@@ -1,0 +1,14 @@
+{
+  "name": "@fractonica/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bundle": "node scripts/build.mjs",
+    "dev": "pnpm prepare:sidecar && tauri dev",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}

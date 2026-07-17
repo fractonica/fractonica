@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "datasetId": "fractonica-solar-eclipse-geometry-reviewed-101-161-v1",
+  "artifact": {
+    "file": "reviewed-101-161.eclp",
+    "bytes": 2057132,
+    "sha256": "165ade1d6ef3e06b4f39242773274477555d0c38fc4a7808c27793a01adacccc",
+    "format": "saros-geo-eclp-v1"
+  },
+  "source": {
+    "catalog": "NASA GSFC solar eclipse catalog",
+    "catalogUrl": "https://eclipse.gsfc.nasa.gov/SEcat5/SEcatalog.html?level=1",
+    "geometryPipeline": "Legacy saros-geo manual normalization and review workflow",
+    "importInput": "saros-geo",
+    "sourceInputSha256": "a68314cdcf6fe5ec67768af4db30bdc8d395b1416827af15f87463eeb73e8db2",
+    "sourceFileCount": 61,
+    "sourceBytes": 2056880,
+    "importedAt": "2026-07-17",
+    "sourceRetrievalMetadata": "Original upstream retrieval date was not retained; the pinned input digest identifies this reviewed import snapshot.",
+    "sourceLicense": {
+      "status": "NASA Eclipse Web Site copyright notice: NASA material is not protected by copyright unless noted.",
+      "noticeUrl": "https://eclipse.gsfc.nasa.gov/SEpubs/copyright.html",
+      "attribution": "Derived from NASA/Goddard Space Flight Center eclipse material attributed to Fred Espenak (eclipse.gsfc.nasa.gov)."
+    }
+  },
+  "review": {
+    "status": "reviewed",
+    "includedSeries": {
+      "start": 101,
+      "end": 161
+    },
+    "excludedSeries": "All series outside 101-161 are intentionally absent from this geometry release."
+  },
+  "coverage": {
+    "eclipseCount": 2044,
+    "pathPointCount": 276576,
+    "firstUnixSeconds": -12213143481,
+    "lastUnixSeconds": 16715109919
+  },
+  "generatedBy": {
+    "script": "tools/saros-data/generate-reviewed-geometry.mjs",
+    "generatorVersion": 1
+  }
+}

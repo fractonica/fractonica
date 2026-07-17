@@ -1,0 +1,17 @@
+[package]
+name = "fractonica-store-sqlite"
+description = "SQLite persistence adapter for Fractonica nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fractonica-core.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

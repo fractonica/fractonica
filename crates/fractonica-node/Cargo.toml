@@ -1,0 +1,24 @@
+[package]
+name = "fractonica-node"
+description = "Headless Fractonica node daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+directories.workspace = true
+fractonica-api.workspace = true
+fractonica-store-sqlite.workspace = true
+fs4.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

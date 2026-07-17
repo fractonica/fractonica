@@ -1,0 +1,10 @@
+[package]
+name = "fractonica-temporal-core"
+description = "Allocation-free Saros clock and rarity semantics for hosts and embedded devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

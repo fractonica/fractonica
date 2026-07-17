@@ -1,0 +1,797 @@
+openapi: 3.1.0
+info:
+  title: Fractonica Node API
+  version: 1.0.0
+  license:
+    name: AGPL-3.0-or-later
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+  description: >-
+    Loopback-only API for a Fractonica node and its deterministic Saros engine.
+    The `saros` profile is stateless and serves only temporal/geometry routes;
+    the `node` profile also owns local SQLite storage. The server must not bind
+    to a non-loopback interface until pairing and authentication have been
+    specified and implemented.
+servers:
+  - url: http://127.0.0.1:8789
+    description: Local node
+tags:
+  - name: Health
+    description: Process and profile readiness probes.
+  - name: Node
+    description: Local node-profile identity and declared capabilities.
+  - name: Saros
+    description: Deterministic temporal readings and reviewed eclipse geometry.
+security:
+  - {}
+  - bootstrapBearer: []
+paths:
+  /health/live:
+    get:
+      tags:
+        - Health
+      summary: Check whether the node process is alive
+      operationId: getLiveness
+      responses:
+        "200":
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveStatus"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+  /health/ready:
+    get:
+      tags:
+        - Health
+      summary: Check whether the node can serve requests
+      operationId: getReadiness
+      responses:
+        "200":
+          description: The selected node profile is ready to serve requests.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyStatus"
+        "503":
+          description: The node is not ready.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+  /api/v1/node:
+    get:
+      tags:
+        - Node
+      summary: Describe the local node profile and installation
+      operationId: getNode
+      responses:
+        "200":
+          description: Local node information.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeInfo"
+        "503":
+          description: The node cannot provide its descriptor yet.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+  /api/v1/saros:
+    get:
+      tags:
+        - Saros
+      summary: Describe the local Saros engine and reviewed geometry release
+      operationId: getSarosMetadata
+      responses:
+        "200":
+          description: Exact temporal semantics and geometry release metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SarosMetadata"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+  /api/v1/saros/pulse:
+    get:
+      tags:
+        - Saros
+      summary: Resolve the two five-digit Saros pulse glyphs at an explicit instant
+      operationId: getSarosPulse
+      parameters:
+        - $ref: "#/components/parameters/AtUnixSeconds"
+        - $ref: "#/components/parameters/AtNanosecond"
+        - name: anchorSaros
+          in: query
+          required: false
+          description: Reviewed Saros series used as the pulse anchor. Defaults to 141.
+          schema:
+            type: integer
+            minimum: 101
+            maximum: 161
+            default: 141
+      responses:
+        "200":
+          description: Exact 30-bit pulse and its two MSB-first glyph halves.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SarosPulse"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "404":
+          $ref: "#/components/responses/ProblemResponse"
+        "422":
+          $ref: "#/components/responses/ProblemResponse"
+        "503":
+          $ref: "#/components/responses/ProblemResponse"
+  /api/v1/saros/series/{saros}/reading:
+    get:
+      tags:
+        - Saros
+      summary: Resolve an exact Saros phase reading at an explicit instant
+      operationId: getSarosReading
+      parameters:
+        - $ref: "#/components/parameters/SarosSeries"
+        - $ref: "#/components/parameters/AtUnixSeconds"
+        - $ref: "#/components/parameters/AtNanosecond"
+        - name: precisionBits
+          in: query
+          required: false
+          description: Number of requested MSB phase bits. Complete octal digits consume three bits.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 64
+            default: 30
+      responses:
+        "200":
+          description: Exact rational phase, fixed-point word and requested projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SarosReading"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "404":
+          $ref: "#/components/responses/ProblemResponse"
+        "422":
+          $ref: "#/components/responses/ProblemResponse"
+        "503":
+          $ref: "#/components/responses/ProblemResponse"
+  /api/v1/saros/series/{saros}/eclipses/{sequence}/path:
+    get:
+      tags:
+        - Saros
+      summary: Return one reviewed compact eclipse path as GeoJSON coordinates
+      operationId: getSarosEclipsePath
+      parameters:
+        - $ref: "#/components/parameters/SarosSeries"
+        - name: sequence
+          in: path
+          required: true
+          description: Zero-based stable sequence within the reviewed Saros series.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 255
+      responses:
+        "200":
+          description: Reviewed eclipse metadata and its MultiPolygon path.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EclipsePath"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "404":
+          $ref: "#/components/responses/ProblemResponse"
+        "503":
+          $ref: "#/components/responses/ProblemResponse"
+components:
+  securitySchemes:
+    bootstrapBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: >-
+        Optional per-launch credential used when the desktop supervisor starts
+        a private node sidecar. Standalone loopback nodes may omit it.
+  responses:
+    BootstrapUnauthorized:
+      description: The supervised node requires its per-launch bearer token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ProblemResponse:
+      description: A stable RFC 9457-style problem response.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  parameters:
+    SarosSeries:
+      name: saros
+      in: path
+      required: true
+      description: Saros series in the reviewed geometry release (101–161).
+      schema:
+        type: integer
+        minimum: 101
+        maximum: 161
+    AtUnixSeconds:
+      name: atUnixSeconds
+      in: query
+      required: true
+      description: Explicit signed Unix UTC seconds. The server never reads the clock for deterministic routes.
+      schema:
+        type: integer
+        format: int64
+    AtNanosecond:
+      name: atNanosecond
+      in: query
+      required: false
+      description: Nanosecond fraction within the explicit Unix second.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 999999999
+        default: 0
+  schemas:
+    LiveStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          const: up
+    ReadyStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - profile
+        - storage
+      properties:
+        status:
+          type: string
+          const: ready
+        profile:
+          $ref: "#/components/schemas/NodeProfile"
+        storage:
+          $ref: "#/components/schemas/StorageReadyStatus"
+    StorageReadyStatus:
+      oneOf:
+        - $ref: "#/components/schemas/SqliteStorageReadyStatus"
+        - $ref: "#/components/schemas/NoStorageReadyStatus"
+    SqliteStorageReadyStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - status
+        - schemaVersion
+      properties:
+        kind:
+          type: string
+          const: sqlite
+        status:
+          type: string
+          const: ready
+        schemaVersion:
+          type: integer
+          minimum: 0
+    NoStorageReadyStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - status
+      properties:
+        kind:
+          type: string
+          const: none
+        status:
+          type: string
+          const: notConfigured
+    NodeProfile:
+      type: string
+      enum: [node, saros]
+    NodeInfo:
+      type: object
+      additionalProperties: false
+      required:
+        - installationId
+        - profile
+        - displayName
+        - version
+        - startedAt
+        - uptimeSeconds
+        - capabilities
+      properties:
+        installationId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >-
+            Persistent installation ID for the `node` profile, or the fixed
+            `saros-engine` profile marker for the stateless `saros` profile.
+        profile:
+          $ref: "#/components/schemas/NodeProfile"
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 128
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        startedAt:
+          type: string
+          format: date-time
+        uptimeSeconds:
+          type: integer
+          minimum: 0
+        capabilities:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+    SarosMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - semanticsVersion
+        - geometry
+      properties:
+        semanticsVersion:
+          type: string
+          const: 1.0.0
+        geometry:
+          $ref: "#/components/schemas/GeometryRelease"
+    GeometryRelease:
+      type: object
+      additionalProperties: false
+      required:
+        - schemaVersion
+        - datasetId
+        - artifact
+        - source
+        - review
+        - coverage
+        - generatedBy
+      properties:
+        schemaVersion:
+          type: integer
+          const: 1
+        datasetId:
+          type: string
+          minLength: 1
+        artifact:
+          $ref: "#/components/schemas/GeometryArtifact"
+        source:
+          $ref: "#/components/schemas/GeometrySource"
+        review:
+          $ref: "#/components/schemas/GeometryReview"
+        coverage:
+          $ref: "#/components/schemas/GeometryCoverage"
+        generatedBy:
+          $ref: "#/components/schemas/GeometryGenerator"
+    GeometryArtifact:
+      type: object
+      additionalProperties: false
+      required:
+        - file
+        - bytes
+        - sha256
+        - format
+      properties:
+        file:
+          type: string
+          const: reviewed-101-161.eclp
+        bytes:
+          type: integer
+          minimum: 1
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        format:
+          type: string
+          const: saros-geo-eclp-v1
+    GeometrySource:
+      type: object
+      additionalProperties: false
+      required:
+        - catalog
+        - catalogUrl
+        - geometryPipeline
+        - importInput
+        - sourceInputSha256
+        - sourceFileCount
+        - sourceBytes
+        - importedAt
+        - sourceRetrievalMetadata
+        - sourceLicense
+      properties:
+        catalog:
+          type: string
+        catalogUrl:
+          type: string
+          format: uri
+        geometryPipeline:
+          type: string
+        importInput:
+          type: string
+        sourceInputSha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        sourceFileCount:
+          type: integer
+          const: 61
+        sourceBytes:
+          type: integer
+          const: 2056880
+        importedAt:
+          type: string
+          format: date
+        sourceRetrievalMetadata:
+          type: string
+        sourceLicense:
+          $ref: "#/components/schemas/GeometrySourceLicense"
+    GeometrySourceLicense:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - noticeUrl
+        - attribution
+      properties:
+        status:
+          type: string
+          minLength: 1
+        noticeUrl:
+          type: string
+          format: uri
+        attribution:
+          type: string
+          minLength: 1
+    GeometryReview:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - includedSeries
+        - excludedSeries
+      properties:
+        status:
+          type: string
+          const: reviewed
+        includedSeries:
+          $ref: "#/components/schemas/SeriesRange"
+        excludedSeries:
+          type: string
+    SeriesRange:
+      type: object
+      additionalProperties: false
+      required:
+        - start
+        - end
+      properties:
+        start:
+          type: integer
+          const: 101
+        end:
+          type: integer
+          const: 161
+    GeometryCoverage:
+      type: object
+      additionalProperties: false
+      required:
+        - eclipseCount
+        - pathPointCount
+        - firstUnixSeconds
+        - lastUnixSeconds
+      properties:
+        eclipseCount:
+          type: integer
+          const: 2044
+        pathPointCount:
+          type: integer
+          const: 276576
+        firstUnixSeconds:
+          type: integer
+          format: int64
+        lastUnixSeconds:
+          type: integer
+          format: int64
+    GeometryGenerator:
+      type: object
+      additionalProperties: false
+      required:
+        - script
+        - generatorVersion
+      properties:
+        script:
+          type: string
+        generatorVersion:
+          type: integer
+          const: 1
+    SarosPulse:
+      type: object
+      additionalProperties: false
+      required:
+        - anchorSaros
+        - reading
+        - glyphs
+      properties:
+        anchorSaros:
+          type: integer
+          minimum: 101
+          maximum: 161
+        reading:
+          $ref: "#/components/schemas/SarosReading"
+        glyphs:
+          $ref: "#/components/schemas/PulseGlyphs"
+    SarosReading:
+      type: object
+      additionalProperties: false
+      required:
+        - saros
+        - at
+        - previous
+        - next
+        - phase
+        - phaseWordHex
+        - projection
+        - nextFlipAt
+      properties:
+        saros:
+          type: integer
+          minimum: 101
+          maximum: 161
+        at:
+          $ref: "#/components/schemas/UnixTimestamp"
+        previous:
+          $ref: "#/components/schemas/EclipseIdentity"
+        next:
+          $ref: "#/components/schemas/EclipseIdentity"
+        phase:
+          $ref: "#/components/schemas/PhaseRatio"
+        phaseWordHex:
+          type: string
+          pattern: "^[0-9a-f]{16}$"
+        projection:
+          $ref: "#/components/schemas/PhaseProjection"
+        rarity:
+          $ref: "#/components/schemas/Rarity"
+        nextFlipAt:
+          $ref: "#/components/schemas/UnixTimestamp"
+    UnixTimestamp:
+      type: object
+      additionalProperties: false
+      required:
+        - unixSeconds
+        - nanosecond
+      properties:
+        unixSeconds:
+          type: integer
+          format: int64
+        nanosecond:
+          type: integer
+          minimum: 0
+          maximum: 999999999
+    EclipseIdentity:
+      type: object
+      additionalProperties: false
+      required:
+        - saros
+        - sequence
+        - unixSeconds
+      properties:
+        saros:
+          type: integer
+          minimum: 101
+          maximum: 161
+        sequence:
+          type: integer
+          minimum: 0
+          maximum: 255
+        unixSeconds:
+          type: integer
+          format: int64
+    PhaseRatio:
+      type: object
+      additionalProperties: false
+      required:
+        - numerator
+        - denominator
+      properties:
+        numerator:
+          type: string
+          pattern: "^[0-9]+$"
+        denominator:
+          type: string
+          pattern: "^[1-9][0-9]*$"
+    PhaseProjection:
+      type: object
+      additionalProperties: false
+      required:
+        - precisionBits
+        - prefix
+        - octal
+        - trailingBits
+        - trailingValue
+      properties:
+        precisionBits:
+          type: integer
+          minimum: 1
+          maximum: 64
+        prefix:
+          type: string
+          pattern: "^[0-9]+$"
+        octal:
+          type: string
+          pattern: "^[0-7]*$"
+        trailingBits:
+          type: integer
+          minimum: 0
+          maximum: 2
+        trailingValue:
+          type: integer
+          minimum: 0
+          maximum: 3
+    Rarity:
+      type: object
+      additionalProperties: false
+      required:
+        - family
+        - digit
+        - digitName
+      properties:
+        family:
+          type: string
+          enum: [common, triplex, duplex, simplex, nihil]
+        digit:
+          type: integer
+          minimum: 0
+          maximum: 7
+        digitName:
+          type: string
+    PulseGlyphs:
+      type: object
+      additionalProperties: false
+      required:
+        - mostSignificant
+        - leastSignificant
+      properties:
+        mostSignificant:
+          type: string
+          pattern: "^[0-7]{5}$"
+        leastSignificant:
+          type: string
+          pattern: "^[0-7]{5}$"
+    EclipsePath:
+      type: object
+      additionalProperties: false
+      required:
+        - geometryStatus
+        - eclipse
+        - metadata
+        - geometry
+      properties:
+        geometryStatus:
+          type: string
+          const: reviewed
+        eclipse:
+          $ref: "#/components/schemas/EclipseIdentity"
+        metadata:
+          $ref: "#/components/schemas/EclipseMetadata"
+        geometry:
+          $ref: "#/components/schemas/GeoJsonMultiPolygon"
+    EclipseMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - typeIndex
+        - unixSeconds
+        - latitude
+        - longitude
+        - sunAltitudeDegrees
+        - magnitude
+        - gamma
+        - polygonCount
+        - pathPointCount
+      properties:
+        typeIndex:
+          type: integer
+          minimum: 0
+          maximum: 17
+        unixSeconds:
+          type: integer
+          format: int64
+        latitude:
+          type: number
+        longitude:
+          type: number
+        sunAltitudeDegrees:
+          type: integer
+          minimum: 0
+          maximum: 127
+        magnitude:
+          type: number
+        gamma:
+          type: number
+        centralDurationSeconds:
+          type: [integer, "null"]
+          minimum: 0
+        centralWidthKm:
+          type: [integer, "null"]
+          minimum: 0
+        polygonCount:
+          type: integer
+          minimum: 0
+          maximum: 31
+        pathPointCount:
+          type: integer
+          minimum: 0
+          maximum: 300000
+    GeoJsonMultiPolygon:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - coordinates
+      properties:
+        type:
+          type: string
+          const: MultiPolygon
+        coordinates:
+          type: array
+          items:
+            type: array
+            items:
+              type: array
+              items:
+                type: array
+                minItems: 2
+                maxItems: 2
+                items:
+                  type: number
+    Problem:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - code
+        - title
+        - status
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
