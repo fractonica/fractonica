@@ -13,9 +13,16 @@ struct Capture {
 
 bool consume_polygon(void *context, const fractonica_glyph_polygon_t *polygon) {
     auto *capture = static_cast<Capture *>(context);
-    if (capture == nullptr || polygon == nullptr || polygon->points == nullptr ||
-        polygon->point_count < 3u) {
+    if (capture == nullptr || polygon == nullptr || polygon->contours == nullptr ||
+        polygon->contour_count == 0u) {
         return false;
+    }
+    for (std::uint8_t contour_index = 0u; contour_index < polygon->contour_count;
+         ++contour_index) {
+        const auto &contour = polygon->contours[contour_index];
+        if (contour.points == nullptr || contour.point_count < 3u) {
+            return false;
+        }
     }
     ++capture->polygons;
     return true;
@@ -42,7 +49,7 @@ int main() {
     return status == FRACTONICA_GLYPH_STATUS_OK &&
                    temporal_status == FRACTONICA_TEMPORAL_OK &&
                    rarity_status == FRACTONICA_TEMPORAL_OK &&
-                   capture.polygons == result.emitted_polygon_count &&
+                   capture.polygons == result.emitted_primitive_count &&
                    capture.polygons >= 2u &&
                    rarity.family == FRACTONICA_TEMPORAL_RARITY_DUPLEX
                ? 0

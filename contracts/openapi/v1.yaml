@@ -21,6 +21,8 @@ tags:
     description: Local node-profile identity and declared capabilities.
   - name: Saros
     description: Deterministic temporal readings and reviewed eclipse geometry.
+  - name: Glyphs
+    description: Canonical octal-glyph grammar, versioned font outlines, compound contour geometry, and raw RGBA8 raster output.
 security:
   - {}
   - bootstrapBearer: []
@@ -97,6 +99,108 @@ paths:
                 $ref: "#/components/schemas/SarosMetadata"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
+  /api/v1/glyphs:
+    get:
+      tags:
+        - Glyphs
+      summary: Describe the canonical octal-glyph grammar and default font
+      operationId: getGlyphMetadata
+      responses:
+        "200":
+          description: Versioned binary-stroke grammar, default font identity, and coordinate conventions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GlyphMetadata"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+  /api/v1/glyphs/{octal}/geometry:
+    get:
+      tags:
+        - Glyphs
+      summary: Resolve canonical compound contour geometry for an octal glyph
+      operationId: getGlyphGeometry
+      parameters:
+        - $ref: "#/components/parameters/GlyphOctal"
+        - $ref: "#/components/parameters/GlyphDepth"
+      responses:
+        "200":
+          description: Normalized MSB-first geometry with a value-invariant frame.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GlyphGeometry"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "422":
+          $ref: "#/components/responses/ProblemResponse"
+  /api/v1/glyphs/{octal}/raster.rgba:
+    get:
+      tags:
+        - Glyphs
+      summary: Rasterize an octal glyph into raw straight-alpha RGBA8 bytes
+      operationId: getGlyphRasterRgba
+      parameters:
+        - $ref: "#/components/parameters/GlyphOctal"
+        - $ref: "#/components/parameters/GlyphDepth"
+        - $ref: "#/components/parameters/GlyphRasterWidth"
+        - $ref: "#/components/parameters/GlyphRasterHeight"
+        - $ref: "#/components/parameters/GlyphForeground"
+        - $ref: "#/components/parameters/GlyphBackground"
+      responses:
+        "200":
+          description: Row-major raw bytes, one straight-alpha red/green/blue/alpha tuple per pixel.
+          headers:
+            X-Fractonica-Pixel-Format:
+              description: Always `rgba8` for this endpoint.
+              schema:
+                type: string
+                const: rgba8
+            X-Fractonica-Width:
+              description: Raster width in pixels.
+              schema:
+                type: integer
+                minimum: 1
+            X-Fractonica-Height:
+              description: Raster height in pixels.
+              schema:
+                type: integer
+                minimum: 1
+            X-Fractonica-Stride-Bytes:
+              description: Bytes in one row; always width multiplied by four.
+              schema:
+                type: integer
+                minimum: 4
+            X-Fractonica-Glyph-Grammar-Version:
+              description: Version of the binary 1/2/4 digit grammar.
+              schema:
+                type: string
+            X-Fractonica-Glyph-Geometry-Version:
+              description: Geometry version selected by the default glyph font.
+              schema:
+                type: string
+            X-Fractonica-Glyph-Font-Id:
+              description: Stable identifier of the font used for rasterization.
+              schema:
+                type: string
+            X-Fractonica-Glyph-Font-Version:
+              description: Semantic version of the font used for rasterization.
+              schema:
+                type: string
+            X-Fractonica-Glyph-Font-Sha256:
+              description: SHA-256 digest of the canonical font document.
+              schema:
+                type: string
+                pattern: "^[0-9a-f]{64}$"
+          content:
+            application/vnd.fractonica.rgba8:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "422":
+          $ref: "#/components/responses/ProblemResponse"
   /api/v1/saros/pulse:
     get:
       tags:
@@ -243,6 +347,60 @@ components:
         minimum: 0
         maximum: 999999999
         default: 0
+    GlyphOctal:
+      name: octal
+      in: path
+      required: true
+      description: One through eight MSB-first ASCII octal digits. Short values are left-padded by the selected depth.
+      schema:
+        type: string
+        pattern: "^[0-7]{1,8}$"
+    GlyphDepth:
+      name: depth
+      in: query
+      required: false
+      description: Number of radial digit sockets. Defaults to five.
+      schema:
+        type: integer
+        minimum: 3
+        maximum: 8
+        default: 5
+    GlyphRasterWidth:
+      name: width
+      in: query
+      required: false
+      description: Output width in pixels. Defaults to 128; maximum is 2048.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 2048
+        default: 128
+    GlyphRasterHeight:
+      name: height
+      in: query
+      required: false
+      description: Output height in pixels. Defaults to 128; maximum is 2048.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 2048
+        default: 128
+    GlyphForeground:
+      name: foreground
+      in: query
+      required: false
+      description: Foreground colour as RRGGBB or RRGGBBAA hexadecimal. Defaults to FFFFFFFF.
+      schema:
+        type: string
+        pattern: "^#?[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$"
+    GlyphBackground:
+      name: background
+      in: query
+      required: false
+      description: Background colour as RRGGBB or RRGGBBAA hexadecimal. Defaults to transparent.
+      schema:
+        type: string
+        pattern: "^#?[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$"
   schemas:
     LiveStatus:
       type: object
@@ -543,6 +701,272 @@ components:
           $ref: "#/components/schemas/SarosReading"
         glyphs:
           $ref: "#/components/schemas/PulseGlyphs"
+    GlyphMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - grammarVersion
+        - grammarSha256
+        - geometryVersion
+        - specSha256
+        - font
+        - radix
+        - minimumDepth
+        - maximumDepth
+        - defaultDepth
+        - coordinateSystem
+        - strokeBits
+      properties:
+        grammarVersion:
+          type: string
+          const: 1.0.0
+        grammarSha256:
+          type: string
+          const: fe0dbfd7aa3faa6174cf38d1844848b2276f731b102dafb2f3350ffa68c7f7c8
+        geometryVersion:
+          type: string
+          const: 2.1.0
+        specSha256:
+          type: string
+          const: f6457d5aa1533a30e0731b70715a5393bb696c317acaeb8c2a5ab0f18ae27a56
+        font:
+          $ref: "#/components/schemas/GlyphFont"
+        radix:
+          type: integer
+          const: 8
+        minimumDepth:
+          type: integer
+          const: 3
+        maximumDepth:
+          type: integer
+          const: 8
+        defaultDepth:
+          type: integer
+          const: 5
+        coordinateSystem:
+          $ref: "#/components/schemas/GlyphCoordinateSystem"
+        strokeBits:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            $ref: "#/components/schemas/GlyphStroke"
+    GlyphFont:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - version
+        - geometryVersion
+        - sha256
+      properties:
+        id:
+          type: string
+          const: fractonica-hex-v2
+        version:
+          type: string
+          const: 1.0.0
+        geometryVersion:
+          type: string
+          const: 2.1.0
+        sha256:
+          type: string
+          const: b67a6132d41a061ee5b33acd6cbe70344cf7f809e6b86a7425d5df76a58ae7d8
+    GlyphCoordinateSystem:
+      type: object
+      additionalProperties: false
+      required:
+        - origin
+        - xAxis
+        - yAxis
+        - rotation
+        - unit
+      properties:
+        origin:
+          type: string
+          const: glyphCentre
+        xAxis:
+          type: string
+          const: right
+        yAxis:
+          type: string
+          const: down
+        rotation:
+          type: string
+          const: clockwise
+        unit:
+          type: string
+          const: fontUnits
+    GlyphStroke:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - bit
+        - from
+        - to
+      properties:
+        id:
+          type: string
+          enum: [left, centre, right]
+        bit:
+          type: integer
+          enum: [1, 2, 4]
+        from:
+          type: string
+          const: anchor
+        to:
+          type: string
+          enum: [left, apex, right]
+    GlyphGeometry:
+      type: object
+      additionalProperties: false
+      required:
+        - grammarVersion
+        - grammarSha256
+        - geometryVersion
+        - specSha256
+        - font
+        - octal
+        - depth
+        - coordinateSystem
+        - frame
+        - primitives
+      properties:
+        grammarVersion:
+          type: string
+          const: 1.0.0
+        grammarSha256:
+          type: string
+          const: fe0dbfd7aa3faa6174cf38d1844848b2276f731b102dafb2f3350ffa68c7f7c8
+        geometryVersion:
+          type: string
+          const: 2.1.0
+        specSha256:
+          type: string
+          const: f6457d5aa1533a30e0731b70715a5393bb696c317acaeb8c2a5ab0f18ae27a56
+        font:
+          $ref: "#/components/schemas/GlyphFont"
+        octal:
+          type: string
+          pattern: "^[0-7]{3,8}$"
+        depth:
+          type: integer
+          minimum: 3
+          maximum: 8
+        coordinateSystem:
+          $ref: "#/components/schemas/GlyphCoordinateSystem"
+        frame:
+          $ref: "#/components/schemas/GlyphFrame"
+        primitives:
+          type: array
+          minItems: 1
+          maxItems: 9
+          items:
+            $ref: "#/components/schemas/GlyphPrimitive"
+    GlyphFrame:
+      type: object
+      additionalProperties: false
+      required:
+        - x
+        - y
+        - width
+        - height
+        - aspectRatio
+      properties:
+        x:
+          type: number
+        y:
+          type: number
+        width:
+          type: number
+          exclusiveMinimum: 0
+        height:
+          type: number
+          exclusiveMinimum: 0
+        aspectRatio:
+          type: number
+          exclusiveMinimum: 0
+    GlyphPrimitive:
+      oneOf:
+        - $ref: "#/components/schemas/GlyphCorePrimitive"
+        - $ref: "#/components/schemas/GlyphArmPrimitive"
+    GlyphCorePrimitive:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - fillRule
+        - contours
+      properties:
+        kind:
+          type: string
+          const: core
+        fillRule:
+          type: string
+          const: evenodd
+        contours:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            $ref: "#/components/schemas/GlyphContour"
+    GlyphArmPrimitive:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - fillRule
+        - socketIndex
+        - digitIndex
+        - digit
+        - contours
+      properties:
+        kind:
+          type: string
+          const: arm
+        fillRule:
+          type: string
+          const: nonzero
+        socketIndex:
+          type: integer
+          minimum: 0
+          maximum: 7
+        digitIndex:
+          type: integer
+          minimum: 0
+          maximum: 7
+        digit:
+          type: integer
+          minimum: 1
+          maximum: 7
+        contours:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            $ref: "#/components/schemas/GlyphContour"
+    GlyphContour:
+      type: object
+      additionalProperties: false
+      required:
+        - points
+      properties:
+        points:
+          type: array
+          minItems: 3
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/GlyphPoint"
+    GlyphPoint:
+      type: object
+      additionalProperties: false
+      required: [x, y]
+      properties:
+        x:
+          type: number
+        y:
+          type: number
     SarosReading:
       type: object
       additionalProperties: false

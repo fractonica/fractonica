@@ -1,0 +1,50 @@
+{
+  "$schema": "https://fractonica.com/schemas/glyph-grammar-v1.json",
+  "grammarVersion": "1.0.0",
+  "radix": 8,
+  "digits": {
+    "minimum": 3,
+    "maximum": 8,
+    "default": 5
+  },
+  "coordinateSystem": {
+    "origin": "glyph centre",
+    "x": "right",
+    "y": "down",
+    "rotation": "clockwise",
+    "unit": "font units"
+  },
+  "strokeBits": [
+    {
+      "id": "left",
+      "bit": 1,
+      "from": "anchor",
+      "to": "left"
+    },
+    {
+      "id": "centre",
+      "bit": 2,
+      "from": "anchor",
+      "to": "apex"
+    },
+    {
+      "id": "right",
+      "bit": 4,
+      "from": "anchor",
+      "to": "right"
+    }
+  ],
+  "lattice": {
+    "anchor": [0, 0],
+    "left": [-1, 1],
+    "apex": [0, 2],
+    "right": [1, 1],
+    "meaning": "A digit is the bitwise sum of its enabled anchor-to-vertex connections. Fonts choose the filled outline used to depict each of the eight masks."
+  },
+  "defaultFont": {
+    "id": "fractonica-hex-v2",
+    "version": "1.0.0",
+    "geometryVersion": "2.1.0",
+    "source": "fonts/fractonica-hex-v2.json"
+  }
+}

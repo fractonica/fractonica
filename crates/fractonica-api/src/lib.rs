@@ -5,10 +5,18 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State, rejection::QueryRejection},
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
+};
+use fractonica_glyph::{
+    DEFAULT_DIGITS, FONT_ID as GLYPH_FONT_ID, FONT_SHA256 as GLYPH_FONT_SHA256,
+    FONT_VERSION as GLYPH_FONT_VERSION, GEOMETRY_VERSION as GLYPH_GEOMETRY_VERSION,
+    GRAMMAR_SHA256 as GLYPH_GRAMMAR_SHA256, GRAMMAR_VERSION as GLYPH_GRAMMAR_VERSION, GlyphConfig,
+    GlyphError, GlyphFrame, GlyphPrimitiveKind, GlyphRasterOptions, MAX_DIGITS as GLYPH_MAX_DIGITS,
+    MIN_DIGITS as GLYPH_MIN_DIGITS, OctalGlyph, RADIX as GLYPH_RADIX, Rgba8,
+    SPEC_SHA256 as GLYPH_SPEC_SHA256,
 };
 use fractonica_saros_engine::{
     EclipseIdentity, EclipsePath, GeometryRelease, SarosEngine, SarosEngineError, SarosPulse,
@@ -27,12 +35,14 @@ use tower_http::{
 use utoipa_swagger_ui::SwaggerUi;
 
 const SAROS_CAPABILITIES: &[&str] = &[
+    "canonical-octal-glyphs",
     "node-http-api",
     "openapi",
     "saros-calculation",
     "reviewed-eclipse-geometry",
 ];
 const FULL_NODE_CAPABILITIES: &[&str] = &[
+    "canonical-octal-glyphs",
     "local-storage",
     "node-http-api",
     "openapi",
@@ -45,6 +55,9 @@ const DISPLAY_NAME_MAX_LENGTH: usize = 128;
 const VERSION_MAX_LENGTH: usize = 64;
 const BEARER_TOKEN_MIN_LENGTH: usize = 32;
 const BEARER_TOKEN_MAX_LENGTH: usize = 512;
+const DEFAULT_GLYPH_RASTER_SIZE: u16 = 128;
+const MAX_GLYPH_RASTER_DIMENSION: u16 = 2_048;
+const MAX_GLYPH_RASTER_PIXELS: usize = 4_194_304;
 
 #[derive(Debug, Error)]
 pub enum ApiStateError {
@@ -201,6 +214,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/health/ready", get(ready))
         .route("/api/v1/node", get(node))
         .route("/api/v1/saros", get(saros_metadata))
+        .route("/api/v1/glyphs", get(glyph_metadata))
+        .route("/api/v1/glyphs/{octal}/geometry", get(glyph_geometry))
+        .route("/api/v1/glyphs/{octal}/raster.rgba", get(glyph_raster))
         .route("/api/v1/saros/pulse", get(saros_pulse))
         .route("/api/v1/saros/series/{saros}/reading", get(saros_reading))
         .route(
@@ -216,7 +232,18 @@ pub fn router(state: ApiState) -> Router {
             CorsLayer::new()
                 .allow_origin(allowed_origins)
                 .allow_methods([Method::GET])
-                .allow_headers([header::ACCEPT, header::AUTHORIZATION]),
+                .allow_headers([header::ACCEPT, header::AUTHORIZATION])
+                .expose_headers([
+                    HeaderName::from_static("x-fractonica-pixel-format"),
+                    HeaderName::from_static("x-fractonica-width"),
+                    HeaderName::from_static("x-fractonica-height"),
+                    HeaderName::from_static("x-fractonica-stride-bytes"),
+                    HeaderName::from_static("x-fractonica-glyph-grammar-version"),
+                    HeaderName::from_static("x-fractonica-glyph-geometry-version"),
+                    HeaderName::from_static("x-fractonica-glyph-font-id"),
+                    HeaderName::from_static("x-fractonica-glyph-font-version"),
+                    HeaderName::from_static("x-fractonica-glyph-font-sha256"),
+                ]),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -263,6 +290,99 @@ pub struct SarosMetadataResponse {
     pub geometry: GeometryRelease,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlyphMetadataResponse {
+    pub grammar_version: &'static str,
+    pub grammar_sha256: &'static str,
+    pub geometry_version: &'static str,
+    pub spec_sha256: &'static str,
+    pub font: GlyphFontResponse,
+    pub radix: u8,
+    pub minimum_depth: u8,
+    pub maximum_depth: u8,
+    pub default_depth: u8,
+    pub coordinate_system: GlyphCoordinateSystemResponse,
+    pub stroke_bits: [GlyphStrokeResponse; 3],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlyphFontResponse {
+    pub id: &'static str,
+    pub version: &'static str,
+    pub geometry_version: &'static str,
+    pub sha256: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlyphCoordinateSystemResponse {
+    pub origin: &'static str,
+    pub x_axis: &'static str,
+    pub y_axis: &'static str,
+    pub rotation: &'static str,
+    pub unit: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlyphStrokeResponse {
+    pub id: &'static str,
+    pub bit: u8,
+    pub from: &'static str,
+    pub to: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlyphGeometryResponse {
+    pub grammar_version: &'static str,
+    pub grammar_sha256: &'static str,
+    pub geometry_version: &'static str,
+    pub spec_sha256: &'static str,
+    pub font: GlyphFontResponse,
+    pub octal: String,
+    pub depth: u8,
+    pub coordinate_system: GlyphCoordinateSystemResponse,
+    pub frame: GlyphFrameResponse,
+    pub primitives: Vec<GlyphPrimitiveResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlyphFrameResponse {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub aspect_ratio: f32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlyphPrimitiveResponse {
+    pub kind: &'static str,
+    pub fill_rule: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_index: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digit_index: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digit: Option<u8>,
+    pub contours: Vec<GlyphContourResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlyphContourResponse {
+    pub points: Vec<GlyphPointResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlyphPointResponse {
+    pub x: f32,
+    pub y: f32,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadingQuery {
@@ -281,6 +401,22 @@ struct PulseQuery {
     at_nanosecond: u32,
     #[serde(default = "default_anchor_saros")]
     anchor_saros: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlyphQuery {
+    depth: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlyphRasterQuery {
+    depth: Option<u8>,
+    width: Option<u16>,
+    height: Option<u16>,
+    foreground: Option<String>,
+    background: Option<String>,
 }
 
 const fn default_precision_bits() -> u8 {
@@ -568,6 +704,133 @@ async fn saros_metadata(State(state): State<ApiState>) -> Json<SarosMetadataResp
     })
 }
 
+async fn glyph_metadata() -> Json<GlyphMetadataResponse> {
+    Json(GlyphMetadataResponse {
+        grammar_version: GLYPH_GRAMMAR_VERSION,
+        grammar_sha256: GLYPH_GRAMMAR_SHA256,
+        geometry_version: GLYPH_GEOMETRY_VERSION,
+        spec_sha256: GLYPH_SPEC_SHA256,
+        font: glyph_font_response(),
+        radix: GLYPH_RADIX,
+        minimum_depth: GLYPH_MIN_DIGITS,
+        maximum_depth: GLYPH_MAX_DIGITS,
+        default_depth: DEFAULT_DIGITS,
+        coordinate_system: glyph_coordinate_system_response(),
+        stroke_bits: [
+            GlyphStrokeResponse {
+                id: "left",
+                bit: 1,
+                from: "anchor",
+                to: "left",
+            },
+            GlyphStrokeResponse {
+                id: "centre",
+                bit: 2,
+                from: "anchor",
+                to: "apex",
+            },
+            GlyphStrokeResponse {
+                id: "right",
+                bit: 4,
+                from: "anchor",
+                to: "right",
+            },
+        ],
+    })
+}
+
+async fn glyph_geometry(
+    Path(octal): Path<String>,
+    query: Result<Query<GlyphQuery>, QueryRejection>,
+) -> Result<Json<GlyphGeometryResponse>, ApiError> {
+    let Query(query) = query.map_err(glyph_query_input_error)?;
+    let glyph = glyph_from_input(&octal, query.depth)?;
+    Ok(Json(glyph_geometry_response(glyph)?))
+}
+
+async fn glyph_raster(
+    Path(octal): Path<String>,
+    query: Result<Query<GlyphRasterQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(glyph_query_input_error)?;
+    let glyph = glyph_from_input(&octal, query.depth)?;
+    let width = query.width.unwrap_or(DEFAULT_GLYPH_RASTER_SIZE);
+    let height = query.height.unwrap_or(DEFAULT_GLYPH_RASTER_SIZE);
+    validate_raster_size(width, height)?;
+    let foreground = query
+        .foreground
+        .as_deref()
+        .map(|value| parse_rgba8(value, "foreground"))
+        .transpose()?
+        .unwrap_or(Rgba8::WHITE);
+    let background = query
+        .background
+        .as_deref()
+        .map(|value| parse_rgba8(value, "background"))
+        .transpose()?
+        .unwrap_or(Rgba8::TRANSPARENT);
+    let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+    let info = glyph
+        .rasterize_rgba8(
+            GlyphConfig::default(),
+            GlyphRasterOptions {
+                width,
+                height,
+                foreground,
+                background,
+            },
+            &mut pixels,
+        )
+        .map_err(glyph_input_error)?;
+
+    let mut response = pixels.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.fractonica.rgba8"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-pixel-format"),
+        HeaderValue::from_static("rgba8"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-width"),
+        HeaderValue::from_str(&info.width.to_string())
+            .expect("decimal width is a valid HTTP header"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-height"),
+        HeaderValue::from_str(&info.height.to_string())
+            .expect("decimal height is a valid HTTP header"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-stride-bytes"),
+        HeaderValue::from_str(&info.stride_bytes.to_string())
+            .expect("decimal stride is a valid HTTP header"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-glyph-grammar-version"),
+        HeaderValue::from_static(GLYPH_GRAMMAR_VERSION),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-glyph-geometry-version"),
+        HeaderValue::from_static(GLYPH_GEOMETRY_VERSION),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-glyph-font-id"),
+        HeaderValue::from_static(GLYPH_FONT_ID),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-glyph-font-version"),
+        HeaderValue::from_static(GLYPH_FONT_VERSION),
+    );
+    headers.insert(
+        HeaderName::from_static("x-fractonica-glyph-font-sha256"),
+        HeaderValue::from_static(GLYPH_FONT_SHA256),
+    );
+    Ok(response)
+}
+
 async fn saros_reading(
     State(state): State<ApiState>,
     Path(saros): Path<u16>,
@@ -630,6 +893,174 @@ fn query_input_error(error: QueryRejection) -> ApiError {
         "invalid_saros_input",
         "Invalid Saros input",
         error.body_text(),
+    )
+}
+
+fn glyph_query_input_error(error: QueryRejection) -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/invalid-glyph-input",
+        "invalid_glyph_input",
+        "Invalid glyph input",
+        error.body_text(),
+    )
+}
+
+fn glyph_input_error(error: GlyphError) -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/invalid-glyph-input",
+        "invalid_glyph_input",
+        "Invalid glyph input",
+        error.to_string(),
+    )
+}
+
+fn glyph_from_input(octal: &str, depth: Option<u8>) -> Result<OctalGlyph, ApiError> {
+    OctalGlyph::parse(depth.unwrap_or(DEFAULT_DIGITS), octal).map_err(glyph_input_error)
+}
+
+fn glyph_coordinate_system_response() -> GlyphCoordinateSystemResponse {
+    GlyphCoordinateSystemResponse {
+        origin: "glyphCentre",
+        x_axis: "right",
+        y_axis: "down",
+        rotation: "clockwise",
+        unit: "fontUnits",
+    }
+}
+
+fn glyph_font_response() -> GlyphFontResponse {
+    GlyphFontResponse {
+        id: GLYPH_FONT_ID,
+        version: GLYPH_FONT_VERSION,
+        geometry_version: GLYPH_GEOMETRY_VERSION,
+        sha256: GLYPH_FONT_SHA256,
+    }
+}
+
+fn glyph_frame_response(frame: GlyphFrame) -> GlyphFrameResponse {
+    GlyphFrameResponse {
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height,
+        aspect_ratio: frame.aspect_ratio(),
+    }
+}
+
+fn glyph_geometry_response(glyph: OctalGlyph) -> Result<GlyphGeometryResponse, ApiError> {
+    let config = GlyphConfig::default();
+    let frame = glyph.frame(config).map_err(glyph_input_error)?;
+    let mut normalized = [0_u8; GLYPH_MAX_DIGITS as usize];
+    glyph
+        .write_normalized_ascii(&mut normalized)
+        .map_err(glyph_input_error)?;
+    let octal = String::from_utf8(normalized[..glyph.depth() as usize].to_vec())
+        .expect("glyph core emits ASCII octal");
+    let primitives = glyph
+        .collect_primitives(config)
+        .map_err(glyph_input_error)?
+        .into_iter()
+        .map(|primitive| GlyphPrimitiveResponse {
+            kind: glyph_primitive_wire_id(primitive.kind),
+            fill_rule: primitive.fill_rule.wire_id(),
+            socket_index: primitive.socket_index,
+            digit_index: primitive.digit_index,
+            digit: primitive.digit,
+            contours: primitive
+                .contours
+                .into_iter()
+                .map(|contour| GlyphContourResponse {
+                    points: contour
+                        .points
+                        .into_iter()
+                        .map(|point| GlyphPointResponse {
+                            x: point.x,
+                            y: point.y,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(GlyphGeometryResponse {
+        grammar_version: GLYPH_GRAMMAR_VERSION,
+        grammar_sha256: GLYPH_GRAMMAR_SHA256,
+        geometry_version: GLYPH_GEOMETRY_VERSION,
+        spec_sha256: GLYPH_SPEC_SHA256,
+        font: glyph_font_response(),
+        octal,
+        depth: glyph.depth(),
+        coordinate_system: glyph_coordinate_system_response(),
+        frame: glyph_frame_response(frame),
+        primitives,
+    })
+}
+
+const fn glyph_primitive_wire_id(kind: GlyphPrimitiveKind) -> &'static str {
+    kind.wire_id()
+}
+
+fn validate_raster_size(width: u16, height: u16) -> Result<(), ApiError> {
+    let pixel_count = width as usize * height as usize;
+    if width == 0
+        || height == 0
+        || width > MAX_GLYPH_RASTER_DIMENSION
+        || height > MAX_GLYPH_RASTER_DIMENSION
+        || pixel_count > MAX_GLYPH_RASTER_PIXELS
+    {
+        return Err(ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-glyph-input",
+            "invalid_glyph_input",
+            "Invalid glyph input",
+            format!(
+                "raster dimensions must be between 1 and {MAX_GLYPH_RASTER_DIMENSION} with at most {MAX_GLYPH_RASTER_PIXELS} pixels, got {width}x{height}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_rgba8(value: &str, field: &str) -> Result<Rgba8, ApiError> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    let bytes = hex.as_bytes();
+    if (bytes.len() != 6 && bytes.len() != 8) || !bytes.is_ascii() {
+        return Err(invalid_colour(field, value));
+    }
+    let red = parse_hex_pair(bytes[0], bytes[1]).ok_or_else(|| invalid_colour(field, value))?;
+    let green = parse_hex_pair(bytes[2], bytes[3]).ok_or_else(|| invalid_colour(field, value))?;
+    let blue = parse_hex_pair(bytes[4], bytes[5]).ok_or_else(|| invalid_colour(field, value))?;
+    let alpha = if bytes.len() == 8 {
+        parse_hex_pair(bytes[6], bytes[7]).ok_or_else(|| invalid_colour(field, value))?
+    } else {
+        u8::MAX
+    };
+    Ok(Rgba8::new(red, green, blue, alpha))
+}
+
+const fn parse_hex_pair(high: u8, low: u8) -> Option<u8> {
+    match (hex_nibble(high), hex_nibble(low)) {
+        (Some(high), Some(low)) => Some((high << 4) | low),
+        _ => None,
+    }
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn invalid_colour(field: &str, value: &str) -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/invalid-glyph-input",
+        "invalid_glyph_input",
+        "Invalid glyph input",
+        format!(
+            "{field} must be a six- or eight-digit hexadecimal RRGGBB[AA] colour, got {value:?}"
+        ),
     )
 }
 
@@ -1177,6 +1608,164 @@ mod tests {
         );
         assert_eq!(body["geometry"]["source"]["sourceFileCount"], 61);
         assert_eq!(body["geometry"]["source"]["sourceBytes"], 2_056_880);
+    }
+
+    #[tokio::test]
+    async fn serves_versioned_canonical_glyph_metadata_and_geometry() {
+        let metadata = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/glyphs")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(metadata.status(), StatusCode::OK);
+        let metadata = json(metadata).await;
+        assert_contract_schema("GlyphMetadata", &metadata);
+        assert_eq!(metadata["grammarVersion"], "1.0.0");
+        assert_eq!(metadata["grammarSha256"], GLYPH_GRAMMAR_SHA256);
+        assert_eq!(metadata["geometryVersion"], "2.1.0");
+        assert_eq!(metadata["font"]["id"], "fractonica-hex-v2");
+        assert_eq!(metadata["font"]["version"], "1.0.0");
+        assert_eq!(metadata["font"]["sha256"], GLYPH_FONT_SHA256);
+        assert_eq!(metadata["strokeBits"][0]["bit"], 1);
+        assert_eq!(metadata["strokeBits"][1]["bit"], 2);
+        assert_eq!(metadata["strokeBits"][2]["bit"], 4);
+
+        let geometry = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/glyphs/12345/geometry?depth=5")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(geometry.status(), StatusCode::OK);
+        let geometry = json(geometry).await;
+        assert_contract_schema("GlyphGeometry", &geometry);
+        assert_eq!(geometry["octal"], "12345");
+        assert_eq!(geometry["font"]["id"], "fractonica-hex-v2");
+        assert_eq!(geometry["primitives"][0]["kind"], "core");
+        assert_eq!(geometry["primitives"][0]["fillRule"], "evenodd");
+        assert_eq!(
+            geometry["primitives"][0]["contours"]
+                .as_array()
+                .expect("core contours")
+                .len(),
+            2
+        );
+        assert_eq!(geometry["primitives"][1]["kind"], "arm");
+        assert_eq!(geometry["primitives"][1]["fillRule"], "nonzero");
+        assert_eq!(geometry["primitives"][1]["socketIndex"], 0);
+        assert_eq!(geometry["primitives"][1]["digitIndex"], 0);
+        assert_eq!(geometry["primitives"][1]["digit"], 1);
+        assert_eq!(
+            geometry["primitives"][1]["contours"]
+                .as_array()
+                .expect("arm contours")
+                .len(),
+            1
+        );
+
+        let zero = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/glyphs/00000/geometry?depth=5")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(zero.status(), StatusCode::OK);
+        let zero = json(zero).await;
+        assert_contract_schema("GlyphGeometry", &zero);
+        assert_eq!(zero["primitives"].as_array().expect("primitives").len(), 1);
+
+        let fixture = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/glyphs/777777/geometry?depth=6")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(fixture.status(), StatusCode::OK);
+        let fixture = json(fixture).await;
+        assert_contract_schema("GlyphGeometry", &fixture);
+        assert_eq!(fixture["frame"]["x"], -176.0);
+        assert_eq!(fixture["frame"]["y"], -200.0);
+        assert_eq!(fixture["frame"]["width"], 352.0);
+        assert_eq!(fixture["frame"]["height"], 400.0);
+        assert_eq!(
+            fixture["primitives"][0]["contours"][0]["points"][2],
+            serde_json::json!({"x": 32.0, "y": -27.71})
+        );
+        assert_eq!(
+            fixture["primitives"][2]["contours"][0]["points"][0],
+            serde_json::json!({"x": 32.0, "y": -27.71})
+        );
+    }
+
+    #[tokio::test]
+    async fn rasterizes_rgba8_with_self_describing_headers() {
+        let response = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/api/v1/glyphs/77777/raster.rgba?depth=5&width=32&height=16&foreground=12ABEF&background=00000000",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.fractonica.rgba8"
+        );
+        assert_eq!(response.headers()["x-fractonica-pixel-format"], "rgba8");
+        assert_eq!(response.headers()["x-fractonica-width"], "32");
+        assert_eq!(response.headers()["x-fractonica-height"], "16");
+        assert_eq!(response.headers()["x-fractonica-stride-bytes"], "128");
+        assert_eq!(
+            response.headers()["x-fractonica-glyph-font-id"],
+            "fractonica-hex-v2"
+        );
+        assert_eq!(
+            response.headers()["x-fractonica-glyph-font-version"],
+            "1.0.0"
+        );
+        assert_eq!(
+            response.headers()["x-fractonica-glyph-font-sha256"],
+            GLYPH_FONT_SHA256
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("raster body")
+            .to_bytes();
+        assert_eq!(bytes.len(), 32 * 16 * 4);
+        assert!(bytes.chunks_exact(4).any(|pixel| pixel[3] > 0));
+
+        let invalid = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/glyphs/8/geometry")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let invalid = json(invalid).await;
+        assert_contract_schema("Problem", &invalid);
+        assert_eq!(invalid["code"], "invalid_glyph_input");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ members = [
     "apps/desktop/src-tauri",
     "crates/fractonica-api",
     "crates/fractonica-core",
+    "crates/fractonica-glyph",
     "crates/fractonica-node",
     "crates/fractonica-saros-engine",
     "crates/fractonica-saros-geo",
@@ -25,6 +26,7 @@ clap = { version = "4.6.2", features = ["derive", "env"] }
 directories = "6.0.0"
 fractonica-api = { path = "crates/fractonica-api" }
 fractonica-core = { path = "crates/fractonica-core" }
+fractonica-glyph = { path = "crates/fractonica-glyph" }
 fractonica-saros-engine = { path = "crates/fractonica-saros-engine" }
 fractonica-saros-geo = { path = "crates/fractonica-saros-geo" }
 fractonica-store-sqlite = { path = "crates/fractonica-store-sqlite" }
@@ -32,6 +34,7 @@ fractonica-temporal-core = { path = "crates/fractonica-temporal-core" }
 fs4 = "1.1.0"
 http-body-util = "0.1.4"
 libc = "0.2.186"
+libm = "0.2.16"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://fractonica.com/schemas/glyph-font-v1.json",
+  "id": "fractonica-hex-v2",
+  "name": "Hex octal glyph font v2",
+  "fontVersion": "1.0.0",
+  "geometryVersion": "2.1.0",
+  "grammarVersion": "1.0.0",
+  "units": 256,
+  "armsCoordinateMode": "socket",
+  "core": {
+    "socketWidth": 16,
+    "coreRadius": 41.57,
+    "insetThickness": 14,
+    "legacyExactOuter": {
+      "depth": 6,
+      "points": [
+        [-8, -41.57],
+        [8, -41.57],
+        [32, -27.71],
+        [40, -13.86],
+        [40, 13.86],
+        [32, 27.71],
+        [8, 41.57],
+        [-8, 41.57],
+        [-32, 27.71],
+        [-40, 13.86],
+        [-40, -13.86],
+        [-32, -27.71]
+      ]
+    },
+    "legacyExactHole": {
+      "depth": 6,
+      "points": [
+        [8, 0],
+        [24, 0],
+        [24, 13.86],
+        [0, 27.71],
+        [-24, 13.86],
+        [-24, 0],
+        [-8, 0]
+      ]
+    }
+  },
+  "renderer": {
+    "gridSize": 8,
+    "paddingCells": 2
+  },
+  "arms": [
+    {
+      "digit": 0,
+      "points": [[-8, 0], [8, 0]]
+    },
+    {
+      "digit": 1,
+      "points": [[-8, 0], [-32, 41.57], [-16, 41.57], [8, 0]]
+    },
+    {
+      "digit": 2,
+      "points": [[-8, 0], [-8, 96.99], [0, 110.85], [8, 96.99], [8, 0]]
+    },
+    {
+      "digit": 3,
+      "points": [[-8, 0], [-40, 55.42], [-8, 110.85], [0, 96.99], [-24, 55.42], [8, 0]]
+    },
+    {
+      "digit": 4,
+      "points": [[-8, 0], [16, 41.57], [32, 41.57], [8, 0]]
+    },
+    {
+      "digit": 5,
+      "points": [[-8, 0], [-40, 55.42], [40, 55.42], [32, 41.57], [-16, 41.57], [8, 0]]
+    },
+    {
+      "digit": 6,
+      "points": [[-8, 0], [-8, 138.56], [40, 55.42], [32, 41.57], [8, 83.14], [8, 0]]
+    },
+    {
+      "digit": 7,
+      "points": [[-8, 0], [-40, 55.42], [0, 124.71], [40, 55.42], [32, 41.57], [0, 96.99], [-24, 55.42], [8, 0]]
+    }
+  ],
+  "provenance": {
+    "source": "octal-glyph-gen commit 440f728, src/glyph/defaultFont.ts",
+    "referenceFixture": "../fixtures/fractonica-hex-v2-777777.svg",
+    "note": "This is the visual default selected by the user. It reuses the proven embedded rasterization approach, while digit zero remains empty to preserve the 000 semantic rule."
+  }
+}

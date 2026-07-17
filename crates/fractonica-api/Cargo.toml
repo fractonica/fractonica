@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 axum.workspace = true
 fractonica-store-sqlite.workspace = true
+fractonica-glyph.workspace = true
 fractonica-saros-engine.workspace = true
 fractonica-temporal-core.workspace = true
 serde.workspace = true

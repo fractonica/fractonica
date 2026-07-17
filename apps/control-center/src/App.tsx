@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { OctalGlyph } from "@fractonica/glyph-react";
 import { Button, Metric, Panel, Skeleton, StatusBadge } from "@fractonica/ui";
 import { createRuntimeNodeClient } from "./api";
 import type { NodeClient, NodeSnapshot } from "./api";
@@ -11,13 +12,7 @@ export interface AppProps {
 }
 
 function FractonicaMark() {
-  return (
-    <svg aria-hidden="true" className="brand-mark" viewBox="0 0 48 48">
-      <circle cx="24" cy="24" r="4.5" />
-      <path d="M24 19.5V7.5m0 33V28.5M19.9 21.6 9.5 15.5m28.9 17L28 26.4M19.9 26.4 9.5 32.5m28.9-17L28 21.6" />
-      <path className="brand-mark__faint" d="m24 7.5 5.5 3.2M9.5 15.5v6.3m0 10.7 5.5 3.2m9 4.8 5.5-3.2m8.9-4.8v-6.3m0-10.7-5.5-3.2" />
-    </svg>
-  );
+  return <OctalGlyph decorative className="brand-mark" depth={6} value="777777" />;
 }
 
 function toneForPhase(phase: "loading" | "offline" | "ready") {

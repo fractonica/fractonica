@@ -46,10 +46,11 @@ shipping any temporal dataset.
 
 ## Portable octal glyph geometry
 
-The first published component is `fractonica/embedded/glyph.h`. It is an
-allocation-free C11 emitter: caller-owned code receives core, arm, and cutout
-polygons through a callback, then decides how to draw them. The component has
-no ESP-IDF, LVGL, heap, filesystem, or network dependency.
+`fractonica/embedded/glyph.h` is an allocation-free C11 emitter. Caller-owned
+code receives compound core and arm outlines through a callback, then decides
+how to draw them. The component has no ESP-IDF, LVGL, heap, filesystem, or
+network dependency. Its generated default is the versioned `fractonica-hex-v2`
+font; the grammar remains the semantic `1 / 2 / 4` octal contract.
 
 The default is a five-digit glyph. The depth is configurable from three to
 eight sockets. Input is an explicit-length, MSB-first ASCII octal string, and
@@ -61,16 +62,21 @@ zero holds the most significant digit, and the remaining sockets run from the
 least significant digit back toward the most significant one. Therefore a
 five-digit `"12345"` glyph has socket values `1, 5, 4, 3, 2`.
 
-The callback's `points` pointer is transient: render or copy the polygon before
-the callback returns. A `CUTOUT` polygon is emitted last so a renderer with an
-erase/background colour can create the central aperture; a renderer without
-that capability can ignore it.
+The callback's contour and point pointers are transient: render or copy them
+before the callback returns. The core has two contours and requires
+`FRACTONICA_GLYPH_FILL_EVENODD`, which produces its aperture without a special
+erase polygon. Each arm has one contour and uses
+`FRACTONICA_GLYPH_FILL_NONZERO`.
 
 ```c
 #include "fractonica/embedded/glyph.h"
 
 static bool draw_polygon(void *display, const fractonica_glyph_polygon_t *polygon) {
-    /* Adapt polygon->points and polygon->point_count to your display API. */
+    for (uint8_t i = 0; i < polygon->contour_count; ++i) {
+        const fractonica_glyph_contour_t *contour = &polygon->contours[i];
+        /* Adapt contour->points / contour->point_count to your display API. */
+    }
+    /* Use polygon->fill_rule when filling a compound outline. */
     return true;
 }
 
@@ -108,8 +114,8 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic -Iinclude \
 The CMake target `fractonica::embedded` links both stable components;
 `fractonica::embedded_glyph` and `fractonica::embedded_temporal` are available
 when a helper only needs one. The test suite also compiles a C++17 consumer
-against the C API. Both published components have ABI version `1` and are
-independently usable now.
+against the C API. The glyph component has ABI version `2` (compound contours);
+the temporal component remains ABI version `1`. They are independently usable.
 
 ### ESP-IDF component use
 

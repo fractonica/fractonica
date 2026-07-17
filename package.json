@@ -7,10 +7,11 @@
   },
   "scripts": {
     "build": "pnpm --recursive build",
-    "check": "pnpm --recursive check",
+    "check": "pnpm glyph:check && pnpm --recursive check",
     "desktop:build": "pnpm --filter @fractonica/desktop bundle",
     "desktop:dev": "pnpm --filter @fractonica/desktop dev",
     "dev": "pnpm --filter @fractonica/control-center dev",
+    "glyph:check": "node tools/glyph/generate-glyph-artifacts.mjs --check",
     "test": "pnpm --recursive test"
   }
 }

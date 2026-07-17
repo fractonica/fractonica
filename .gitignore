@@ -33,6 +33,9 @@ test-results/
 # Local Embedded C SDK CMake build tree
 sdk/embedded-c/build/
 
+# Swift Package Manager build output
+sdk/swift/**/.build/
+
 # Generated Tauri sidecars
 apps/desktop/src-tauri/binaries/*
 !apps/desktop/src-tauri/binaries/.gitkeep

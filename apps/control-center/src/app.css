@@ -113,20 +113,8 @@ main {
   width: 2.25rem;
   height: 2.25rem;
   overflow: visible;
-  fill: none;
-  stroke: #8ce8cf;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.6;
+  color: #8ce8cf;
   filter: drop-shadow(0 0 0.7rem rgba(140, 232, 207, 0.18));
-}
-
-.brand-mark circle {
-  fill: rgba(140, 232, 207, 0.12);
-}
-
-.brand-mark__faint {
-  stroke: rgba(140, 232, 207, 0.35);
 }
 
 .sidebar nav {

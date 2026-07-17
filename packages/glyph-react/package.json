@@ -1,0 +1,24 @@
+{
+  "name": "@fractonica/glyph-react",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "pnpm typecheck",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fractonica/glyph-core": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.9",
+    "react": "^19.1.1",
+    "typescript": "^5.9.2"
+  }
+}
