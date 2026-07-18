@@ -3,7 +3,8 @@
 ## Scope of this guide
 
 At this milestone, self-hosting means running a Fractonica node on the same
-machine that uses it. The default `full` profile owns a local SQLite database;
+machine that uses it. The default `full` profile owns a local SQLite database
+and immutable content store;
 the stateless `saros` profile exposes the verified Saros calculation and
 geometry API without creating local storage. Both profiles expose a
 loopback-only HTTP API for their local control center or local tools. They are
@@ -41,11 +42,21 @@ The currently implemented endpoints are:
 | `GET /health/live` | Confirms that the HTTP process is alive. |
 | `GET /health/ready` | Confirms that the local SQLite store is available and reports its schema version. |
 | `GET /api/v1/node` | Returns the local installation descriptor. |
+| `POST /api/v1/operations` | Validates and appends one causal record operation. |
+| `GET /api/v1/operations` | Pages the node-local operation feed by local cursor. |
+| `GET /api/v1/entities/{entityId}` | Returns the current heads and conflict state for an entity. |
+| `/api/v1/uploads` | Discovers and creates resumable tus uploads. |
+| `/api/v1/uploads/{uploadId}` | Inspects or appends to one resumable upload. |
+| `/api/v1/blobs/{contentId}` | Streams immutable content, including one byte range. |
+| `POST /api/v1/blobs/availability` | Separates locally available and missing content IDs. |
 | `/api/docs` | Serves the Swagger UI for the checked-in OpenAPI document. |
 | `GET /api/openapi.json` | Serves that OpenAPI document as JSON. |
 
-These endpoints are diagnostics and local-node metadata only. They do not yet
-create, fetch, synchronize, or publish records, events, media, or device data.
+The operation and content APIs are deliberately local building blocks. They do
+not yet pair devices, replicate with peers, or publish data outside this node.
+See [operation-log semantics](operation-log.md) and
+[content-addressed storage](content-storage.md) before building an importer or
+agent against them.
 
 ## Run a stateless Saros engine
 
@@ -110,16 +121,18 @@ On Unix, the node creates or tightens these permissions:
 - the data directory: `0700`;
 - `fractonica.db`: `0600`;
 - `node.lock`: `0600`.
+- `content/`, its staging directory, and digest-prefix directories: `0700`;
+- staged and committed content files: `0600`.
 
 It also refuses a symbolic link where the data directory or database file is
 expected. These controls protect local filesystem ownership only; they do not
 encrypt the database. Store backups in a location with equivalent access
 controls.
 
-The database uses SQLite WAL mode with `synchronous=FULL`. The current schema
-is intentionally small, but back up the whole data directory rather than
-assuming that a single database file will remain the complete installation
-state.
+The database uses SQLite WAL mode with `synchronous=FULL`. Blob bytes live
+outside SQLite under `content/`; their descriptors and upload state live in
+the database. Always back up the whole data directory. A database-only backup
+retains causal references but loses locally available media bytes.
 
 ## Backup and recovery safety
 

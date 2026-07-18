@@ -9,21 +9,30 @@ repository.workspace = true
 
 [dependencies]
 axum.workspace = true
-fractonica-store-sqlite.workspace = true
+base64.workspace = true
+fractonica-application.workspace = true
+fractonica-blob-store.workspace = true
+fractonica-content.workspace = true
+fractonica-data-model.workspace = true
 fractonica-glyph.workspace = true
 fractonica-saros-engine.workspace = true
 fractonica-temporal-core.workspace = true
+httpdate.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 subtle.workspace = true
 time.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util.workspace = true
 tower-http.workspace = true
 utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
+fractonica-store-sqlite.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
 tower.workspace = true

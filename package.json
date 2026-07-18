@@ -12,6 +12,7 @@
     "desktop:dev": "pnpm --filter @fractonica/desktop dev",
     "dev": "pnpm --filter @fractonica/control-center dev",
     "glyph:check": "node tools/glyph/generate-glyph-artifacts.mjs --check",
+    "import:exeligmos": "pnpm --filter @fractonica/import-exeligmos start",
     "test": "pnpm --recursive test"
   }
 }

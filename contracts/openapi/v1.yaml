@@ -19,6 +19,14 @@ tags:
     description: Process and profile readiness probes.
   - name: Node
     description: Local node-profile identity and declared capabilities.
+  - name: Operations
+    description: >-
+      Durable node-profile operation log and materialized entity heads. These
+      routes return 503 when the stateless `saros` profile is selected.
+  - name: Content
+    description: >-
+      Stateful content-addressed blob discovery, tus 1.0.0 resumable upload,
+      and immutable byte streaming. These routes return 503 from `saros`.
   - name: Saros
     description: Deterministic temporal readings and reviewed eclipse geometry.
   - name: Glyphs
@@ -84,6 +92,549 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
+  /api/v1/operations:
+    post:
+      tags:
+        - Operations
+      summary: Append an idempotent operation to the local node log
+      operationId: appendOperation
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperationSubmission"
+      responses:
+        "201":
+          description: >-
+            The operation was accepted and assigned a node-local sequence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredOperation"
+        "200":
+          description: >-
+            The same idempotency key and canonical request were already
+            accepted; the original stored operation is replayed unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredOperation"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "409":
+          description: >-
+            The idempotency key was reused with a different request, or a
+            causal parent conflicts with the operation log.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: The operation is malformed or violates a domain invariant.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    get:
+      tags:
+        - Operations
+      summary: Read a node-local page of stored operations
+      operationId: listOperations
+      parameters:
+        - $ref: "#/components/parameters/OperationsAfter"
+        - $ref: "#/components/parameters/OperationsLimit"
+      responses:
+        "200":
+          description: >-
+            Operations ordered by ascending node-local sequence, strictly
+            after the requested cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationPage"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "422":
+          $ref: "#/components/responses/ProblemResponse"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/entities/{entityId}:
+    get:
+      tags:
+        - Operations
+      summary: Resolve the current causal heads of an entity
+      operationId: getEntity
+      parameters:
+        - $ref: "#/components/parameters/EntityId"
+      responses:
+        "200":
+          description: >-
+            The entity's current stored heads. Concurrent heads are retained
+            rather than resolved by arrival order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityState"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "404":
+          description: No operation for the canonical entity UUID is stored.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          $ref: "#/components/responses/ProblemResponse"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/uploads:
+    options:
+      tags:
+        - Content
+      summary: Discover resumable upload capabilities
+      operationId: getUploadCapabilities
+      responses:
+        "204":
+          description: >-
+            The node supports tus 1.0.0 creation, expiration, and checksum
+            extensions with the advertised limits.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Tus-Version:
+              $ref: "#/components/headers/TusVersion"
+            Tus-Extension:
+              $ref: "#/components/headers/TusExtension"
+            Tus-Max-Size:
+              $ref: "#/components/headers/TusMaxSize"
+            Tus-Checksum-Algorithm:
+              $ref: "#/components/headers/TusChecksumAlgorithm"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    post:
+      tags:
+        - Content
+      summary: Create an empty tus upload resource
+      operationId: createUpload
+      parameters:
+        - $ref: "#/components/parameters/TusResumableRequest"
+        - $ref: "#/components/parameters/UploadLengthRequest"
+        - $ref: "#/components/parameters/UploadMetadataRequest"
+      responses:
+        "201":
+          description: >-
+            Upload staging was created at the returned Location. A zero-byte
+            upload may already be committed and include Fractonica-Content-Id.
+          headers:
+            Location:
+              $ref: "#/components/headers/UploadLocation"
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Offset:
+              $ref: "#/components/headers/UploadOffset"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+            Fractonica-Content-Id:
+              $ref: "#/components/headers/FractonicaContentId"
+        "400":
+          $ref: "#/components/responses/TusProblemResponse"
+        "401":
+          $ref: "#/components/responses/TusProblemResponse"
+        "412":
+          description: The requested tus version is unsupported.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Tus-Version:
+              $ref: "#/components/headers/TusVersion"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: Upload-Length exceeds the node's configured blob limit.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/uploads/{uploadId}:
+    head:
+      tags:
+        - Content
+      summary: Inspect the durable offset of a tus upload
+      operationId: getUploadOffset
+      parameters:
+        - $ref: "#/components/parameters/UploadId"
+        - $ref: "#/components/parameters/TusResumableRequest"
+      responses:
+        "200":
+          description: Current durable upload offset and declared length.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Offset:
+              $ref: "#/components/headers/UploadOffset"
+            Upload-Length:
+              $ref: "#/components/headers/UploadLength"
+            Upload-Metadata:
+              $ref: "#/components/headers/UploadMetadata"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+            Fractonica-Content-Id:
+              $ref: "#/components/headers/FractonicaContentId"
+            Cache-Control:
+              $ref: "#/components/headers/UploadCacheControl"
+        "401":
+          $ref: "#/components/responses/TusProblemResponse"
+        "404":
+          $ref: "#/components/responses/TusProblemResponse"
+        "410":
+          description: The unfinished upload expired and is no longer resumable.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "412":
+          description: The requested tus version is unsupported.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Tus-Version:
+              $ref: "#/components/headers/TusVersion"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    patch:
+      tags:
+        - Content
+      summary: Append one bounded chunk to a tus upload
+      operationId: appendUploadChunk
+      parameters:
+        - $ref: "#/components/parameters/UploadId"
+        - $ref: "#/components/parameters/TusResumableRequest"
+        - $ref: "#/components/parameters/UploadOffsetRequest"
+        - $ref: "#/components/parameters/UploadChecksumRequest"
+        - $ref: "#/components/parameters/UploadChunkLengthRequest"
+      requestBody:
+        required: true
+        content:
+          application/offset+octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "204":
+          description: >-
+            The chunk was durably accepted. When the upload becomes complete,
+            Fractonica-Content-Id identifies the committed immutable blob.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Offset:
+              $ref: "#/components/headers/UploadOffset"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+            Fractonica-Content-Id:
+              $ref: "#/components/headers/FractonicaContentId"
+        "400":
+          description: Upload-Checksum uses an unsupported checksum algorithm.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/TusProblemResponse"
+        "404":
+          $ref: "#/components/responses/TusProblemResponse"
+        "409":
+          description: >-
+            Upload-Offset does not equal the resource's current durable offset;
+            the request body was not applied.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Offset:
+              $ref: "#/components/headers/UploadOffset"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "410":
+          description: The unfinished upload expired and is no longer resumable.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "412":
+          description: The requested tus version is unsupported.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Tus-Version:
+              $ref: "#/components/headers/TusVersion"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: >-
+            The chunk exceeds 4 MiB or would advance beyond Upload-Length.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "415":
+          description: Content-Type must be application/offset+octet-stream.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: >-
+            The complete upload does not match the expected content ID
+            declared in Upload-Metadata. The upload remains resumable from its
+            last durable offset.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Offset:
+              $ref: "#/components/headers/UploadOffset"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "460":
+          description: >-
+            The supplied chunk checksum did not match. The chunk was discarded
+            and Upload-Offset was not changed.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+            Upload-Offset:
+              $ref: "#/components/headers/UploadOffset"
+            Upload-Expires:
+              $ref: "#/components/headers/UploadExpires"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          headers:
+            Tus-Resumable:
+              $ref: "#/components/headers/TusResumable"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/blobs/{contentId}:
+    get:
+      tags:
+        - Content
+      summary: Stream an immutable content-addressed blob
+      operationId: getBlob
+      parameters:
+        - $ref: "#/components/parameters/BlobContentId"
+        - $ref: "#/components/parameters/BlobRangeRequest"
+      responses:
+        "200":
+          description: Complete immutable blob bytes.
+          headers:
+            ETag:
+              $ref: "#/components/headers/BlobEtag"
+            Accept-Ranges:
+              $ref: "#/components/headers/BlobAcceptRanges"
+            Content-Length:
+              $ref: "#/components/headers/BlobContentLength"
+            Content-Digest:
+              $ref: "#/components/headers/BlobContentDigest"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "206":
+          description: >-
+            One satisfiable byte range. Content-Digest covers the partial
+            message content, as required by RFC 9530.
+          headers:
+            ETag:
+              $ref: "#/components/headers/BlobEtag"
+            Accept-Ranges:
+              $ref: "#/components/headers/BlobAcceptRanges"
+            Content-Length:
+              $ref: "#/components/headers/BlobContentLength"
+            Content-Range:
+              $ref: "#/components/headers/BlobContentRange"
+            Content-Digest:
+              $ref: "#/components/headers/BlobContentDigest"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "404":
+          $ref: "#/components/responses/ProblemResponse"
+        "416":
+          description: The requested byte range is not satisfiable.
+          headers:
+            Content-Range:
+              $ref: "#/components/headers/BlobUnsatisfiedContentRange"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: The path does not contain a canonical content ID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    head:
+      tags:
+        - Content
+      summary: Inspect immutable blob metadata without transferring bytes
+      operationId: headBlob
+      parameters:
+        - $ref: "#/components/parameters/BlobContentId"
+      responses:
+        "200":
+          description: >-
+            Metadata for the complete selected representation. Repr-Digest,
+            rather than Content-Digest, identifies the full blob because a
+            HEAD response has no message content.
+          headers:
+            ETag:
+              $ref: "#/components/headers/BlobEtag"
+            Accept-Ranges:
+              $ref: "#/components/headers/BlobAcceptRanges"
+            Content-Length:
+              $ref: "#/components/headers/BlobContentLength"
+            Repr-Digest:
+              $ref: "#/components/headers/BlobRepresentationDigest"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "404":
+          $ref: "#/components/responses/ProblemResponse"
+        "422":
+          description: The path does not contain a canonical content ID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/blobs/availability:
+    post:
+      tags:
+        - Content
+      summary: Resolve which content IDs are locally available
+      operationId: getBlobAvailability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BlobAvailabilityRequest"
+      responses:
+        "200":
+          description: Available descriptors and content IDs missing from this node.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlobAvailabilityResponse"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
+        "422":
+          $ref: "#/components/responses/ProblemResponse"
+        "503":
+          description: Persistent storage is unavailable for the selected profile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /api/v1/saros:
     get:
       tags:
@@ -319,7 +870,139 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+    TusProblemResponse:
+      description: A tus request failed with a structured problem response.
+      headers:
+        Tus-Resumable:
+          $ref: "#/components/headers/TusResumable"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
   parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Opaque retry key scoped to the request actor. Reusing a key with the
+        same canonical request replays the original response; reusing it with
+        different content returns 409.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 200
+        pattern: "^[!-~]{8,200}$"
+    OperationsAfter:
+      name: after
+      in: query
+      required: false
+      description: >-
+        Exclusive node-local sequence cursor. It has no meaning on another
+        node and must not be used as a causal or globally ordered timestamp.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        default: 0
+    OperationsLimit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of stored operations returned in this page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 100
+    EntityId:
+      name: entityId
+      in: path
+      required: true
+      description: Canonical entity UUID. Human-facing short IDs are aliases only.
+      schema:
+        type: string
+        format: uuid
+    UploadId:
+      name: uploadId
+      in: path
+      required: true
+      description: Opaque UUID of an unfinished or recently completed upload resource.
+      schema:
+        type: string
+        format: uuid
+    TusResumableRequest:
+      name: Tus-Resumable
+      in: header
+      required: true
+      description: tus protocol version selected by the client.
+      schema:
+        type: string
+        const: 1.0.0
+    UploadLengthRequest:
+      name: Upload-Length
+      in: header
+      required: true
+      description: Declared complete blob length in bytes. Deferred length is not supported.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        maximum: 17179869184
+    UploadMetadataRequest:
+      name: Upload-Metadata
+      in: header
+      required: false
+      description: >-
+        Optional tus metadata as unique comma-separated key/Base64-value pairs.
+        It is staging metadata and does not affect the content ID.
+      schema:
+        type: string
+        maxLength: 8192
+    UploadOffsetRequest:
+      name: Upload-Offset
+      in: header
+      required: true
+      description: Byte offset at which this chunk must begin.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    UploadChecksumRequest:
+      name: Upload-Checksum
+      in: header
+      required: false
+      description: >-
+        tus checksum-extension value for this PATCH body: a supported
+        lowercase algorithm name, one space, and its Base64 digest.
+      schema:
+        type: string
+        pattern: '^(sha1|sha256) [A-Za-z0-9+/]+={0,2}$'
+    UploadChunkLengthRequest:
+      name: Content-Length
+      in: header
+      required: true
+      description: PATCH body length in bytes; Fractonica accepts at most 4 MiB per chunk.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 4194304
+    BlobContentId:
+      name: contentId
+      in: path
+      required: true
+      description: Canonical SHA-256 content identifier.
+      schema:
+        $ref: "#/components/schemas/ContentId"
+    BlobRangeRequest:
+      name: Range
+      in: header
+      required: false
+      description: One RFC 9110 byte range. Multiple ranges are not supported.
+      schema:
+        type: string
+        pattern: '^bytes=([0-9]+-[0-9]*|-[0-9]+)$'
     SarosSeries:
       name: saros
       in: path
@@ -401,6 +1084,117 @@ components:
       schema:
         type: string
         pattern: "^#?[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$"
+  headers:
+    TusResumable:
+      description: tus protocol version used by this response.
+      schema:
+        type: string
+        const: 1.0.0
+    TusVersion:
+      description: Supported tus protocol versions in server preference order.
+      schema:
+        type: string
+        const: 1.0.0
+    TusExtension:
+      description: Supported tus extensions.
+      schema:
+        type: string
+        const: creation,expiration,checksum
+    TusMaxSize:
+      description: Default maximum complete upload size in bytes (16 GiB).
+      schema:
+        type: integer
+        format: int64
+        const: 17179869184
+    TusChecksumAlgorithm:
+      description: >-
+        Supported tus chunk-checksum algorithms. sha1 is required by tus 1.0.0;
+        sha256 is preferred for new Fractonica clients.
+      schema:
+        type: string
+        const: sha1,sha256
+    UploadLocation:
+      description: Relative or absolute URL of the created upload resource.
+      schema:
+        type: string
+        format: uri-reference
+    UploadOffset:
+      description: Current durable byte offset within the upload resource.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    UploadLength:
+      description: Declared complete upload length in bytes.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        maximum: 17179869184
+    UploadMetadata:
+      description: >-
+        Original tus Upload-Metadata value supplied when the upload was
+        created. Omitted when creation included no metadata.
+      schema:
+        type: string
+        maxLength: 8192
+    UploadExpires:
+      description: >-
+        RFC 9110 HTTP-date after which an unfinished upload cannot be resumed.
+        Present whenever the upload is subject to expiration.
+      schema:
+        type: string
+    FractonicaContentId:
+      description: >-
+        Present when the complete upload has been verified and committed into
+        immutable content-addressed storage.
+      schema:
+        $ref: "#/components/schemas/ContentId"
+    UploadCacheControl:
+      description: Prevents caches from retaining mutable upload offset state.
+      schema:
+        type: string
+        const: no-store
+    BlobEtag:
+      description: Strong validator equal to the quoted canonical content ID.
+      schema:
+        type: string
+        pattern: '^"sha-256:[0-9a-f]{64}"$'
+    BlobAcceptRanges:
+      description: Indicates support for a single byte range.
+      schema:
+        type: string
+        const: bytes
+    BlobContentLength:
+      description: Number of bytes in this response content.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        maximum: 17179869184
+    BlobContentDigest:
+      description: >-
+        RFC 9530 Content-Digest of the actual response content, encoded as an
+        HTTP Structured Fields sha-256 Byte Sequence.
+      schema:
+        type: string
+        pattern: '^sha-256=:[A-Za-z0-9+/]{43}=:$'
+    BlobRepresentationDigest:
+      description: >-
+        RFC 9530 Repr-Digest of the complete selected blob representation.
+      schema:
+        type: string
+        pattern: '^sha-256=:[A-Za-z0-9+/]{43}=:$'
+    BlobContentRange:
+      description: Byte range and complete blob size for a 206 response.
+      schema:
+        type: string
+        pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$'
+    BlobUnsatisfiedContentRange:
+      description: Complete blob size returned for an unsatisfied range.
+      schema:
+        type: string
+        pattern: '^bytes \*/[0-9]+$'
   schemas:
     LiveStatus:
       type: object
@@ -506,6 +1300,318 @@ components:
             type: string
             minLength: 1
             maxLength: 64
+    OperationSubmission:
+      type: object
+      additionalProperties: false
+      required:
+        - protocolVersion
+        - operationId
+        - entityId
+        - schema
+        - causalParents
+        - occurredAtUnixMs
+        - body
+      properties:
+        protocolVersion:
+          type: integer
+          const: 1
+        operationId:
+          type: string
+          format: uuid
+          description: Canonical operation identifier generated by the submitting client.
+        entityId:
+          type: string
+          format: uuid
+          description: Canonical UUID of the entity affected by this operation.
+        schema:
+          type: string
+          const: record.v1
+        causalParents:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: >-
+            Canonical operation UUIDs observed as causal predecessors. An
+            initial put uses an empty array; a merge put names every current
+            head.
+          items:
+            type: string
+            format: uuid
+        occurredAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Client-declared event time; it does not determine log order.
+        body:
+          $ref: "#/components/schemas/OperationBody"
+    Operation:
+      type: object
+      additionalProperties: false
+      required:
+        - protocolVersion
+        - operationId
+        - entityId
+        - actorId
+        - schema
+        - causalParents
+        - occurredAtUnixMs
+        - body
+      properties:
+        protocolVersion:
+          type: integer
+          const: 1
+        operationId:
+          type: string
+          format: uuid
+        entityId:
+          type: string
+          format: uuid
+        actorId:
+          type: string
+          format: uuid
+          description: >-
+            Actor resolved by the node from trusted local context. In this
+            loopback-only version it is the persistent installation identity;
+            submitters cannot provide or override it.
+        schema:
+          type: string
+          const: record.v1
+        causalParents:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        occurredAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+        body:
+          $ref: "#/components/schemas/OperationBody"
+    OperationBody:
+      oneOf:
+        - $ref: "#/components/schemas/PutOperationBody"
+        - $ref: "#/components/schemas/TombstoneOperationBody"
+    PutOperationBody:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - document
+      properties:
+        kind:
+          type: string
+          const: put
+        document:
+          $ref: "#/components/schemas/RecordDocument"
+    TombstoneOperationBody:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          const: tombstone
+    RecordDocument:
+      type: object
+      additionalProperties: false
+      required:
+        - startAtUnixMs
+        - visibility
+      properties:
+        startAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+        endAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: When present, must be greater than or equal to startAtUnixMs.
+        visibility:
+          type: string
+          enum: [public, private]
+        emoji:
+          type: string
+          minLength: 1
+          maxLength: 32
+        text:
+          type: string
+          maxLength: 262144
+        metadata:
+          type: object
+          maxProperties: 128
+          additionalProperties: true
+          description: Schema-specific JSON metadata retained without interpretation.
+        resources:
+          type: array
+          maxItems: 64
+          description: >-
+            Ordered immutable content references. Array order is part of the
+            record document and is preserved even when a blob is not local.
+          items:
+            $ref: "#/components/schemas/ResourceRef"
+    ContentId:
+      type: string
+      pattern: '^sha-256:[0-9a-f]{64}$'
+      description: >-
+        Canonical identifier derived from the SHA-256 digest of the complete
+        unencoded blob bytes. The hexadecimal digest is lowercase.
+    ResourceRef:
+      type: object
+      additionalProperties: false
+      required:
+        - contentId
+        - byteLength
+        - mediaType
+        - role
+      properties:
+        contentId:
+          $ref: "#/components/schemas/ContentId"
+        byteLength:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1099511627776
+          description: Complete unencoded byte length asserted by this reference.
+        mediaType:
+          type: string
+          minLength: 1
+          maxLength: 127
+          pattern: "^[A-Za-z0-9!#$%&'*+.^_`|~-]+/[A-Za-z0-9!#$%&'*+.^_`|~-]+$"
+          description: Client-declared canonical media type; it is not part of the content ID.
+        role:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z0-9._-]+$'
+          description: Lowercase semantic role interpreted by the record schema.
+        originalName:
+          type: string
+          minLength: 1
+          maxLength: 255
+          pattern: '^(?!\.{1,2}$)[^/\\:\u0000-\u001F\u007F-\u009F]+$'
+          description: >-
+            Optional path-free display label. Control characters, slash,
+            backslash, colon, dot, and dot-dot are rejected.
+    ContentDescriptor:
+      type: object
+      additionalProperties: false
+      required:
+        - contentId
+        - byteLength
+      properties:
+        contentId:
+          $ref: "#/components/schemas/ContentId"
+        byteLength:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1099511627776
+    BlobAvailabilityRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - contentIds
+      properties:
+        contentIds:
+          type: array
+          minItems: 1
+          maxItems: 256
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ContentId"
+    BlobAvailabilityResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - available
+        - missing
+      properties:
+        available:
+          type: array
+          maxItems: 256
+          description: Locally committed blobs, in request order after missing IDs are removed.
+          items:
+            $ref: "#/components/schemas/ContentDescriptor"
+        missing:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          description: Content IDs not currently committed on this node, in request order.
+          items:
+            $ref: "#/components/schemas/ContentId"
+    StoredOperation:
+      type: object
+      additionalProperties: false
+      required:
+        - localSequence
+        - operation
+      properties:
+        localSequence:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >-
+            Monotonic cursor assigned by this node only. It is not a causal,
+            temporal, portable, or globally comparable identifier.
+        operation:
+          $ref: "#/components/schemas/Operation"
+    OperationPage:
+      type: object
+      additionalProperties: false
+      required:
+        - operations
+        - nextAfter
+        - hasMore
+      properties:
+        operations:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/StoredOperation"
+        nextAfter:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Cursor to pass as `after` when requesting the next page.
+        hasMore:
+          type: boolean
+    EntityState:
+      type: object
+      additionalProperties: false
+      required:
+        - entityId
+        - schema
+        - operationCount
+        - conflicted
+        - heads
+      properties:
+        entityId:
+          type: string
+          format: uuid
+        schema:
+          type: string
+          const: record.v1
+        operationCount:
+          type: integer
+          format: int64
+          minimum: 1
+        conflicted:
+          type: boolean
+          description: True when more than one concurrent current head is retained.
+        heads:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Current stored operations after causal ancestry is reduced. A
+            tombstone remains a durable head until a later causal operation
+            explicitly descends from it.
+          items:
+            $ref: "#/components/schemas/StoredOperation"
     SarosMetadata:
       type: object
       additionalProperties: false

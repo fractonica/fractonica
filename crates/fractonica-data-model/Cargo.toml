@@ -1,0 +1,15 @@
+[package]
+name = "fractonica-data-model"
+description = "Canonical causal operation model and deterministic entity reducer for Fractonica"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fractonica-content.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

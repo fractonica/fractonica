@@ -103,6 +103,15 @@ importers:
         specifier: ^5.9.2
         version: 5.9.3
 
+  tools/import-exeligmos:
+    devDependencies:
+      '@types/node':
+        specifier: ^24.10.0
+        version: 24.13.3
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
 packages:
 
   '@adobe/css-tools@4.5.0':

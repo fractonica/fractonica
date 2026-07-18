@@ -1,15 +1,37 @@
 //! HTTP and OpenAPI surface for a local Fractonica node.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File as StdFile,
+    io::{Read as _, Seek as _, SeekFrom},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State, rejection::QueryRejection},
-    http::{HeaderName, HeaderValue, Method, StatusCode, header},
+    body::{Body, to_bytes},
+    extract::{
+        Path, Query, Request, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, head, options, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use fractonica_application::{
+    ApplicationError, ApplicationService, DEFAULT_CHANGE_LIMIT, EntityState,
+    MAX_AVAILABILITY_CONTENT_IDS, OperationChangePage, RepositoryError, StoredOperation,
+    SubmitOperationCommand, UploadId, UploadSession, UploadState,
+};
+use fractonica_blob_store::{BlobStore, BlobStoreError, CreateUpload, MAX_PATCH_BYTES};
+use fractonica_content::{
+    ContentDescriptor, ContentId, MAX_MEDIA_TYPE_BYTES, MAX_ORIGINAL_NAME_CHARS,
+};
+use fractonica_data_model::{EntityId, EntitySchema};
 use fractonica_glyph::{
     DEFAULT_DIGITS, FONT_ID as GLYPH_FONT_ID, FONT_SHA256 as GLYPH_FONT_SHA256,
     FONT_VERSION as GLYPH_FONT_VERSION, GEOMETRY_VERSION as GLYPH_GEOMETRY_VERSION,
@@ -22,12 +44,15 @@ use fractonica_saros_engine::{
     EclipseIdentity, EclipsePath, GeometryRelease, SarosEngine, SarosEngineError, SarosPulse,
     SarosReading,
 };
-use fractonica_store_sqlite::SqliteStore;
 use fractonica_temporal_core::{BitPrecision, PhaseRatio, Rarity, TemporalError, Timestamp};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -43,6 +68,17 @@ const SAROS_CAPABILITIES: &[&str] = &[
 ];
 const FULL_NODE_CAPABILITIES: &[&str] = &[
     "canonical-octal-glyphs",
+    "causal-operation-log",
+    "local-storage",
+    "node-http-api",
+    "openapi",
+    "saros-calculation",
+    "reviewed-eclipse-geometry",
+];
+const FULL_NODE_CONTENT_CAPABILITIES: &[&str] = &[
+    "canonical-octal-glyphs",
+    "causal-operation-log",
+    "content-addressed-resources",
     "local-storage",
     "node-http-api",
     "openapi",
@@ -58,6 +94,11 @@ const BEARER_TOKEN_MAX_LENGTH: usize = 512;
 const DEFAULT_GLYPH_RASTER_SIZE: u16 = 128;
 const MAX_GLYPH_RASTER_DIMENSION: u16 = 2_048;
 const MAX_GLYPH_RASTER_PIXELS: usize = 4_194_304;
+const TUS_VERSION: &str = "1.0.0";
+const TUS_EXTENSIONS: &str = "creation,expiration,checksum";
+const TUS_CHECKSUM_ALGORITHMS: &str = "sha1,sha256";
+const MAX_UPLOAD_METADATA_BYTES: usize = 8_192;
+const FILE_DIGEST_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ApiStateError {
@@ -110,7 +151,8 @@ impl NodeProfile {
 
 #[derive(Clone)]
 pub struct ApiState {
-    store: Option<Arc<SqliteStore>>,
+    application: Option<Arc<ApplicationService>>,
+    blob_store: Option<Arc<BlobStore>>,
     saros: Arc<SarosEngine>,
     profile: NodeProfile,
     display_name: Arc<str>,
@@ -122,11 +164,11 @@ pub struct ApiState {
 
 impl ApiState {
     pub fn new(
-        store: Arc<SqliteStore>,
+        application: Arc<ApplicationService>,
         display_name: impl Into<Arc<str>>,
         version: impl Into<Arc<str>>,
     ) -> Result<Self, ApiStateError> {
-        Self::new_inner(Some(store), NodeProfile::Full, display_name, version)
+        Self::new_inner(Some(application), NodeProfile::Full, display_name, version)
     }
 
     /// Builds a stateless Saros-only HTTP surface.
@@ -142,7 +184,7 @@ impl ApiState {
     }
 
     fn new_inner(
-        store: Option<Arc<SqliteStore>>,
+        application: Option<Arc<ApplicationService>>,
         profile: NodeProfile,
         display_name: impl Into<Arc<str>>,
         version: impl Into<Arc<str>>,
@@ -159,7 +201,8 @@ impl ApiState {
 
         let started_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         Ok(Self {
-            store,
+            application,
+            blob_store: None,
             saros: Arc::new(SarosEngine::embedded_reviewed()?),
             profile,
             display_name,
@@ -194,6 +237,16 @@ impl ApiState {
         self.bearer_token = Some(bearer_token);
         Ok(self)
     }
+
+    /// Installs the node-profile immutable content store.
+    ///
+    /// Keeping this explicit prevents the stateless Saros profile from ever
+    /// creating filesystem or database state as a side effect of HTTP setup.
+    #[must_use]
+    pub fn with_blob_store(mut self, blob_store: Arc<BlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
+        self
+    }
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -209,10 +262,22 @@ pub fn router(state: ApiState) -> Router {
     ]);
     let authentication_state = state.clone();
 
-    Router::new()
+    let application = Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/api/v1/node", get(node))
+        .route(
+            "/api/v1/operations",
+            get(operation_changes).post(submit_operation),
+        )
+        .route("/api/v1/entities/{entity_id}", get(entity_state))
+        .route("/api/v1/uploads", post(create_upload))
+        .route(
+            "/api/v1/uploads/{upload_id}",
+            head(upload_status).patch(append_upload_chunk),
+        )
+        .route("/api/v1/blobs/availability", post(blob_availability))
+        .route("/api/v1/blobs/{content_id}", get(get_blob).head(head_blob))
         .route("/api/v1/saros", get(saros_metadata))
         .route("/api/v1/glyphs", get(glyph_metadata))
         .route("/api/v1/glyphs/{octal}/geometry", get(glyph_geometry))
@@ -231,9 +296,43 @@ pub fn router(state: ApiState) -> Router {
         .layer(
             CorsLayer::new()
                 .allow_origin(allowed_origins)
-                .allow_methods([Method::GET])
-                .allow_headers([header::ACCEPT, header::AUTHORIZATION])
+                .allow_methods([
+                    Method::GET,
+                    Method::HEAD,
+                    Method::OPTIONS,
+                    Method::PATCH,
+                    Method::POST,
+                ])
+                .allow_headers([
+                    header::ACCEPT,
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    HeaderName::from_static("idempotency-key"),
+                    HeaderName::from_static("range"),
+                    HeaderName::from_static("tus-resumable"),
+                    HeaderName::from_static("upload-checksum"),
+                    HeaderName::from_static("upload-length"),
+                    HeaderName::from_static("upload-metadata"),
+                    HeaderName::from_static("upload-offset"),
+                ])
                 .expose_headers([
+                    header::ACCEPT_RANGES,
+                    header::CONTENT_LENGTH,
+                    header::CONTENT_RANGE,
+                    header::ETAG,
+                    header::LOCATION,
+                    HeaderName::from_static("repr-digest"),
+                    HeaderName::from_static("content-digest"),
+                    HeaderName::from_static("fractonica-content-id"),
+                    HeaderName::from_static("tus-checksum-algorithm"),
+                    HeaderName::from_static("tus-extension"),
+                    HeaderName::from_static("tus-max-size"),
+                    HeaderName::from_static("tus-resumable"),
+                    HeaderName::from_static("tus-version"),
+                    HeaderName::from_static("upload-expires"),
+                    HeaderName::from_static("upload-length"),
+                    HeaderName::from_static("upload-metadata"),
+                    HeaderName::from_static("upload-offset"),
                     HeaderName::from_static("x-fractonica-pixel-format"),
                     HeaderName::from_static("x-fractonica-width"),
                     HeaderName::from_static("x-fractonica-height"),
@@ -246,7 +345,16 @@ pub fn router(state: ApiState) -> Router {
                 ]),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state.clone());
+
+    // `CorsLayer` answers all OPTIONS requests itself. Keep protocol
+    // discovery outside that layer so a plain tus OPTIONS request reaches the
+    // capability handler rather than receiving an empty generic CORS reply.
+    let upload_options = Router::new()
+        .route("/api/v1/uploads", options(upload_capabilities))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+    application.merge(upload_options)
 }
 
 #[derive(Debug, Serialize)]
@@ -281,6 +389,42 @@ pub struct NodeResponse {
     pub started_at: String,
     pub uptime_seconds: u64,
     pub capabilities: Vec<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationChangesQuery {
+    #[serde(default)]
+    after: u64,
+    #[serde(default = "default_change_limit")]
+    limit: usize,
+}
+
+const fn default_change_limit() -> usize {
+    DEFAULT_CHANGE_LIMIT
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityStateResponse {
+    pub entity_id: EntityId,
+    pub schema: EntitySchema,
+    pub operation_count: u64,
+    pub conflicted: bool,
+    pub heads: Vec<StoredOperation>,
+}
+
+impl From<EntityState> for EntityStateResponse {
+    fn from(value: EntityState) -> Self {
+        let conflicted = value.is_conflicted();
+        Self {
+            entity_id: value.entity_id,
+            schema: value.schema,
+            operation_count: value.operation_count,
+            conflicted,
+            heads: value.heads,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -536,27 +680,62 @@ struct ApiError {
     code: &'static str,
     title: &'static str,
     detail: String,
+    response_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl ApiError {
-    fn unavailable(detail: impl Into<String>) -> Self {
+    fn status(
+        status: StatusCode,
+        problem_type: &'static str,
+        code: &'static str,
+        title: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            problem_type: "https://fractonica.com/problems/node-not-ready",
-            code: "node_not_ready",
-            title: "Node is not ready",
+            status,
+            problem_type,
+            code,
+            title,
             detail: detail.into(),
+            response_headers: Vec::new(),
         }
     }
 
-    fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            problem_type: "https://fractonica.com/problems/invalid-bootstrap-token",
-            code: "invalid_bootstrap_token",
-            title: "Authentication required",
-            detail: "Supply the bearer token issued by the local node supervisor.".into(),
+    fn with_header(mut self, name: &'static str, value: impl AsRef<str>) -> Self {
+        if let Ok(value) = HeaderValue::from_str(value.as_ref()) {
+            self.response_headers
+                .push((HeaderName::from_static(name), value));
         }
+        self
+    }
+
+    fn bad_request(
+        problem_type: &'static str,
+        code: &'static str,
+        title: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::status(StatusCode::BAD_REQUEST, problem_type, code, title, detail)
+    }
+
+    fn unavailable(detail: impl Into<String>) -> Self {
+        Self::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "https://fractonica.com/problems/node-not-ready",
+            "node_not_ready",
+            "Node is not ready",
+            detail,
+        )
+    }
+
+    fn unauthorized() -> Self {
+        Self::status(
+            StatusCode::UNAUTHORIZED,
+            "https://fractonica.com/problems/invalid-bootstrap-token",
+            "invalid_bootstrap_token",
+            "Authentication required",
+            "Supply the bearer token issued by the local node supervisor.",
+        )
     }
 
     fn unprocessable(
@@ -565,13 +744,22 @@ impl ApiError {
         title: &'static str,
         detail: impl Into<String>,
     ) -> Self {
-        Self {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
+        Self::status(
+            StatusCode::UNPROCESSABLE_ENTITY,
             problem_type,
             code,
             title,
-            detail: detail.into(),
-        }
+            detail,
+        )
+    }
+
+    fn conflict(
+        problem_type: &'static str,
+        code: &'static str,
+        title: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::status(StatusCode::CONFLICT, problem_type, code, title, detail)
     }
 
     fn not_found(
@@ -580,13 +768,7 @@ impl ApiError {
         title: &'static str,
         detail: impl Into<String>,
     ) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            problem_type,
-            code,
-            title,
-            detail: detail.into(),
-        }
+        Self::status(StatusCode::NOT_FOUND, problem_type, code, title, detail)
     }
 }
 
@@ -600,6 +782,9 @@ impl IntoResponse for ApiError {
             detail: self.detail,
         };
         let mut response = (self.status, Json(problem)).into_response();
+        for (name, value) in self.response_headers {
+            response.headers_mut().insert(name, value);
+        }
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
@@ -641,11 +826,11 @@ async fn live() -> Json<LiveResponse> {
 }
 
 async fn ready(State(state): State<ApiState>) -> Result<Json<ReadyResponse>, ApiError> {
-    let schema_version = match &state.store {
-        Some(store) => {
-            let store = Arc::clone(store);
+    let schema_version = match &state.application {
+        Some(application) => {
+            let application = Arc::clone(application);
             Some(
-                tokio::task::spawn_blocking(move || store.readiness())
+                tokio::task::spawn_blocking(move || application.readiness())
                     .await
                     .map_err(|error| {
                         ApiError::unavailable(format!("database task failed: {error}"))
@@ -669,10 +854,10 @@ async fn ready(State(state): State<ApiState>) -> Result<Json<ReadyResponse>, Api
 }
 
 async fn node(State(state): State<ApiState>) -> Result<Json<NodeResponse>, ApiError> {
-    let installation_id = match &state.store {
-        Some(store) => {
-            let store = Arc::clone(store);
-            tokio::task::spawn_blocking(move || store.installation())
+    let installation_id = match &state.application {
+        Some(application) => {
+            let application = Arc::clone(application);
+            tokio::task::spawn_blocking(move || application.installation())
                 .await
                 .map_err(|error| ApiError::unavailable(format!("database task failed: {error}")))?
                 .map_err(|error| ApiError::unavailable(error.to_string()))?
@@ -682,6 +867,7 @@ async fn node(State(state): State<ApiState>) -> Result<Json<NodeResponse>, ApiEr
         None => SAROS_PROFILE_INSTALLATION_ID.to_owned(),
     };
     let capabilities = match state.profile {
+        NodeProfile::Full if state.blob_store.is_some() => FULL_NODE_CONTENT_CAPABILITIES,
         NodeProfile::Full => FULL_NODE_CAPABILITIES,
         NodeProfile::Saros => SAROS_CAPABILITIES,
     };
@@ -695,6 +881,1070 @@ async fn node(State(state): State<ApiState>) -> Result<Json<NodeResponse>, ApiEr
         uptime_seconds: state.started_instant.elapsed().as_secs(),
         capabilities: capabilities.to_vec(),
     }))
+}
+
+async fn submit_operation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    payload: Result<Json<SubmitOperationCommand>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let application = full_application(&state)?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .ok_or_else(|| {
+            ApiError::unprocessable(
+                "https://fractonica.com/problems/invalid-idempotency-key",
+                "invalid_idempotency_key",
+                "Invalid idempotency key",
+                "Supply the Idempotency-Key header for every operation submission.",
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            ApiError::unprocessable(
+                "https://fractonica.com/problems/invalid-idempotency-key",
+                "invalid_idempotency_key",
+                "Invalid idempotency key",
+                "The Idempotency-Key header must contain visible ASCII characters.",
+            )
+        })?
+        .to_owned();
+    let Json(command) = payload.map_err(operation_json_error)?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        application.submit_operation(command, &idempotency_key)
+    })
+    .await
+    .map_err(|error| ApiError::unavailable(format!("operation task failed: {error}")))?
+    .map_err(application_error)?;
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(result.operation)).into_response())
+}
+
+async fn operation_changes(
+    State(state): State<ApiState>,
+    query: Result<Query<OperationChangesQuery>, QueryRejection>,
+) -> Result<Json<OperationChangePage>, ApiError> {
+    let application = full_application(&state)?;
+    let Query(query) = query.map_err(operation_query_error)?;
+    let page =
+        tokio::task::spawn_blocking(move || application.changes_after(query.after, query.limit))
+            .await
+            .map_err(|error| ApiError::unavailable(format!("operation task failed: {error}")))?
+            .map_err(application_error)?;
+    Ok(Json(page))
+}
+
+async fn entity_state(
+    State(state): State<ApiState>,
+    Path(entity_id): Path<String>,
+) -> Result<Json<EntityStateResponse>, ApiError> {
+    let application = full_application(&state)?;
+    let entity_id = EntityId::parse(&entity_id).map_err(|error| {
+        ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-entity-id",
+            "invalid_entity_id",
+            "Invalid entity ID",
+            error.to_string(),
+        )
+    })?;
+    let entity = tokio::task::spawn_blocking(move || application.entity_state(entity_id))
+        .await
+        .map_err(|error| ApiError::unavailable(format!("operation task failed: {error}")))?
+        .map_err(application_error)?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "https://fractonica.com/problems/entity-not-found",
+                "entity_not_found",
+                "Entity not found",
+                format!("Entity {entity_id} does not exist on this node."),
+            )
+        })?;
+    Ok(Json(entity.into()))
+}
+
+fn full_application(state: &ApiState) -> Result<Arc<ApplicationService>, ApiError> {
+    state.application.as_ref().map(Arc::clone).ok_or_else(|| {
+        ApiError::unavailable("The stateless Saros profile does not have an operation repository.")
+    })
+}
+
+fn full_blob_store(state: &ApiState) -> Result<Arc<BlobStore>, ApiError> {
+    state.blob_store.as_ref().map(Arc::clone).ok_or_else(|| {
+        ApiError::unavailable("The selected profile does not have an immutable content repository.")
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BlobAvailabilityRequest {
+    content_ids: Vec<ContentId>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlobAvailabilityResponse {
+    available: Vec<ContentDescriptor>,
+    missing: Vec<ContentId>,
+}
+
+#[derive(Default)]
+struct UploadMetadata {
+    content_id: Option<ContentId>,
+    media_type: Option<String>,
+    original_name: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ByteRange {
+    start: u64,
+    length: u64,
+}
+
+async fn upload_capabilities(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    match upload_capabilities_inner(state).await {
+        Ok(mut response) => {
+            add_upload_options_cors_headers(&mut response, &headers);
+            response
+        }
+        Err(error) => tus_error_response(error),
+    }
+}
+
+async fn upload_capabilities_inner(state: ApiState) -> Result<Response, ApiError> {
+    let store = full_blob_store(&state)?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    insert_header(response.headers_mut(), "tus-resumable", TUS_VERSION)?;
+    insert_header(response.headers_mut(), "tus-version", TUS_VERSION)?;
+    insert_header(response.headers_mut(), "tus-extension", TUS_EXTENSIONS)?;
+    insert_header(
+        response.headers_mut(),
+        "tus-checksum-algorithm",
+        TUS_CHECKSUM_ALGORITHMS,
+    )?;
+    insert_header(
+        response.headers_mut(),
+        "tus-max-size",
+        &store.max_blob_bytes().to_string(),
+    )?;
+    Ok(response)
+}
+
+async fn create_upload(State(state): State<ApiState>, request: Request) -> Response {
+    match create_upload_inner(state, request).await {
+        Ok(response) => response,
+        Err(error) => tus_error_response(error),
+    }
+}
+
+async fn create_upload_inner(state: ApiState, request: Request) -> Result<Response, ApiError> {
+    let store = full_blob_store(&state)?;
+    require_tus_version(request.headers())?;
+    let upload_length = parse_required_u64_header(request.headers(), "upload-length")?;
+    if upload_length > store.max_blob_bytes() {
+        return Err(ApiError::status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "https://fractonica.com/problems/upload-too-large",
+            "upload_too_large",
+            "Upload is too large",
+            format!(
+                "Upload-Length {upload_length} exceeds this node's maximum {} bytes.",
+                store.max_blob_bytes()
+            ),
+        ));
+    }
+    let metadata_header = optional_ascii_header(request.headers(), "upload-metadata")?;
+    let metadata = parse_upload_metadata(metadata_header.as_deref())?;
+    let body = to_bytes(request.into_body(), 1).await.map_err(|_| {
+        ApiError::bad_request(
+            "https://fractonica.com/problems/invalid-upload-creation",
+            "invalid_upload_creation",
+            "Invalid upload creation",
+            "Upload creation does not accept request content; append bytes with PATCH.",
+        )
+    })?;
+    if !body.is_empty() {
+        return Err(ApiError::bad_request(
+            "https://fractonica.com/problems/invalid-upload-creation",
+            "invalid_upload_creation",
+            "Invalid upload creation",
+            "Upload creation does not accept request content; append bytes with PATCH.",
+        ));
+    }
+
+    let session = tokio::task::spawn_blocking(move || {
+        store.create_upload(CreateUpload {
+            upload_length,
+            expected_content_id: metadata.content_id,
+            upload_metadata: metadata_header,
+            media_type: metadata.media_type,
+            original_name: metadata.original_name,
+        })
+    })
+    .await
+    .map_err(|error| ApiError::unavailable(format!("content task failed: {error}")))?
+    .map_err(blob_store_error)?;
+
+    let mut response = StatusCode::CREATED.into_response();
+    insert_header(
+        response.headers_mut(),
+        "location",
+        &format!("/api/v1/uploads/{}", session.upload_id),
+    )?;
+    add_upload_headers(response.headers_mut(), &session, true)?;
+    Ok(response)
+}
+
+async fn upload_status(
+    State(state): State<ApiState>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    match upload_status_inner(state, upload_id, headers).await {
+        Ok(response) => response,
+        Err(error) => tus_error_response(error),
+    }
+}
+
+async fn upload_status_inner(
+    state: ApiState,
+    upload_id: String,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let store = full_blob_store(&state)?;
+    require_tus_version(&headers)?;
+    let upload_id = parse_upload_id(&upload_id)?;
+    let session = tokio::task::spawn_blocking(move || store.upload(upload_id))
+        .await
+        .map_err(|error| ApiError::unavailable(format!("content task failed: {error}")))?
+        .map_err(blob_store_error)?
+        .ok_or_else(|| upload_not_found(upload_id))?;
+    reject_expired_upload(&session)?;
+
+    let mut response = StatusCode::OK.into_response();
+    add_upload_headers(response.headers_mut(), &session, true)?;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn append_upload_chunk(
+    State(state): State<ApiState>,
+    Path(upload_id): Path<String>,
+    request: Request,
+) -> Response {
+    let recovery_state = state.clone();
+    let recovery_upload_id = upload_id.clone();
+    match append_upload_chunk_inner(state, upload_id, request).await {
+        Ok(response) => response,
+        Err(error) => tus_error_with_upload_state(error, recovery_state, &recovery_upload_id).await,
+    }
+}
+
+async fn append_upload_chunk_inner(
+    state: ApiState,
+    upload_id: String,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let store = full_blob_store(&state)?;
+    require_tus_version(request.headers())?;
+    let upload_id = parse_upload_id(&upload_id)?;
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if content_type != Some("application/offset+octet-stream") {
+        return Err(ApiError::status(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "https://fractonica.com/problems/invalid-upload-content-type",
+            "invalid_upload_content_type",
+            "Invalid upload content type",
+            "Content-Type must be application/offset+octet-stream.",
+        ));
+    }
+    let supplied_offset = parse_required_u64_header(request.headers(), "upload-offset")?;
+    let declared_length = parse_required_u64_header(request.headers(), "content-length")?;
+    if declared_length == 0 || declared_length > MAX_PATCH_BYTES as u64 {
+        return Err(ApiError::status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "https://fractonica.com/problems/upload-chunk-too-large",
+            "upload_chunk_too_large",
+            "Upload chunk is too large",
+            format!("PATCH chunks must contain 1-{MAX_PATCH_BYTES} bytes."),
+        ));
+    }
+    let checksum_header = optional_ascii_header(request.headers(), "upload-checksum")?;
+    let checksum = checksum_header
+        .as_deref()
+        .map(parse_upload_checksum)
+        .transpose()?;
+    let body = to_bytes(request.into_body(), MAX_PATCH_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::status(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "https://fractonica.com/problems/upload-chunk-too-large",
+                "upload_chunk_too_large",
+                "Upload chunk is too large",
+                format!("PATCH chunks must contain at most {MAX_PATCH_BYTES} bytes."),
+            )
+        })?;
+    if body.is_empty() || body.len() as u64 != declared_length {
+        return Err(ApiError::bad_request(
+            "https://fractonica.com/problems/invalid-upload-chunk",
+            "invalid_upload_chunk",
+            "Invalid upload chunk",
+            "Content-Length must equal the non-empty PATCH body length.",
+        ));
+    }
+    let sha256 = verify_upload_checksum(checksum, &body)?;
+    let bytes = body.to_vec();
+    let outcome = tokio::task::spawn_blocking(move || {
+        store.append_chunk(upload_id, supplied_offset, &bytes, sha256)
+    })
+    .await
+    .map_err(|error| ApiError::unavailable(format!("content task failed: {error}")))?
+    .map_err(blob_store_error)?;
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    add_upload_headers(response.headers_mut(), &outcome.session, false)?;
+    Ok(response)
+}
+
+async fn blob_availability(
+    State(state): State<ApiState>,
+    payload: Result<Json<BlobAvailabilityRequest>, JsonRejection>,
+) -> Result<Json<BlobAvailabilityResponse>, ApiError> {
+    let store = full_blob_store(&state)?;
+    let Json(payload) = payload.map_err(|error| {
+        ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-content-query",
+            "invalid_content_query",
+            "Invalid content query",
+            error.body_text(),
+        )
+    })?;
+    if payload.content_ids.is_empty()
+        || payload.content_ids.len() > MAX_AVAILABILITY_CONTENT_IDS
+        || payload
+            .content_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len()
+            != payload.content_ids.len()
+    {
+        return Err(ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-content-query",
+            "invalid_content_query",
+            "Invalid content query",
+            format!("contentIds must contain 1-{MAX_AVAILABILITY_CONTENT_IDS} unique identifiers."),
+        ));
+    }
+    let requested = payload.content_ids;
+    let lookup_ids = requested.clone();
+    let availability = tokio::task::spawn_blocking(move || store.availability(&lookup_ids))
+        .await
+        .map_err(|error| ApiError::unavailable(format!("content task failed: {error}")))?
+        .map_err(blob_store_error)?;
+    let mut descriptors: HashMap<ContentId, ContentDescriptor> = availability
+        .available
+        .into_iter()
+        .map(|descriptor| (descriptor.content_id, descriptor))
+        .collect();
+    let mut available = Vec::new();
+    let mut missing = Vec::new();
+    for content_id in requested {
+        if let Some(descriptor) = descriptors.remove(&content_id) {
+            available.push(descriptor);
+        } else {
+            missing.push(content_id);
+        }
+    }
+    Ok(Json(BlobAvailabilityResponse { available, missing }))
+}
+
+async fn head_blob(
+    State(state): State<ApiState>,
+    Path(content_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let object = find_blob(&state, &content_id).await?;
+    let mut response = Body::empty().into_response();
+    add_blob_headers(
+        response.headers_mut(),
+        object.descriptor.content_id,
+        object.descriptor.byte_length,
+    )?;
+    insert_header(
+        response.headers_mut(),
+        "repr-digest",
+        &digest_header_value(object.descriptor.content_id.as_bytes()),
+    )?;
+    Ok(response)
+}
+
+async fn get_blob(
+    State(state): State<ApiState>,
+    Path(content_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let object = find_blob(&state, &content_id).await?;
+    let total_length = object.descriptor.byte_length;
+    let requested_range = optional_ascii_header(&headers, "range")?;
+    let range = requested_range
+        .as_deref()
+        .map(|value| parse_byte_range(value, total_length))
+        .transpose()?;
+    let selected = range.unwrap_or(ByteRange {
+        start: 0,
+        length: total_length,
+    });
+    let digest = if range.is_some() {
+        let path = object.path.clone();
+        tokio::task::spawn_blocking(move || digest_file_range(path, selected))
+            .await
+            .map_err(|error| ApiError::unavailable(format!("content task failed: {error}")))?
+            .map_err(|error| ApiError::unavailable(format!("failed to hash blob range: {error}")))?
+    } else {
+        object.descriptor.content_id.into_bytes()
+    };
+
+    let mut file = tokio::fs::File::open(&object.path)
+        .await
+        .map_err(|error| ApiError::unavailable(format!("failed to open blob: {error}")))?;
+    file.seek(SeekFrom::Start(selected.start))
+        .await
+        .map_err(|error| ApiError::unavailable(format!("failed to seek blob: {error}")))?;
+    let stream = ReaderStream::new(file.take(selected.length));
+    let mut response = Body::from_stream(stream).into_response();
+    if range.is_some() {
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        let end = selected.start + selected.length - 1;
+        insert_header(
+            response.headers_mut(),
+            "content-range",
+            &format!("bytes {}-{end}/{total_length}", selected.start),
+        )?;
+    }
+    add_blob_headers(
+        response.headers_mut(),
+        object.descriptor.content_id,
+        selected.length,
+    )?;
+    insert_header(
+        response.headers_mut(),
+        "content-digest",
+        &digest_header_value(&digest),
+    )?;
+    Ok(response)
+}
+
+async fn find_blob(
+    state: &ApiState,
+    content_id: &str,
+) -> Result<fractonica_blob_store::BlobObject, ApiError> {
+    let store = full_blob_store(state)?;
+    let content_id = ContentId::parse(content_id).map_err(|error| {
+        ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-content-id",
+            "invalid_content_id",
+            "Invalid content ID",
+            error.to_string(),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || store.blob(content_id))
+        .await
+        .map_err(|error| ApiError::unavailable(format!("content task failed: {error}")))?
+        .map_err(blob_store_error)?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "https://fractonica.com/problems/blob-not-found",
+                "blob_not_found",
+                "Blob not found",
+                format!("Content {content_id} is not available on this node."),
+            )
+        })
+}
+
+fn parse_upload_id(value: &str) -> Result<UploadId, ApiError> {
+    UploadId::parse(value).map_err(|error| {
+        ApiError::not_found(
+            "https://fractonica.com/problems/upload-not-found",
+            "upload_not_found",
+            "Upload not found",
+            format!("Upload identifier is invalid: {error}"),
+        )
+    })
+}
+
+fn upload_not_found(upload_id: UploadId) -> ApiError {
+    ApiError::not_found(
+        "https://fractonica.com/problems/upload-not-found",
+        "upload_not_found",
+        "Upload not found",
+        format!("Upload {upload_id} does not exist on this node."),
+    )
+}
+
+fn parse_required_u64_header(headers: &HeaderMap, name: &'static str) -> Result<u64, ApiError> {
+    let value = optional_ascii_header(headers, name)?.ok_or_else(|| {
+        ApiError::bad_request(
+            "https://fractonica.com/problems/invalid-upload-header",
+            "invalid_upload_header",
+            "Invalid upload header",
+            format!("The {name} header is required."),
+        )
+    })?;
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return Err(ApiError::bad_request(
+            "https://fractonica.com/problems/invalid-upload-header",
+            "invalid_upload_header",
+            "Invalid upload header",
+            format!("The {name} header must be a canonical non-negative integer."),
+        ));
+    }
+    value.parse::<u64>().map_err(|_| {
+        ApiError::bad_request(
+            "https://fractonica.com/problems/invalid-upload-header",
+            "invalid_upload_header",
+            "Invalid upload header",
+            format!("The {name} header must be a canonical non-negative integer."),
+        )
+    })
+}
+
+fn optional_ascii_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, ApiError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value.to_str().map(str::to_owned).map_err(|_| {
+                ApiError::bad_request(
+                    "https://fractonica.com/problems/invalid-upload-header",
+                    "invalid_upload_header",
+                    "Invalid upload header",
+                    format!("The {name} header must contain visible ASCII."),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn require_tus_version(headers: &HeaderMap) -> Result<(), ApiError> {
+    if optional_ascii_header(headers, "tus-resumable")?.as_deref() == Some(TUS_VERSION) {
+        return Ok(());
+    }
+    Err(ApiError::status(
+        StatusCode::PRECONDITION_FAILED,
+        "https://fractonica.com/problems/unsupported-tus-version",
+        "unsupported_tus_version",
+        "Unsupported tus version",
+        "Tus-Resumable must be 1.0.0.",
+    )
+    .with_header("tus-resumable", TUS_VERSION)
+    .with_header("tus-version", TUS_VERSION))
+}
+
+fn parse_upload_metadata(value: Option<&str>) -> Result<UploadMetadata, ApiError> {
+    let Some(value) = value else {
+        return Ok(UploadMetadata::default());
+    };
+    if value.len() > MAX_UPLOAD_METADATA_BYTES {
+        return Err(invalid_upload_metadata(format!(
+            "Upload-Metadata exceeds {MAX_UPLOAD_METADATA_BYTES} bytes."
+        )));
+    }
+    let mut seen = HashSet::new();
+    let mut metadata = UploadMetadata::default();
+    for item in value.split(',') {
+        let (key, encoded) = item.split_once(' ').unwrap_or((item, ""));
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b',')
+            || !seen.insert(key)
+        {
+            return Err(invalid_upload_metadata(
+                "Metadata keys must be unique visible ASCII tokens.",
+            ));
+        }
+        let decoded = BASE64_STANDARD.decode(encoded).map_err(|_| {
+            invalid_upload_metadata(format!("Metadata value for {key} is not valid Base64."))
+        })?;
+        match key {
+            "contentId" => {
+                let text = String::from_utf8(decoded).map_err(|_| {
+                    invalid_upload_metadata("contentId metadata must contain UTF-8 text.")
+                })?;
+                metadata.content_id = Some(ContentId::parse(&text).map_err(|error| {
+                    invalid_upload_metadata(format!("contentId metadata is invalid: {error}"))
+                })?);
+            }
+            "mediaType" => {
+                let text = String::from_utf8(decoded).map_err(|_| {
+                    invalid_upload_metadata("mediaType metadata must contain UTF-8 text.")
+                })?;
+                if text.is_empty()
+                    || text.len() > MAX_MEDIA_TYPE_BYTES
+                    || !text.is_ascii()
+                    || text.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    return Err(invalid_upload_metadata(format!(
+                        "mediaType must contain 1-{MAX_MEDIA_TYPE_BYTES} visible ASCII bytes."
+                    )));
+                }
+                metadata.media_type = Some(text);
+            }
+            "filename" | "originalName" => {
+                let text = String::from_utf8(decoded).map_err(|_| {
+                    invalid_upload_metadata("filename metadata must contain UTF-8 text.")
+                })?;
+                if text.is_empty()
+                    || text.chars().count() > MAX_ORIGINAL_NAME_CHARS
+                    || text.chars().any(char::is_control)
+                {
+                    return Err(invalid_upload_metadata(format!(
+                        "filename must contain 1-{MAX_ORIGINAL_NAME_CHARS} non-control characters."
+                    )));
+                }
+                if metadata.original_name.replace(text).is_some() {
+                    return Err(invalid_upload_metadata(
+                        "Supply only one of filename and originalName.",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(metadata)
+}
+
+fn invalid_upload_metadata(detail: impl Into<String>) -> ApiError {
+    ApiError::bad_request(
+        "https://fractonica.com/problems/invalid-upload-metadata",
+        "invalid_upload_metadata",
+        "Invalid upload metadata",
+        detail,
+    )
+}
+
+enum UploadChecksum {
+    Sha1([u8; 20]),
+    Sha256([u8; 32]),
+}
+
+fn parse_upload_checksum(value: &str) -> Result<UploadChecksum, ApiError> {
+    let Some((algorithm, encoded)) = value.split_once(' ') else {
+        return Err(invalid_upload_checksum(
+            "Upload-Checksum must contain an algorithm and Base64 digest.",
+        ));
+    };
+    if encoded.contains(' ') || encoded.is_empty() {
+        return Err(invalid_upload_checksum(
+            "Upload-Checksum must contain exactly one algorithm and digest.",
+        ));
+    }
+    let digest = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid_upload_checksum("Upload-Checksum does not contain valid Base64."))?;
+    match algorithm {
+        "sha1" => digest
+            .try_into()
+            .map(UploadChecksum::Sha1)
+            .map_err(|_| invalid_upload_checksum("sha1 checksums must contain 20 bytes.")),
+        "sha256" => digest
+            .try_into()
+            .map(UploadChecksum::Sha256)
+            .map_err(|_| invalid_upload_checksum("sha256 checksums must contain 32 bytes.")),
+        _ => Err(invalid_upload_checksum(
+            "Supported checksum algorithms are sha1 and sha256.",
+        )),
+    }
+}
+
+fn invalid_upload_checksum(detail: impl Into<String>) -> ApiError {
+    ApiError::bad_request(
+        "https://fractonica.com/problems/invalid-upload-checksum",
+        "invalid_upload_checksum",
+        "Invalid upload checksum",
+        detail,
+    )
+}
+
+fn verify_upload_checksum(
+    checksum: Option<UploadChecksum>,
+    bytes: &[u8],
+) -> Result<Option<[u8; 32]>, ApiError> {
+    match checksum {
+        None => Ok(None),
+        Some(UploadChecksum::Sha1(expected)) => {
+            let actual: [u8; 20] = Sha1::digest(bytes).into();
+            if actual == expected {
+                Ok(None)
+            } else {
+                Err(checksum_mismatch())
+            }
+        }
+        Some(UploadChecksum::Sha256(expected)) => {
+            let actual: [u8; 32] = Sha256::digest(bytes).into();
+            if actual == expected {
+                Ok(Some(expected))
+            } else {
+                Err(checksum_mismatch())
+            }
+        }
+    }
+}
+
+fn checksum_mismatch() -> ApiError {
+    ApiError::status(
+        StatusCode::from_u16(460).expect("tus checksum mismatch is a valid extension status"),
+        "https://fractonica.com/problems/upload-checksum-mismatch",
+        "upload_checksum_mismatch",
+        "Upload checksum mismatch",
+        "The supplied chunk checksum did not match; no bytes were appended.",
+    )
+}
+
+fn reject_expired_upload(session: &UploadSession) -> Result<(), ApiError> {
+    if session.state != UploadState::Complete && unix_time_millis()? >= session.expires_at_unix_ms {
+        return Err(ApiError::status(
+            StatusCode::GONE,
+            "https://fractonica.com/problems/upload-expired",
+            "upload_expired",
+            "Upload expired",
+            format!("Upload {} is no longer resumable.", session.upload_id),
+        ));
+    }
+    Ok(())
+}
+
+fn add_upload_headers(
+    headers: &mut HeaderMap,
+    session: &UploadSession,
+    include_length_and_metadata: bool,
+) -> Result<(), ApiError> {
+    insert_header(headers, "tus-resumable", TUS_VERSION)?;
+    insert_header(headers, "upload-offset", &session.upload_offset.to_string())?;
+    insert_header(
+        headers,
+        "upload-expires",
+        &format_http_date(session.expires_at_unix_ms)?,
+    )?;
+    if include_length_and_metadata {
+        insert_header(headers, "upload-length", &session.upload_length.to_string())?;
+        if let Some(metadata) = encode_upload_metadata(session) {
+            insert_header(headers, "upload-metadata", &metadata)?;
+        }
+    }
+    if let Some(content_id) = session.final_content_id {
+        insert_header(headers, "fractonica-content-id", &content_id.to_string())?;
+    }
+    Ok(())
+}
+
+fn encode_upload_metadata(session: &UploadSession) -> Option<String> {
+    session.upload_metadata.clone()
+}
+
+fn tus_error_response(error: ApiError) -> Response {
+    let mut response = error.into_response();
+    response
+        .headers_mut()
+        .insert("tus-resumable", HeaderValue::from_static(TUS_VERSION));
+    if response.status() == StatusCode::PRECONDITION_FAILED {
+        response
+            .headers_mut()
+            .insert("tus-version", HeaderValue::from_static(TUS_VERSION));
+    }
+    response
+}
+
+async fn tus_error_with_upload_state(
+    error: ApiError,
+    state: ApiState,
+    upload_id: &str,
+) -> Response {
+    let mut response = tus_error_response(error);
+    let (Some(store), Ok(upload_id)) = (state.blob_store, UploadId::parse(upload_id)) else {
+        return response;
+    };
+    let session = tokio::task::spawn_blocking(move || store.upload(upload_id)).await;
+    if let Ok(Ok(Some(session))) = session {
+        let _ = add_upload_headers(response.headers_mut(), &session, false);
+    }
+    response
+}
+
+fn add_upload_options_cors_headers(response: &mut Response, request_headers: &HeaderMap) {
+    const ALLOWED_ORIGINS: &[&str] = &[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:4173",
+        "http://localhost:4173",
+        "http://tauri.localhost",
+        "tauri://localhost",
+    ];
+    let Some(origin) = request_headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .filter(|origin| ALLOWED_ORIGINS.contains(origin))
+    else {
+        return;
+    };
+    if let Ok(origin) = HeaderValue::from_str(origin) {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        response
+            .headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Origin"));
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("POST, OPTIONS"),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static(
+                "authorization, content-type, tus-resumable, upload-length, upload-metadata",
+            ),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static(
+                "location, fractonica-content-id, tus-checksum-algorithm, tus-extension, tus-max-size, tus-resumable, tus-version, upload-expires, upload-length, upload-metadata, upload-offset",
+            ),
+        );
+    }
+}
+
+fn blob_store_error(error: BlobStoreError) -> ApiError {
+    match error {
+        BlobStoreError::UploadTooLarge { .. }
+        | BlobStoreError::PatchTooLarge { .. }
+        | BlobStoreError::UploadOverflow { .. } => ApiError::status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "https://fractonica.com/problems/upload-too-large",
+            "upload_too_large",
+            "Upload is too large",
+            error.to_string(),
+        ),
+        BlobStoreError::UploadNotFound(upload_id) => upload_not_found(upload_id),
+        BlobStoreError::UploadExpired(_) => ApiError::status(
+            StatusCode::GONE,
+            "https://fractonica.com/problems/upload-expired",
+            "upload_expired",
+            "Upload expired",
+            error.to_string(),
+        ),
+        BlobStoreError::UploadNotActive(_) | BlobStoreError::OffsetMismatch { .. } => {
+            ApiError::conflict(
+                "https://fractonica.com/problems/upload-conflict",
+                "upload_conflict",
+                "Upload conflict",
+                error.to_string(),
+            )
+        }
+        BlobStoreError::ChunkChecksumMismatch => checksum_mismatch(),
+        BlobStoreError::ContentIdMismatch { .. } => ApiError::unprocessable(
+            "https://fractonica.com/problems/content-id-mismatch",
+            "content_id_mismatch",
+            "Content ID mismatch",
+            error.to_string(),
+        ),
+        BlobStoreError::Io(_)
+        | BlobStoreError::Repository(_)
+        | BlobStoreError::LockPoisoned
+        | BlobStoreError::ClockBeforeUnixEpoch
+        | BlobStoreError::Corrupt(_) => ApiError::unavailable(error.to_string()),
+    }
+}
+
+fn add_blob_headers(
+    headers: &mut HeaderMap,
+    content_id: ContentId,
+    content_length: u64,
+) -> Result<(), ApiError> {
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    insert_header(headers, "content-length", &content_length.to_string())?;
+    insert_header(headers, "etag", &format!("\"{content_id}\""))?;
+    Ok(())
+}
+
+fn parse_byte_range(value: &str, total_length: u64) -> Result<ByteRange, ApiError> {
+    let Some(specification) = value.strip_prefix("bytes=") else {
+        return Err(range_not_satisfiable(total_length));
+    };
+    if specification.contains(',') || specification.is_empty() || total_length == 0 {
+        return Err(range_not_satisfiable(total_length));
+    }
+    let Some((start, end)) = specification.split_once('-') else {
+        return Err(range_not_satisfiable(total_length));
+    };
+    if start.is_empty() {
+        let suffix = end
+            .parse::<u64>()
+            .ok()
+            .filter(|suffix| *suffix > 0)
+            .ok_or_else(|| range_not_satisfiable(total_length))?;
+        let length = suffix.min(total_length);
+        return Ok(ByteRange {
+            start: total_length - length,
+            length,
+        });
+    }
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| range_not_satisfiable(total_length))?;
+    if start >= total_length {
+        return Err(range_not_satisfiable(total_length));
+    }
+    let inclusive_end = if end.is_empty() {
+        total_length - 1
+    } else {
+        end.parse::<u64>()
+            .map_err(|_| range_not_satisfiable(total_length))?
+            .min(total_length - 1)
+    };
+    if inclusive_end < start {
+        return Err(range_not_satisfiable(total_length));
+    }
+    Ok(ByteRange {
+        start,
+        length: inclusive_end - start + 1,
+    })
+}
+
+fn range_not_satisfiable(total_length: u64) -> ApiError {
+    ApiError::status(
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        "https://fractonica.com/problems/range-not-satisfiable",
+        "range_not_satisfiable",
+        "Range not satisfiable",
+        format!("The requested byte range is not satisfiable for a {total_length}-byte blob."),
+    )
+    .with_header("content-range", format!("bytes */{total_length}"))
+}
+
+fn digest_file_range(path: PathBuf, range: ByteRange) -> std::io::Result<[u8; 32]> {
+    let mut file = StdFile::open(path)?;
+    file.seek(SeekFrom::Start(range.start))?;
+    let mut remaining = range.length;
+    let mut buffer = vec![0_u8; FILE_DIGEST_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let capacity = u64::try_from(buffer.len()).expect("digest buffer length fits u64");
+        let requested = usize::try_from(remaining.min(capacity)).expect("bounded by buffer length");
+        let count = file.read(&mut buffer[..requested])?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "blob ended before the selected byte range",
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        remaining -= u64::try_from(count).expect("read count fits u64");
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn digest_header_value(digest: &[u8; 32]) -> String {
+    format!("sha-256=:{}:", BASE64_STANDARD.encode(digest))
+}
+
+fn format_http_date(unix_ms: i64) -> Result<String, ApiError> {
+    let milliseconds = u64::try_from(unix_ms)
+        .map_err(|_| ApiError::unavailable("upload expiration precedes the Unix epoch"))?;
+    Ok(httpdate::fmt_http_date(
+        UNIX_EPOCH + Duration::from_millis(milliseconds),
+    ))
+}
+
+fn unix_time_millis() -> Result<i64, ApiError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ApiError::unavailable("system clock precedes the Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| ApiError::unavailable("system clock is outside the supported range"))
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> Result<(), ApiError> {
+    let value = HeaderValue::from_str(value)
+        .map_err(|error| ApiError::unavailable(format!("invalid response header: {error}")))?;
+    headers.insert(HeaderName::from_static(name), value);
+    Ok(())
+}
+
+fn operation_json_error(error: JsonRejection) -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/invalid-operation",
+        "invalid_operation",
+        "Invalid operation",
+        error.body_text(),
+    )
+}
+
+fn operation_query_error(error: QueryRejection) -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/invalid-operation-query",
+        "invalid_operation_query",
+        "Invalid operation query",
+        error.body_text(),
+    )
+}
+
+fn application_error(error: ApplicationError) -> ApiError {
+    match error {
+        ApplicationError::InvalidOperation(error) => ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-operation",
+            "invalid_operation",
+            "Invalid operation",
+            error.to_string(),
+        ),
+        ApplicationError::InvalidIdempotencyKey => ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-idempotency-key",
+            "invalid_idempotency_key",
+            "Invalid idempotency key",
+            "Idempotency-Key must satisfy the documented ASCII length and character bounds.",
+        ),
+        ApplicationError::InvalidChangeLimit => ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-operation-query",
+            "invalid_operation_query",
+            "Invalid operation query",
+            "The requested change-page limit is outside the supported range.",
+        ),
+        ApplicationError::SemanticEncoding(error) => {
+            ApiError::unavailable(format!("failed to encode canonical operation: {error}"))
+        }
+        ApplicationError::Repository(repository_error) => match repository_error {
+            conflict @ (RepositoryError::MissingParent(_)
+            | RepositoryError::ParentMismatch { .. }
+            | RepositoryError::EntityAlreadyExists(_)
+            | RepositoryError::InvalidTopology(_)
+            | RepositoryError::OperationConflict(_)
+            | RepositoryError::IdempotencyConflict) => ApiError::conflict(
+                "https://fractonica.com/problems/operation-conflict",
+                "operation_conflict",
+                "Operation conflict",
+                conflict.to_string(),
+            ),
+            unavailable @ (RepositoryError::Corrupt(_) | RepositoryError::Unavailable(_)) => {
+                ApiError::unavailable(unavailable.to_string())
+            }
+        },
+    }
 }
 
 async fn saros_metadata(State(state): State<ApiState>) -> Json<SarosMetadataResponse> {
@@ -1215,49 +2465,73 @@ fn glyph_string(digits: &[u8]) -> String {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use fractonica_data_model::ActorId;
+    use fractonica_store_sqlite::SqliteStore;
     use http_body_util::BodyExt;
     use serde_json::Value;
     use std::collections::HashSet;
+    use tempfile::TempDir;
     use tower::ServiceExt;
 
     fn test_app() -> Router {
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
-        let state = ApiState::new(store, "Test Node", "0.1.0").expect("API state");
+        let state =
+            ApiState::new(test_application(store), "Test Node", "0.1.0").expect("API state");
         router(state)
     }
 
     fn authenticated_test_app() -> Router {
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
-        let state = ApiState::new(store, "Test Node", "0.1.0")
+        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
             .expect("API state")
             .with_bearer_token("0123456789abcdef0123456789abcdef")
             .expect("bearer token");
         router(state)
     }
 
+    fn content_test_app() -> (Router, TempDir) {
+        let temporary = TempDir::new().expect("temporary content directory");
+        let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
+        let blob_store = Arc::new(
+            BlobStore::open(temporary.path().join("content"), Arc::clone(&store))
+                .expect("blob store"),
+        );
+        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
+            .expect("API state")
+            .with_blob_store(blob_store);
+        (router(state), temporary)
+    }
+
     fn saros_only_app() -> Router {
         router(ApiState::new_saros_only("Saros test node", "0.1.0").expect("Saros-only API state"))
+    }
+
+    fn test_application(store: Arc<SqliteStore>) -> Arc<ApplicationService> {
+        let installation = store.installation().expect("installation metadata");
+        let actor_id = ActorId::new(installation.installation_id.as_uuid());
+        Arc::new(ApplicationService::new(store, actor_id))
     }
 
     #[test]
     fn rejects_node_metadata_outside_the_public_contract() {
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
+        let application = test_application(Arc::clone(&store));
         assert!(matches!(
-            ApiState::new(Arc::clone(&store), "", "0.1.0"),
+            ApiState::new(Arc::clone(&application), "", "0.1.0"),
             Err(ApiStateError::InvalidDisplayName)
         ));
         assert!(matches!(
-            ApiState::new(Arc::clone(&store), "x".repeat(129), "0.1.0"),
+            ApiState::new(Arc::clone(&application), "x".repeat(129), "0.1.0"),
             Err(ApiStateError::InvalidDisplayName)
         ));
         assert!(matches!(
-            ApiState::new(store, "Test Node", ""),
+            ApiState::new(application, "Test Node", ""),
             Err(ApiStateError::InvalidVersion)
         ));
 
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
         assert!(matches!(
-            ApiState::new(store, "Test Node", "0.1.0")
+            ApiState::new(test_application(store), "Test Node", "0.1.0")
                 .expect("API state")
                 .with_bearer_token("too-short"),
             Err(ApiStateError::InvalidBearerToken)
@@ -1364,11 +2638,9 @@ mod tests {
         match expected_type {
             Some("object") => {
                 let object = value.as_object().expect("OpenAPI object");
-                let properties = schema
-                    .get("properties")
-                    .and_then(Value::as_object)
-                    .expect("OpenAPI object properties");
+                let properties = schema.get("properties").and_then(Value::as_object);
                 if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                    let properties = properties.expect("closed OpenAPI object properties");
                     for key in object.keys() {
                         assert!(properties.contains_key(key), "unexpected property {key}");
                     }
@@ -1379,9 +2651,11 @@ mod tests {
                         assert!(object.contains_key(key), "missing required property {key}");
                     }
                 }
-                for (key, property_schema) in properties {
-                    if let Some(property) = object.get(key) {
-                        assert_schema(property, property_schema, contract);
+                if let Some(properties) = properties {
+                    for (key, property_schema) in properties {
+                        if let Some(property) = object.get(key) {
+                            assert_schema(property, property_schema, contract);
+                        }
                     }
                 }
             }
@@ -1434,6 +2708,7 @@ mod tests {
                     assert!(number <= maximum, "number is above maximum");
                 }
             }
+            Some("boolean") => assert!(value.is_boolean(), "OpenAPI boolean"),
             Some("null") => assert!(value.is_null(), "OpenAPI null"),
             Some(other) => panic!("unsupported OpenAPI test schema type {other}"),
             None => {}
@@ -1519,7 +2794,10 @@ mod tests {
         assert_eq!(body["profile"], "node");
         assert_eq!(body["storage"]["kind"], "sqlite");
         assert_eq!(body["storage"]["status"], "ready");
-        assert_eq!(body["storage"]["schemaVersion"], 1);
+        assert_eq!(
+            body["storage"]["schemaVersion"],
+            fractonica_store_sqlite::SCHEMA_VERSION
+        );
     }
 
     #[tokio::test]
@@ -1542,6 +2820,174 @@ mod tests {
         assert_eq!(first["profile"], "node");
         assert_eq!(first["displayName"], "Test Node");
         assert_eq!(first["version"], "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn appends_replays_pages_and_materializes_operations() {
+        let app = test_app();
+        let operation_id = "019f6f11-8e23-7b81-b923-71773bbd5132";
+        let entity_id = "019f6f11-a1d7-72b1-8db1-6fa9e9c45b89";
+        let operation = serde_json::json!({
+            "protocolVersion": 1,
+            "operationId": operation_id,
+            "entityId": entity_id,
+            "schema": "record.v1",
+            "causalParents": [],
+            "occurredAtUnixMs": 1_784_390_400_000_i64,
+            "body": {
+                "kind": "put",
+                "document": {
+                    "startAtUnixMs": 1_784_390_400_000_i64,
+                    "visibility": "private",
+                    "emoji": "🌀",
+                    "metadata": {"source": "API test"}
+                }
+            }
+        });
+        let append_request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/operations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "operation-create-0001")
+                .body(Body::from(
+                    serde_json::to_vec(&operation).expect("operation JSON"),
+                ))
+                .expect("request")
+        };
+
+        let accepted = app
+            .clone()
+            .oneshot(append_request())
+            .await
+            .expect("response");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let accepted = json(accepted).await;
+        assert_contract_schema("StoredOperation", &accepted);
+        assert_eq!(accepted["localSequence"], 1);
+        assert_eq!(accepted["operation"]["operationId"], operation_id);
+        assert!(accepted["operation"]["actorId"].is_string());
+
+        let replayed = app
+            .clone()
+            .oneshot(append_request())
+            .await
+            .expect("response");
+        assert_eq!(replayed.status(), StatusCode::OK);
+        assert_eq!(json(replayed).await, accepted);
+
+        let changes = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/operations?after=0&limit=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(changes.status(), StatusCode::OK);
+        let changes = json(changes).await;
+        assert_contract_schema("OperationPage", &changes);
+        assert_eq!(
+            changes["operations"].as_array().expect("operations").len(),
+            1
+        );
+        assert_eq!(changes["nextAfter"], 1);
+        assert_eq!(changes["hasMore"], false);
+
+        let entity = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/entities/{entity_id}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(entity.status(), StatusCode::OK);
+        let entity = json(entity).await;
+        assert_contract_schema("EntityState", &entity);
+        assert_eq!(entity["entityId"], entity_id);
+        assert_eq!(entity["operationCount"], 1);
+        assert_eq!(entity["conflicted"], false);
+        assert_eq!(entity["heads"][0], accepted);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_parents_and_stateful_routes_in_saros_profile() {
+        let operation = serde_json::json!({
+            "protocolVersion": 1,
+            "operationId": "019f6f12-2bf9-72b2-ac3f-8659537a2220",
+            "entityId": "019f6f12-38ca-7f80-b4dd-cea4b2fa7f4b",
+            "schema": "record.v1",
+            "causalParents": ["019f6f12-45c1-7f40-a09c-622cf6bdba2b"],
+            "occurredAtUnixMs": 1_784_390_400_000_i64,
+            "body": {
+                "kind": "put",
+                "document": {
+                    "startAtUnixMs": 1_784_390_400_000_i64,
+                    "visibility": "public"
+                }
+            }
+        });
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/operations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "missing-parent-0001")
+                .body(Body::from(
+                    serde_json::to_vec(&operation).expect("operation JSON"),
+                ))
+                .expect("request")
+        };
+
+        let conflict = test_app().oneshot(request()).await.expect("response");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict = json(conflict).await;
+        assert_contract_schema("Problem", &conflict);
+        assert_eq!(conflict["code"], "operation_conflict");
+
+        let unavailable = saros_only_app().oneshot(request()).await.expect("response");
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let unavailable = json(unavailable).await;
+        assert_contract_schema("Problem", &unavailable);
+        assert_eq!(unavailable["code"], "node_not_ready");
+
+        let spoofed_actor = serde_json::json!({
+            "protocolVersion": 1,
+            "operationId": "019f6f12-6b24-76e3-b720-c51853671102",
+            "entityId": "019f6f12-7553-7c10-991f-cb7d8ff7628f",
+            "actorId": "019f6f12-7f3f-7801-b0cc-34311f8f370f",
+            "schema": "record.v1",
+            "causalParents": [],
+            "occurredAtUnixMs": 1_784_390_400_000_i64,
+            "body": {
+                "kind": "put",
+                "document": {
+                    "startAtUnixMs": 1_784_390_400_000_i64,
+                    "visibility": "public"
+                }
+            }
+        });
+        let spoofed = test_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/operations")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "spoofed-actor-0001")
+                    .body(Body::from(
+                        serde_json::to_vec(&spoofed_actor).expect("operation JSON"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(spoofed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let spoofed = json(spoofed).await;
+        assert_eq!(spoofed["code"], "invalid_operation");
     }
 
     #[tokio::test]
@@ -1863,6 +3309,404 @@ mod tests {
         let outside = json(outside).await;
         assert_contract_schema("Problem", &outside);
         assert_eq!(outside["code"], "geometry_unavailable");
+    }
+
+    #[tokio::test]
+    async fn uploads_discovers_and_streams_content_with_ranges() {
+        let (app, _temporary) = content_test_app();
+        let bytes = b"hello world";
+        let content_id = fractonica_content::hash_bytes(bytes);
+        let capabilities = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/v1/uploads")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(capabilities.status(), StatusCode::NO_CONTENT);
+        assert_eq!(capabilities.headers()["tus-version"], TUS_VERSION);
+        assert_eq!(capabilities.headers()["tus-extension"], TUS_EXTENSIONS);
+        assert_eq!(
+            capabilities.headers()["tus-checksum-algorithm"],
+            TUS_CHECKSUM_ALGORITHMS
+        );
+        let metadata = format!(
+            "contentId {},mediaType {},filename {},agent {}",
+            BASE64_STANDARD.encode(content_id.to_string()),
+            BASE64_STANDARD.encode("text/plain"),
+            BASE64_STANDARD.encode("greeting.txt"),
+            BASE64_STANDARD.encode("exeligmos-importer")
+        );
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/uploads")
+                    .header("tus-resumable", TUS_VERSION)
+                    .header("upload-length", bytes.len())
+                    .header("upload-metadata", metadata)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(created.headers()["tus-resumable"], TUS_VERSION);
+        assert_eq!(created.headers()["upload-offset"], "0");
+        let location = created.headers()[header::LOCATION]
+            .to_str()
+            .expect("location")
+            .to_owned();
+
+        let checksum = BASE64_STANDARD.encode(Sha256::digest(bytes));
+        let patched = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(&location)
+                    .header("tus-resumable", TUS_VERSION)
+                    .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+                    .header(header::CONTENT_LENGTH, bytes.len())
+                    .header("upload-offset", 0)
+                    .header("upload-checksum", format!("sha256 {checksum}"))
+                    .body(Body::from(bytes.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(patched.status(), StatusCode::NO_CONTENT);
+        assert_eq!(patched.headers()["upload-offset"], bytes.len().to_string());
+        assert_eq!(
+            patched.headers()["fractonica-content-id"],
+            content_id.to_string()
+        );
+
+        let upload_head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(&location)
+                    .header("tus-resumable", TUS_VERSION)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(upload_head.status(), StatusCode::OK);
+        assert_eq!(
+            upload_head.headers()["upload-length"],
+            bytes.len().to_string()
+        );
+        assert_eq!(
+            upload_head.headers()["fractonica-content-id"],
+            content_id.to_string()
+        );
+        assert_eq!(
+            upload_head.headers()["upload-metadata"],
+            format!(
+                "contentId {},mediaType {},filename {},agent {}",
+                BASE64_STANDARD.encode(content_id.to_string()),
+                BASE64_STANDARD.encode("text/plain"),
+                BASE64_STANDARD.encode("greeting.txt"),
+                BASE64_STANDARD.encode("exeligmos-importer")
+            )
+        );
+
+        let availability = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/blobs/availability")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "contentIds": [content_id]
+                        }))
+                        .expect("JSON"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(availability.status(), StatusCode::OK);
+        let availability = json(availability).await;
+        assert_eq!(
+            availability["available"][0]["contentId"],
+            content_id.to_string()
+        );
+        assert_eq!(availability["available"][0]["byteLength"], bytes.len());
+        assert_eq!(availability["missing"], serde_json::json!([]));
+
+        let blob_uri = format!("/api/v1/blobs/{content_id}");
+        let blob_head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(&blob_uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(blob_head.status(), StatusCode::OK);
+        assert_eq!(
+            blob_head.headers()[header::CONTENT_LENGTH],
+            bytes.len().to_string()
+        );
+        assert_eq!(
+            blob_head.headers()["repr-digest"],
+            digest_header_value(content_id.as_bytes())
+        );
+
+        let complete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&blob_uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(complete.status(), StatusCode::OK);
+        assert_eq!(
+            complete.headers()["content-digest"],
+            digest_header_value(content_id.as_bytes())
+        );
+        assert_eq!(
+            complete
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+            bytes.as_slice()
+        );
+
+        let partial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&blob_uri)
+                    .header(header::RANGE, "bytes=1-4")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.headers()[header::CONTENT_RANGE], "bytes 1-4/11");
+        assert_eq!(
+            partial.headers()["content-digest"],
+            digest_header_value(&Sha256::digest(b"ello").into())
+        );
+        assert_eq!(
+            partial
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+            b"ello".as_slice()
+        );
+
+        let unsatisfied = app
+            .oneshot(
+                Request::builder()
+                    .uri(&blob_uri)
+                    .header(header::RANGE, "bytes=99-")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unsatisfied.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(unsatisfied.headers()[header::CONTENT_RANGE], "bytes */11");
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_upload_checksums_without_advancing_and_content_in_saros() {
+        let (app, _temporary) = content_test_app();
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/uploads")
+                    .header("tus-resumable", TUS_VERSION)
+                    .header("upload-length", 3)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let location = created.headers()[header::LOCATION]
+            .to_str()
+            .expect("location")
+            .to_owned();
+        let mismatch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(&location)
+                    .header("tus-resumable", TUS_VERSION)
+                    .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+                    .header(header::CONTENT_LENGTH, 3)
+                    .header("upload-offset", 0)
+                    .header(
+                        "upload-checksum",
+                        format!("sha256 {}", BASE64_STANDARD.encode([0_u8; 32])),
+                    )
+                    .body(Body::from(&b"abc"[..]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(mismatch.status().as_u16(), 460);
+        assert_eq!(mismatch.headers()["tus-resumable"], TUS_VERSION);
+
+        let upload_head = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(&location)
+                    .header("tus-resumable", TUS_VERSION)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(upload_head.headers()["upload-offset"], "0");
+
+        let unavailable = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/v1/uploads")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.headers()["tus-resumable"], TUS_VERSION);
+    }
+
+    #[tokio::test]
+    async fn rejected_empty_upload_digest_does_not_poison_a_restart() {
+        let temporary = TempDir::new().expect("temporary node directory");
+        let database_path = temporary.path().join("node.sqlite3");
+        let content_root = temporary.path().join("content");
+        let store = Arc::new(SqliteStore::open(&database_path).expect("database"));
+        let blob_store =
+            Arc::new(BlobStore::open(&content_root, Arc::clone(&store)).expect("content storage"));
+        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
+            .expect("API state")
+            .with_blob_store(blob_store);
+        let app = router(state);
+        let wrong_content_id = fractonica_content::hash_bytes(b"not empty");
+        let metadata = format!(
+            "contentId {}",
+            BASE64_STANDARD.encode(wrong_content_id.to_string())
+        );
+
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/uploads")
+                    .header("tus-resumable", TUS_VERSION)
+                    .header("upload-length", 0)
+                    .header("upload-metadata", metadata)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            std::fs::read_dir(content_root.join("staging"))
+                .expect("staging directory")
+                .count(),
+            0
+        );
+
+        let reopened_store = Arc::new(SqliteStore::open(database_path).expect("reopen database"));
+        BlobStore::open(content_root, reopened_store).expect("restart content storage");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_serve_or_advertise_same_length_corrupt_content() {
+        let temporary = TempDir::new().expect("temporary content directory");
+        let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
+        let blob_store = Arc::new(
+            BlobStore::open(temporary.path().join("content"), Arc::clone(&store))
+                .expect("blob store"),
+        );
+        let bytes = b"good";
+        let content_id = fractonica_content::hash_bytes(bytes);
+        let upload = blob_store
+            .create_upload(CreateUpload {
+                upload_length: bytes.len() as u64,
+                expected_content_id: Some(content_id),
+                upload_metadata: None,
+                media_type: None,
+                original_name: None,
+            })
+            .expect("create upload");
+        blob_store
+            .append_chunk(upload.upload_id, 0, bytes, None)
+            .expect("complete upload");
+        let blob_path = blob_store
+            .blob(content_id)
+            .expect("verify blob")
+            .expect("blob")
+            .path;
+        std::fs::write(blob_path, b"evil").expect("same-length corruption");
+        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
+            .expect("API state")
+            .with_blob_store(blob_store);
+        let app = router(state);
+
+        let blob = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/blobs/{content_id}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(blob.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let availability = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/blobs/availability")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "contentIds": [content_id]
+                        }))
+                        .expect("JSON"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(availability.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

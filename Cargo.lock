@@ -1065,22 +1065,69 @@ name = "fractonica-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "fractonica-application",
+ "fractonica-blob-store",
+ "fractonica-content",
+ "fractonica-data-model",
  "fractonica-glyph",
  "fractonica-saros-engine",
  "fractonica-store-sqlite",
  "fractonica-temporal-core",
  "http-body-util",
+ "httpdate",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha1",
+ "sha2 0.10.9",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http 0.7.0",
  "utoipa-swagger-ui",
+]
+
+[[package]]
+name = "fractonica-application"
+version = "0.1.0"
+dependencies = [
+ "fractonica-content",
+ "fractonica-core",
+ "fractonica-data-model",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "fractonica-blob-store"
+version = "0.1.0"
+dependencies = [
+ "fractonica-application",
+ "fractonica-content",
+ "fractonica-store-sqlite",
+ "libc",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "fractonica-content"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1088,6 +1135,17 @@ name = "fractonica-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "uuid",
+]
+
+[[package]]
+name = "fractonica-data-model"
+version = "0.1.0"
+dependencies = [
+ "fractonica-content",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -1120,6 +1178,9 @@ dependencies = [
  "clap",
  "directories",
  "fractonica-api",
+ "fractonica-application",
+ "fractonica-blob-store",
+ "fractonica-data-model",
  "fractonica-store-sqlite",
  "fs4",
  "tempfile",
@@ -1149,8 +1210,12 @@ version = "0.1.0"
 name = "fractonica-store-sqlite"
 version = "0.1.0"
 dependencies = [
+ "fractonica-application",
+ "fractonica-content",
  "fractonica-core",
+ "fractonica-data-model",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
@@ -3298,6 +3363,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
 dependencies = [
  "stable_deref_trait",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

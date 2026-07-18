@@ -2,7 +2,11 @@
 members = [
     "apps/desktop/src-tauri",
     "crates/fractonica-api",
+    "crates/fractonica-application",
+    "crates/fractonica-blob-store",
+    "crates/fractonica-content",
     "crates/fractonica-core",
+    "crates/fractonica-data-model",
     "crates/fractonica-glyph",
     "crates/fractonica-node",
     "crates/fractonica-saros-engine",
@@ -22,10 +26,15 @@ repository = "https://github.com/fractonica/fractonica"
 [workspace.dependencies]
 anyhow = "1.0.103"
 axum = "0.8.9"
+base64 = "0.22.1"
 clap = { version = "4.6.2", features = ["derive", "env"] }
 directories = "6.0.0"
 fractonica-api = { path = "crates/fractonica-api" }
+fractonica-application = { path = "crates/fractonica-application" }
+fractonica-blob-store = { path = "crates/fractonica-blob-store" }
+fractonica-content = { path = "crates/fractonica-content" }
 fractonica-core = { path = "crates/fractonica-core" }
+fractonica-data-model = { path = "crates/fractonica-data-model" }
 fractonica-glyph = { path = "crates/fractonica-glyph" }
 fractonica-saros-engine = { path = "crates/fractonica-saros-engine" }
 fractonica-saros-geo = { path = "crates/fractonica-saros-geo" }
@@ -33,12 +42,14 @@ fractonica-store-sqlite = { path = "crates/fractonica-store-sqlite" }
 fractonica-temporal-core = { path = "crates/fractonica-temporal-core" }
 fs4 = "1.1.0"
 http-body-util = "0.1.4"
+httpdate = "1.0.3"
 libc = "0.2.186"
 libm = "0.2.16"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml_ng = "0.10.0"
+sha1 = "0.10.6"
 sha2 = "0.10.9"
 subtle = "2.6.1"
 tempfile = "3.27.0"
@@ -48,6 +59,7 @@ tauri-plugin-shell = "2.3.5"
 thiserror = "2.0.18"
 time = { version = "0.3.53", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
 tower = "0.5.3"
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 tracing = "0.1.44"

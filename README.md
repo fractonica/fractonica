@@ -5,8 +5,10 @@ local storage and exposes an OpenAPI-described loopback API. Pairing,
 replication, and public-data publishing are planned but are not implemented
 yet.
 
-This repository is intentionally independent from Exeligmos. Legacy data will
-later be imported through the same public node API used by external agents.
+This repository is intentionally independent from Exeligmos. The one-way
+[Exeligmos importer](tools/import-exeligmos/README.md) migrates legacy records
+through the same public node API used by external agents; it never opens the
+legacy database or media directory directly.
 
 ## Current milestone
 
@@ -16,6 +18,10 @@ The initial vertical slice provides:
 - a dependency-free `no_std` temporal core suitable for constrained helpers;
 - a portable, allocation-free C11 SDK for temporal pulse logic and glyph geometry;
 - a migration-backed SQLite installation database;
+- a node-profile causal operation log with idempotent appends, durable
+  tombstones, concurrent heads, and node-local change cursors;
+- content-addressed record resources with tus 1.0.0 resumable staging,
+  immutable SHA-256 blobs, availability checks, and byte-range streaming;
 - loopback-only liveness, readiness, node metadata, and Swagger endpoints;
 - a stateless `saros` node profile for exact temporal readings and reviewed
   eclipse geometry without local storage;
@@ -35,7 +41,31 @@ application uses a private random loopback port instead. Useful endpoints:
 - `GET /health/live`
 - `GET /health/ready`
 - `GET /api/v1/node`
+- `POST /api/v1/operations`
+- `GET /api/v1/operations?after=0&limit=100`
+- `GET /api/v1/entities/{entityId}`
+- `OPTIONS` / `POST /api/v1/uploads`
+- `HEAD` / `PATCH /api/v1/uploads/{uploadId}`
+- `GET` / `HEAD /api/v1/blobs/{contentId}`
+- `POST /api/v1/blobs/availability`
 - `/api/docs`
+
+Operation requests use canonical UUIDs and a required `Idempotency-Key` header.
+The node derives `actorId`; clients do not submit it. Concurrent entity heads
+are retained until a merge put names every current head, tombstones remain in
+the immutable history, and `localSequence` is only a cursor for the node that
+assigned it. See [operation-log semantics](docs/operation-log.md).
+
+Record resources are ordered references to immutable IDs of the form
+`sha-256:<64 lowercase hex>`. Missing local blobs do not invalidate operations;
+clients can discover availability and resume bounded uploads independently.
+Committed blobs have no direct deletion or garbage-collection API. See
+[content-addressed storage](docs/content-storage.md).
+
+To inventory or migrate an existing Exeligmos account, first read the
+[API-only importer guide](tools/import-exeligmos/README.md). It documents the
+source scopes, dry-run, source-quiescence requirement, deterministic mapping,
+and resumable checkpoint contract.
 
 Use `--data-dir` to keep development data outside the platform default:
 

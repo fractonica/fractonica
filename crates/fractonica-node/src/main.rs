@@ -3,6 +3,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use fractonica_api::ApiState;
+use fractonica_application::ApplicationService;
+use fractonica_blob_store::BlobStore;
+use fractonica_data_model::ActorId;
 use fractonica_node::{NodeProcessLock, NodeReadyFile, default_data_dir, validate_bind};
 use fractonica_store_sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
@@ -98,8 +101,22 @@ async fn main() -> Result<()> {
                 SqliteStore::open(&database_path)
                     .with_context(|| format!("failed to open {}", database_path.display()))?,
             );
+            let installation = store
+                .installation()
+                .context("failed to read the local installation identity")?;
+            let actor_id = ActorId::new(installation.installation_id.as_uuid());
+            let blob_store = Arc::new(
+                BlobStore::open(data_dir.join("content"), Arc::clone(&store))
+                    .context("failed to open the local content store")?,
+            );
+            let application = Arc::new(ApplicationService::new(store, actor_id));
             (
-                ApiState::new(store, arguments.display_name, env!("CARGO_PKG_VERSION"))?,
+                ApiState::new(
+                    application,
+                    arguments.display_name,
+                    env!("CARGO_PKG_VERSION"),
+                )?
+                .with_blob_store(blob_store),
                 RuntimeStorage::Full {
                     data_dir,
                     process_lock,

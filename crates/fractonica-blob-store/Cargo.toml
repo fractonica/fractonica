@@ -1,6 +1,6 @@
 [package]
-name = "fractonica-store-sqlite"
-description = "SQLite persistence adapter for Fractonica nodes"
+name = "fractonica-blob-store"
+description = "Atomic filesystem content storage and resumable upload coordination"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,12 +10,11 @@ repository.workspace = true
 [dependencies]
 fractonica-application.workspace = true
 fractonica-content.workspace = true
-fractonica-core.workspace = true
-fractonica-data-model.workspace = true
-rusqlite.workspace = true
-serde_json.workspace = true
+libc.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+fractonica-store-sqlite.workspace = true
 tempfile.workspace = true
