@@ -11,6 +11,10 @@ repository.workspace = true
 tauri-build.workspace = true
 
 [dependencies]
+fractonica-client-runtime.workspace = true
+fractonica-client-sqlite.workspace = true
+fractonica-data-model.workspace = true
+fractonica-sync.workspace = true
 serde.workspace = true
 tauri.workspace = true
 tauri-plugin-shell.workspace = true

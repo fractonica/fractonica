@@ -1398,6 +1398,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "fractonica-client-runtime"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fractonica-application",
+ "fractonica-client",
+ "fractonica-client-content",
+ "fractonica-client-sqlite",
+ "fractonica-data-model",
+ "fractonica-keystore",
+ "fractonica-peer",
+ "fractonica-sync",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fractonica-client-sqlite"
 version = "0.1.0"
 dependencies = [
@@ -1448,6 +1470,10 @@ dependencies = [
 name = "fractonica-desktop"
 version = "0.1.0"
 dependencies = [
+ "fractonica-client-runtime",
+ "fractonica-client-sqlite",
+ "fractonica-data-model",
+ "fractonica-sync",
  "libc",
  "serde",
  "tauri",

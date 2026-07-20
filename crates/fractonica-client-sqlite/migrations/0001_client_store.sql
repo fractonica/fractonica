@@ -117,15 +117,18 @@ CREATE TABLE client_peers (
 CREATE TABLE client_peer_spaces (
     peer_id TEXT NOT NULL,
     space_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    grant_operation_id TEXT NOT NULL,
+    read_mode TEXT NOT NULL CHECK (read_mode IN ('supervisor_bearer', 'paired')),
+    session_id TEXT,
+    grant_operation_id TEXT,
     pull_after INTEGER NOT NULL DEFAULT 0 CHECK (pull_after >= 0),
     next_pull_at_unix_ms INTEGER NOT NULL CHECK (next_pull_at_unix_ms >= 0),
     pull_failure_count INTEGER NOT NULL DEFAULT 0 CHECK (pull_failure_count >= 0),
     last_pull_error TEXT,
     last_pull_at_unix_ms INTEGER,
     PRIMARY KEY (peer_id, space_id),
-    FOREIGN KEY (peer_id) REFERENCES client_peers(peer_id) ON DELETE CASCADE
+    FOREIGN KEY (peer_id) REFERENCES client_peers(peer_id) ON DELETE CASCADE,
+    CHECK ((read_mode = 'paired') = (session_id IS NOT NULL)),
+    CHECK ((read_mode = 'paired') = (grant_operation_id IS NOT NULL))
 ) STRICT;
 
 CREATE INDEX client_peer_spaces_due_idx

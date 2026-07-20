@@ -23,9 +23,12 @@ small `watch` status snapshot and responds to a shutdown channel; UI code never
 waits for a record-count scan or network request.
 
 `SyncTransport` and `SyncClock` are injectable. `NodeHttpTransport` implements
-the current signed admission and paired-read HTTP contract. `PeerProofCustody`
-keeps detached proof signing behind a native boundary; the included software
-adapter is intended for tests and protected headless agents.
+signed admission plus two explicit incremental-read modes. A supervised
+desktop node uses the bearer-protected changes route over its private loopback
+channel. An independently paired peer uses the pairing session, capability
+grant, and a fresh dual-signed proof. `PeerProofCustody` keeps detached proof
+signing behind a native boundary; the included software adapter is intended
+for tests and protected headless agents.
 
 The current paired-read endpoint remains loopback-only and does not provide
 transport confidentiality. This worker does not change that boundary. LAN and

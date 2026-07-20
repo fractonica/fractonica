@@ -34,3 +34,8 @@ references, scheduling state, and aggregate progress.
 Entity heads and client projections are derived entirely from immutable local
 operations. `rebuild_derived_state` recreates both without altering delivery
 state.
+
+Every peer-space cursor records an explicit read mode. A supervised desktop
+node uses its private loopback bearer channel; an independently paired peer
+requires a pairing session and capability grant for dual-signed reads. The
+store does not infer one trust mode from the presence of credentials.

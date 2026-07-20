@@ -31,9 +31,12 @@ The initial vertical slice provides:
   confirmation;
 - dual-signed, pairing-bound `readSpace` change pages with durable replay
   protection;
-- a thin Tauri desktop shell that owns the node process lifecycle;
+- a Tauri desktop shell that supervises the node and owns a native client
+  runtime without exposing keys or storage handles to the webview;
 - a platform-neutral Rust client authoring core with explicit native key
   custody and causal create, edit, delete, and profile operations;
+- a composed native client runtime that verifies and adopts the bundled node's
+  signed trust anchors, persists locally first, and supervises synchronization;
 - an independent client SQLite store with atomic offline commits, rebuildable
   heads/projections, and crash-recoverable operation and resource leases;
 - a supervised native sync worker with bounded signed delivery, durable

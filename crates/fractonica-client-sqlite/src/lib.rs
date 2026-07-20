@@ -61,10 +61,18 @@ pub struct PeerConfig {
 pub struct PeerSpaceConfig {
     pub peer_id: NodeId,
     pub space_id: SpaceId,
-    pub session_id: PeerSessionId,
-    pub grant_operation_id: OperationId,
+    pub read_mode: PeerReadMode,
     pub start_after: u64,
     pub next_pull_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeerReadMode {
+    SupervisorBearer,
+    Paired {
+        session_id: PeerSessionId,
+        grant_operation_id: OperationId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,8 +80,7 @@ pub struct SyncTarget {
     pub peer_id: NodeId,
     pub endpoint: String,
     pub space_id: SpaceId,
-    pub session_id: PeerSessionId,
-    pub grant_operation_id: OperationId,
+    pub read_mode: PeerReadMode,
     pub after: u64,
     pub pull_failure_count: u32,
 }
@@ -205,7 +212,7 @@ pub struct OutboxCounts {
     pub rejected: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyncCounts {
     pub enabled_peers: u64,
     pub spaces: u64,
@@ -435,7 +442,7 @@ impl ClientSqliteStore {
                 "INSERT OR IGNORE INTO client_deliveries (
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', ?2 FROM client_operations
-                   WHERE schema_id <> 'space.genesis'",
+                   WHERE schema_id IN ('record', 'event', 'tag', 'profile')",
                 params![peer.peer_id.to_string(), peer.added_at_unix_ms],
             )?;
             queue_known_resources_for_peer(&transaction, peer.peer_id, peer.added_at_unix_ms)?;
@@ -459,7 +466,8 @@ impl ClientSqliteStore {
                 "INSERT OR IGNORE INTO client_deliveries (
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', stored_at_unix_ms
-                   FROM client_operations WHERE schema_id <> 'space.genesis'",
+                   FROM client_operations
+                  WHERE schema_id IN ('record', 'event', 'tag', 'profile')",
                 params![peer_id.to_string()],
             )?;
             queue_known_resources_for_peer(&transaction, peer_id, 0)?;
@@ -516,19 +524,32 @@ impl ClientSqliteStore {
         if !configured {
             return Err(ClientStoreError::UnknownPeer(config.peer_id));
         }
+        let (read_mode, session_id, grant_operation_id) = match &config.read_mode {
+            PeerReadMode::SupervisorBearer => ("supervisor_bearer", None, None),
+            PeerReadMode::Paired {
+                session_id,
+                grant_operation_id,
+            } => (
+                "paired",
+                Some(session_id.to_string()),
+                Some(grant_operation_id.to_string()),
+            ),
+        };
         connection.execute(
             "INSERT INTO client_peer_spaces (
-                peer_id, space_id, session_id, grant_operation_id,
+                peer_id, space_id, read_mode, session_id, grant_operation_id,
                 pull_after, next_pull_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(peer_id, space_id) DO UPDATE SET
+                read_mode = excluded.read_mode,
                 session_id = excluded.session_id,
                 grant_operation_id = excluded.grant_operation_id",
             params![
                 config.peer_id.to_string(),
                 config.space_id.to_string(),
-                config.session_id.to_string(),
-                config.grant_operation_id.to_string(),
+                read_mode,
+                session_id,
+                grant_operation_id,
                 i64::try_from(config.start_after)
                     .map_err(|_| ClientStoreError::InvalidPullCursor)?,
                 config.next_pull_at_unix_ms,
@@ -550,7 +571,7 @@ impl ClientSqliteStore {
         }
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT p.peer_id, p.endpoint, s.space_id, s.session_id,
+            "SELECT p.peer_id, p.endpoint, s.space_id, s.read_mode, s.session_id,
                     s.grant_operation_id, s.pull_after, s.pull_failure_count
              FROM client_peer_spaces s
              JOIN client_peers p ON p.peer_id = s.peer_id
@@ -563,9 +584,10 @@ impl ClientSqliteStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
         rows.map(|row| {
@@ -580,16 +602,9 @@ impl ClientSqliteStore {
                     .2
                     .parse()
                     .map_err(|error| corrupt(format!("invalid space ID: {error}")))?,
-                session_id: row
-                    .3
-                    .parse()
-                    .map_err(|error| corrupt(format!("invalid session ID: {error}")))?,
-                grant_operation_id: row
-                    .4
-                    .parse()
-                    .map_err(|error| corrupt(format!("invalid grant ID: {error}")))?,
-                after: nonnegative_u64(row.5)?,
-                pull_failure_count: u32::try_from(row.6)
+                read_mode: parse_peer_read_mode(&row.3, row.4.as_deref(), row.5.as_deref())?,
+                after: nonnegative_u64(row.6)?,
+                pull_failure_count: u32::try_from(row.7)
                     .map_err(|_| corrupt("pull failure count overflow"))?,
             })
         })
@@ -1720,6 +1735,25 @@ fn parse_content_id(value: &str) -> Result<ContentId, ClientStoreError> {
     ContentId::parse(value).map_err(|error| corrupt(format!("invalid content ID: {error}")))
 }
 
+fn parse_peer_read_mode(
+    mode: &str,
+    session_id: Option<&str>,
+    grant_operation_id: Option<&str>,
+) -> Result<PeerReadMode, ClientStoreError> {
+    match (mode, session_id, grant_operation_id) {
+        ("supervisor_bearer", None, None) => Ok(PeerReadMode::SupervisorBearer),
+        ("paired", Some(session), Some(grant)) => Ok(PeerReadMode::Paired {
+            session_id: session
+                .parse()
+                .map_err(|error| corrupt(format!("invalid session ID: {error}")))?,
+            grant_operation_id: grant
+                .parse()
+                .map_err(|error| corrupt(format!("invalid grant ID: {error}")))?,
+        }),
+        _ => Err(corrupt("invalid peer read mode")),
+    }
+}
+
 fn apply_delivery_source(
     transaction: &Transaction<'_>,
     operation_id: OperationId,
@@ -1731,7 +1765,7 @@ fn apply_delivery_source(
         params![operation_id.to_string()],
         |row| row.get(0),
     )?;
-    if schema == EntitySchema::SpaceGenesis.as_str() {
+    if !matches!(schema.as_str(), "record" | "event" | "tag" | "profile") {
         return Ok(());
     }
     if let CommitSource::Peer(peer_id) = source {

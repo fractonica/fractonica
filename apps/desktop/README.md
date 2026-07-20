@@ -1,9 +1,18 @@
 # Fractonica Desktop
 
-The desktop application is a thin Tauri supervisor around the same
-`fractonica-node` binary used by headless installations. It bundles the
-control-center web application, starts the node as a sidecar, and terminates
-the child process when the desktop application exits.
+The desktop application owns two native services behind a thin Tauri command
+boundary:
+
+- the same `fractonica-node` binary used by headless installations, supervised
+  as a sidecar; and
+- `fractonica-client-runtime`, which owns the local client database, private
+  content store, writer key custody, local operation authoring, and background
+  synchronization.
+
+The React webview never receives private keys, SQLite handles, or filesystem
+paths. Local writes cross narrow semantic commands, return after the signed
+operation is durable in client SQLite, and synchronize independently of UI
+lifecycle or network latency.
 
 From the repository root:
 
@@ -30,3 +39,37 @@ port. The node publishes that endpoint through a private readiness file and
 requires a fresh bearer token handed directly from Tauri to the control center.
 The token is never placed in a URL or process argument. This bootstrap channel
 is local process supervision, not the future device-pairing protocol.
+
+The runtime uses separate directories below Tauri's platform application-data
+directory:
+
+```text
+node/    protected node identity, node SQLite, and node content
+client/  client SQLite and the private client content store
+```
+
+On first launch the runtime adopts the writer identity and signed default-space
+trust anchors already established by the bundled node. It verifies that the
+node metadata, protected key material, signed genesis operation, and initial
+writer grant agree before opening synchronization. It does not mint a second
+desktop account.
+
+## Native command boundary
+
+The current Tauri commands expose:
+
+- `client_status` for lifecycle, operation queue, and resource progress;
+- create and update commands for records, events, and tags;
+- `client_put_profile`;
+- `client_delete`; and
+- `client_list` for bounded local projection summaries.
+
+`node_connection` remains temporarily available to the existing control-center
+screens that inspect node and system APIs directly. Application data editing
+should use the client commands; a node response is never the local-save success
+boundary.
+
+The sidecar and synchronization worker receive explicit cancellation when the
+application exits. An unexpected sidecar exit removes the live client runtime
+and is surfaced through `client_status` instead of silently leaving a stale
+ready state.

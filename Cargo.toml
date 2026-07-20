@@ -7,6 +7,7 @@ members = [
     "crates/fractonica-client",
     "crates/fractonica-client-sqlite",
     "crates/fractonica-client-content",
+    "crates/fractonica-client-runtime",
     "crates/fractonica-sync",
     "crates/fractonica-content",
     "crates/fractonica-core",
@@ -43,6 +44,7 @@ fractonica-blob-store = { path = "crates/fractonica-blob-store" }
 fractonica-client = { path = "crates/fractonica-client" }
 fractonica-client-sqlite = { path = "crates/fractonica-client-sqlite" }
 fractonica-client-content = { path = "crates/fractonica-client-content" }
+fractonica-client-runtime = { path = "crates/fractonica-client-runtime" }
 fractonica-sync = { path = "crates/fractonica-sync" }
 fractonica-content = { path = "crates/fractonica-content" }
 fractonica-core = { path = "crates/fractonica-core" }

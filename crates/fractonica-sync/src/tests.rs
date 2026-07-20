@@ -289,8 +289,10 @@ async fn worker_commits_a_complete_pull_before_advancing_the_durable_cursor() {
         .configure_peer_space(&PeerSpaceConfig {
             peer_id: peer.peer_id,
             space_id: space(),
-            session_id: PeerSessionId::from_bytes([3; 16]),
-            grant_operation_id: genesis.operation_id,
+            read_mode: PeerReadMode::Paired {
+                session_id: PeerSessionId::from_bytes([3; 16]),
+                grant_operation_id: genesis.operation_id,
+            },
             start_after: 0,
             next_pull_at_unix_ms: 10,
         })
@@ -393,8 +395,10 @@ async fn http_transport_uses_signed_admission_and_paired_read_contracts() {
                 peer_id: peer.peer_id,
                 endpoint: peer.endpoint.clone(),
                 space_id: space(),
-                session_id: PeerSessionId::from_bytes([4; 16]),
-                grant_operation_id: genesis.operation_id,
+                read_mode: PeerReadMode::Paired {
+                    session_id: PeerSessionId::from_bytes([4; 16]),
+                    grant_operation_id: genesis.operation_id,
+                },
                 after: 0,
                 pull_failure_count: 0,
             },

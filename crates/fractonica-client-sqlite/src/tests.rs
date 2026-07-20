@@ -685,8 +685,10 @@ fn peer_space_cursor_and_failure_state_use_compare_and_swap() {
         .configure_peer_space(&PeerSpaceConfig {
             peer_id: peer.peer_id,
             space_id: space(),
-            session_id: PeerSessionId::from_bytes([5; 16]),
-            grant_operation_id: genesis.operation_id,
+            read_mode: PeerReadMode::Paired {
+                session_id: PeerSessionId::from_bytes([5; 16]),
+                grant_operation_id: genesis.operation_id,
+            },
             start_after: 0,
             next_pull_at_unix_ms: 10,
         })

@@ -17,9 +17,11 @@ The first client stack has four deliberately separate layers:
 Rust's `fractonica-client` implements the native authoring boundary.
 `fractonica-client-sqlite` atomically persists immutable operations, current
 heads, disposable projections, configured peers, and their delivery state.
-The TypeScript `@fractonica/client` package implements strict node reads and
-delivery of already-signed operations. `fractonica-sync` consumes the durable
-outbox and paired change cursors on a supervised native async task.
+`fractonica-client-runtime` composes key custody, authoring, SQLite, private
+content, transport, and the synchronization worker into one application-owned
+lifecycle. The TypeScript `@fractonica/client` package remains useful for
+strict node administration and projection reads; it is not the desktop local
+write boundary.
 
 ## Create, edit, and delete
 
@@ -56,9 +58,9 @@ reason to delete or roll back local data.
 
 ## Platform use
 
-- Desktop: the Tauri Rust process owns actor custody, the local store, and the
-  outbox. The React webview invokes narrow commands and uses the TypeScript
-  package for typed projection data only where appropriate.
+- Desktop: the Tauri Rust process owns `ClientRuntime`. The React webview
+  invokes narrow commands and receives small serializable results; it does not
+  receive keys, database handles, storage paths, or synchronization controls.
 - iOS: a Swift bridge invokes the same Rust semantics or matches the published
   conformance vectors, with actor keys held behind Keychain-backed custody.
 - Headless agents: `SoftwareActorKey` may be used with an explicitly provisioned
@@ -92,10 +94,20 @@ them on native blocking pools and return small results to the UI.
 The native worker runs bounded push and pull cycles. Pushes retain exact signed
 bytes and use expiring outbox leases. Retryable failures receive capped
 exponential backoff; permanent admission failures remain visible as rejected
-delivery state. Pulls use fresh dual-signed paired-read proofs and compare-and-
-swap cursors. A cursor advances only after every operation in its page has
+delivery state. A cursor advances only after every operation in its page has
 been verified and committed, so a crash replays an idempotent page rather than
 losing data.
+
+Peer-space configuration makes the read trust mode explicit:
+
+- `supervisor_bearer` is only for the desktop-owned node on a numeric loopback
+  HTTP origin. The bearer token is delivered out of band by the Tauri
+  supervisor and authorizes the ordinary incremental changes route.
+- `paired` uses the pairing session, capability grant, and a fresh dual-signed
+  read proof. This is the mode for an independently paired peer.
+
+The two modes share cursor and verification semantics but are not silently
+interchangeable.
 
 SQLite calls run on Tokio's blocking pool. The supervisor exposes a compact
 watch snapshot containing cycle counters and aggregate queue state and accepts
@@ -115,6 +127,22 @@ The status snapshot reports waiting, pending, leased, completed, and rejected
 resource work plus aggregate synchronized and total bytes. Platform UIs can
 render progress without scanning operations or touching the filesystem.
 
-The current peer route is still loopback-only and unauthenticated transport is
-not safe to expose on a LAN. Encrypted session transport and platform command
-wiring remain subsequent phases.
+## Desktop runtime bootstrap
+
+The bundled node owns the installation's initial controller, writer, genesis,
+and initial writer grant. `ClientRuntime::bootstrap_supervised` loads the same
+protected identity, fetches the advertised signed anchors through the private
+supervisor channel, verifies that every identity and operation ID agrees, and
+commits those anchors into the independent client store. Only then does it
+enable background pull and delivery. This prevents the desktop client from
+creating a parallel identity or trusting metadata that disagrees with its
+protected keys.
+
+Local create, update, delete, bounded list, status, and shutdown operations are
+now wired through Tauri. Moving the existing React record views onto those
+commands, importing attachments into the private content store, and exposing
+paired-device lifecycle commands are the next client-facing layers.
+
+The paired peer route is still loopback-only and unauthenticated transport is
+not safe to expose on a LAN. Encrypted session transport remains a subsequent
+phase.

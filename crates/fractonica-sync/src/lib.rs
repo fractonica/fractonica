@@ -16,8 +16,8 @@ use fractonica_application::{OperationChangePage, StoredOperation};
 use fractonica_client_content::{ClientContentError, ClientContentStore, MAX_DOWNLOAD_CHUNK_BYTES};
 use fractonica_client_sqlite::{
     ClientSqliteStore, ClientStoreError, DeliveryLeaseId, MAX_ERROR_BYTES,
-    MAX_RESOURCE_TRANSFER_BATCH, PeerConfig, ResourceTransferDirection, ResourceTransferItem,
-    ResourceTransferLeaseId, SyncCounts, SyncTarget,
+    MAX_RESOURCE_TRANSFER_BATCH, PeerConfig, PeerReadMode, ResourceTransferDirection,
+    ResourceTransferItem, ResourceTransferLeaseId, SyncCounts, SyncTarget,
 };
 use fractonica_content::{ContentDescriptor, ContentId, ResourceRef};
 use fractonica_data_model::{NodeId, OperationEnvelope};
@@ -1328,6 +1328,33 @@ where
         now_unix_ms: i64,
         request_lifetime: Duration,
     ) -> Result<PulledPage, TransportError> {
+        if target.read_mode == PeerReadMode::SupervisorBearer {
+            let token = self.bearer_tokens.get(&target.peer_id).ok_or_else(|| {
+                TransportError::permanent("supervised-node reads require a configured bearer token")
+            })?;
+            let mut url = node_url(
+                &target.endpoint,
+                &format!("api/spaces/{}/changes", target.space_id),
+            )?;
+            url.query_pairs_mut()
+                .append_pair("after", &target.after.to_string())
+                .append_pair("limit", &limit.to_string());
+            let response = self
+                .client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(network_error)?;
+            return decode_change_page(response, target).await;
+        }
+        let PeerReadMode::Paired {
+            session_id,
+            grant_operation_id,
+        } = &target.read_mode
+        else {
+            unreachable!("supervisor mode returned above")
+        };
         let expires_at_unix_ms = now_unix_ms
             .checked_add(i64::try_from(request_lifetime.as_millis()).map_err(|_| {
                 TransportError::permanent("request lifetime exceeds signed milliseconds")
@@ -1337,9 +1364,9 @@ where
         getrandom::fill(&mut nonce)
             .map_err(|error| TransportError::retryable(format!("entropy unavailable: {error}")))?;
         let proof = self.custody.sign_read(PeerReadChangesFields {
-            session_id: target.session_id,
+            session_id: *session_id,
             space_id: target.space_id,
-            grant_operation_id: target.grant_operation_id,
+            grant_operation_id: *grant_operation_id,
             after: target.after,
             limit,
             issued_at_unix_ms: now_unix_ms,
@@ -1357,28 +1384,35 @@ where
             .send()
             .await
             .map_err(|error| TransportError::retryable(error.to_string()))?;
-        if !response.status().is_success() {
-            return Err(http_failure(response.status()).await);
-        }
-        let page: OperationChangePage = response
-            .json()
-            .await
-            .map_err(|error| TransportError::retryable(format!("invalid change page: {error}")))?;
-        if page.space_id != target.space_id || page.next_after < target.after {
-            return Err(TransportError::permanent(
-                "change page identity or cursor is invalid",
-            ));
-        }
-        Ok(PulledPage {
-            operations: page
-                .operations
-                .into_iter()
-                .map(|stored: StoredOperation| stored.operation)
-                .collect(),
-            next_after: page.next_after,
-            has_more: page.has_more,
-        })
+        decode_change_page(response, target).await
     }
+}
+
+async fn decode_change_page(
+    response: reqwest::Response,
+    target: &SyncTarget,
+) -> Result<PulledPage, TransportError> {
+    if !response.status().is_success() {
+        return Err(http_failure(response.status()).await);
+    }
+    let page: OperationChangePage = response
+        .json()
+        .await
+        .map_err(|error| TransportError::retryable(format!("invalid change page: {error}")))?;
+    if page.space_id != target.space_id || page.next_after < target.after {
+        return Err(TransportError::permanent(
+            "change page identity or cursor is invalid",
+        ));
+    }
+    Ok(PulledPage {
+        operations: page
+            .operations
+            .into_iter()
+            .map(|stored: StoredOperation| stored.operation)
+            .collect(),
+        next_after: page.next_after,
+        has_more: page.has_more,
+    })
 }
 
 #[async_trait]
