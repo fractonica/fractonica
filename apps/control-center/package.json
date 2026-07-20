@@ -16,6 +16,7 @@
     "@fractonica/glyph-react": "workspace:*",
     "@fractonica/ui": "workspace:*",
     "@tauri-apps/api": "^2.11.0",
+    "qrcode.react": "^4.2.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },

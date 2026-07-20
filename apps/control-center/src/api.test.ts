@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createNodeClient, DEFAULT_NODE_URL, resolveNodeBaseUrl } from "./api";
+import type { CreatePairingRequest } from "./api";
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -16,6 +17,16 @@ const NODE_READY_RESPONSE = {
 
 const NODE_RESPONSE = {
   installationId: "node-01",
+  nodeId: `node:ed25519:${"2".repeat(64)}`,
+  spaces: [{
+    spaceId: `space:${"1".repeat(64)}`,
+    displayName: "Personal space",
+    genesisOperationId: `sha-256:${"3".repeat(64)}`,
+    initialGrantOperationId: `sha-256:${"4".repeat(64)}`,
+    controllerActorId: `actor:ed25519:${"5".repeat(64)}`,
+    localWriterActorId: `actor:ed25519:${"6".repeat(64)}`,
+    createdAtUnixMs: 1_784_265_600_000,
+  }],
   profile: "node",
   displayName: "Desk node",
   version: "0.1.0",
@@ -144,5 +155,84 @@ describe("node client", () => {
     }
     expect(client.baseUrl).toBe("http://127.0.0.1:49152");
     expect(client.baseUrl).not.toContain(token);
+  });
+
+  it("creates, reads, confirms, and cancels strict pairing sessions with bearer auth", async () => {
+    const invitationId = "7".repeat(32);
+    const spaceId = `space:${"1".repeat(64)}`;
+    const created = {
+      invitationId,
+      spaceId,
+      state: "created",
+      expiresAtUnixMs: 1_784_265_900_000,
+    };
+    const claimed = {
+      ...created,
+      state: "claimed",
+      joinerNodeId: `node:ed25519:${"2".repeat(64)}`,
+      subjectActorId: `actor:ed25519:${"3".repeat(64)}`,
+      confirmationOctal: "0123456701",
+    };
+    const completed = {
+      ...claimed,
+      state: "completed",
+      grantOperationId: `sha-256:${"4".repeat(64)}`,
+    };
+    const cancelled = { ...created, state: "cancelled" };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({ qr: "fractonica-pairing:v1:Abc_123", session: created }, 201),
+      )
+      .mockResolvedValueOnce(jsonResponse(claimed))
+      .mockResolvedValueOnce(jsonResponse(completed))
+      .mockResolvedValueOnce(jsonResponse(cancelled));
+    const token = "0123456789abcdef0123456789abcdef";
+    const client = createNodeClient("http://127.0.0.1:8789", fetcher, 5_000, token);
+    const request: CreatePairingRequest = {
+      spaceId,
+      expiresInMs: 300_000,
+      capability: {
+        actions: ["appendOperation", "readSpace", "writeContent"],
+        schemas: ["record.v1"],
+        recordVisibilities: ["public", "private"],
+        contentRoles: ["record.media"],
+        maxResourceByteLength: 1_073_741_824,
+        delegationDepth: 0,
+        label: "Personal device",
+      },
+    };
+
+    await expect(client.createPairing(request)).resolves.toMatchObject({ session: created });
+    await expect(client.readPairing(invitationId)).resolves.toEqual(claimed);
+    await expect(client.confirmPairing(invitationId, "0123456701")).resolves.toEqual(completed);
+    await expect(client.cancelPairing(invitationId)).resolves.toEqual(cancelled);
+
+    expect(fetcher.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ["http://127.0.0.1:8789/api/v2/pairing/invitations", "POST"],
+      [`http://127.0.0.1:8789/api/v2/pairing/invitations/${invitationId}`, "GET"],
+      [`http://127.0.0.1:8789/api/v2/pairing/invitations/${invitationId}/confirm`, "POST"],
+      [`http://127.0.0.1:8789/api/v2/pairing/invitations/${invitationId}`, "DELETE"],
+    ]);
+    for (const [, init] of fetcher.mock.calls) {
+      expect(init?.headers).toMatchObject({ Authorization: `Bearer ${token}` });
+    }
+  });
+
+  it("rejects pairing projections with unknown fields", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse({
+        invitationId: "7".repeat(32),
+        spaceId: `space:${"1".repeat(64)}`,
+        state: "created",
+        expiresAtUnixMs: 1_784_265_900_000,
+        secret: "must-not-cross-this-boundary",
+      }),
+    );
+    const client = createNodeClient("http://127.0.0.1:8789", fetcher);
+
+    await expect(client.readPairing("7".repeat(32))).rejects.toThrow(
+      "The pairing response did not match the expected schema.",
+    );
   });
 });

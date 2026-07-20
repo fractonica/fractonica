@@ -19,6 +19,19 @@ import type {
 
 export const MAX_TUS_CHUNK_BYTES = 4 * 1024 * 1024;
 
+const LEGACY_V1_COMPATIBILITY_MESSAGE =
+  "this importer only emits unsigned Fractonica operation protocol v1; " +
+  "the destination must expose the legacy /api/v1/operations API. Signed " +
+  "operation protocol v2 requires a dedicated client-side actor-key/signing " +
+  "adapter, which this tool does not implement";
+
+export class LegacyV1CompatibilityError extends Error {
+  constructor(detail: string, options?: ErrorOptions) {
+    super(`${LEGACY_V1_COMPATIBILITY_MESSAGE}: ${detail}`, options);
+    this.name = "LegacyV1CompatibilityError";
+  }
+}
+
 export interface TusUploadState {
   readonly uploadUrl: string;
   readonly length: number;
@@ -40,10 +53,31 @@ export interface TusUploadMetadata {
 export class FractonicaClient {
   readonly baseUrl: string;
   readonly token: string | undefined;
+  private legacyV1CompatibilityVerified = false;
 
   constructor(baseUrl: string, token?: string) {
     this.baseUrl = baseUrl;
     this.token = token;
+  }
+
+  /**
+   * Proves that the destination still exposes the legacy unsigned operation
+   * API without mutating it. Every mutating method in this legacy client is
+   * gated on a successful probe so a v2 node cannot be populated with orphaned
+   * content before operation submission is found to be obsolete.
+   */
+  async assertLegacyV1Compatible(): Promise<void> {
+    this.legacyV1CompatibilityVerified = false;
+    try {
+      await this.operationPage(0, 1);
+      this.legacyV1CompatibilityVerified = true;
+    } catch (error) {
+      const detail =
+        error instanceof HttpError && error.status === 410
+          ? "the destination explicitly retired operation protocol v1 (HTTP 410)"
+          : "the read-only compatibility probe did not return a valid protocol-v1 operation page";
+      throw new LegacyV1CompatibilityError(detail, { cause: error });
+    }
   }
 
   async blobAvailability(
@@ -71,6 +105,7 @@ export class FractonicaClient {
     length: number,
     metadata: TusUploadMetadata,
   ): Promise<TusUploadState> {
+    this.requireLegacyV1Compatibility();
     assertNonnegativeSafeInteger(length, "upload length");
     const headers = new Headers({
       "Tus-Resumable": "1.0.0",
@@ -123,6 +158,7 @@ export class FractonicaClient {
     offset: number,
     bytes: Uint8Array,
   ): Promise<TusPatchResult> {
+    this.requireLegacyV1Compatibility();
     assertNonnegativeSafeInteger(offset, "upload offset");
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_TUS_CHUNK_BYTES) {
       throw new Error(`TUS chunks must contain 1-${MAX_TUS_CHUNK_BYTES} bytes`);
@@ -160,6 +196,7 @@ export class FractonicaClient {
     operation: OperationSubmission,
     idempotencyKey: string,
   ): Promise<{ readonly stored: StoredOperation; readonly replayed: boolean }> {
+    this.requireLegacyV1Compatibility();
     const json = jsonBody(operation);
     json.headers.set("Idempotency-Key", idempotencyKey);
     const response = await fetchChecked(
@@ -238,6 +275,14 @@ export class FractonicaClient {
 
   isUploadGone(error: unknown): boolean {
     return error instanceof HttpError && (error.status === 404 || error.status === 410);
+  }
+
+  private requireLegacyV1Compatibility(): void {
+    if (!this.legacyV1CompatibilityVerified) {
+      throw new LegacyV1CompatibilityError(
+        "a successful read-only compatibility probe is required before destination writes",
+      );
+    }
   }
 }
 

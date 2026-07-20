@@ -11,8 +11,10 @@ repository.workspace = true
 fractonica-core.workspace = true
 fractonica-content.workspace = true
 fractonica-data-model.workspace = true
+fractonica-peer.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

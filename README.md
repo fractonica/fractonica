@@ -1,14 +1,15 @@
 # Fractonica
 
 Fractonica is a local-first personal data network. The current node owns its
-local storage and exposes an OpenAPI-described loopback API. Pairing,
-replication, and public-data publishing are planned but are not implemented
-yet.
+local storage and exposes an OpenAPI-described loopback API. Local pairing and
+capability-authorized peer reads are implemented; encrypted transport,
+replication, and public-data publishing remain planned.
 
-This repository is intentionally independent from Exeligmos. The one-way
-[Exeligmos importer](tools/import-exeligmos/README.md) migrates legacy records
-through the same public node API used by external agents; it never opens the
-legacy database or media directory directly.
+This repository is intentionally independent from Exeligmos. The historical
+[Exeligmos importer](tools/import-exeligmos/README.md) is retained as an
+explicitly legacy, unsigned-v1 migration tool; it refuses to target a signed-v2
+node. A v2 migration must construct and sign new operations rather than assign
+trust to legacy UUID operations.
 
 ## Current milestone
 
@@ -18,16 +19,24 @@ The initial vertical slice provides:
 - a dependency-free `no_std` temporal core suitable for constrained helpers;
 - a portable, allocation-free C11 SDK for temporal pulse logic and glyph geometry;
 - a migration-backed SQLite installation database;
-- a node-profile causal operation log with idempotent appends, durable
-  tombstones, concurrent heads, and node-local change cursors;
+- a signed, space-scoped version 2 Merkle operation graph with idempotent
+  admission, durable tombstones, concurrent heads, node-local change cursors,
+  capability grants, and append-only revocations;
 - content-addressed record resources with tus 1.0.0 resumable staging,
   immutable SHA-256 blobs, availability checks, and byte-range streaming;
 - loopback-only liveness, readiness, node metadata, and Swagger endpoints;
 - a stateless `saros` node profile for exact temporal readings and reviewed
   eclipse geometry without local storage;
-- a React control center that can inspect the local node;
+- a React control center that can inspect the local node and administer the
+  loopback Noise pairing ceremony through a scannable QR and two-glyph human
+  confirmation;
+- dual-signed, pairing-bound `readSpace` change pages with durable replay
+  protection;
 - a thin Tauri desktop shell that owns the node process lifecycle;
-- architecture and protocol contracts for the next pairing and replication work.
+- protected Unix filesystem identity bootstrap with an explicit installation
+  binding that persists the exact signed default-space bootstrap before the
+  database is allowed to commit it;
+- architecture and protocol contracts for the next replication work.
 
 ## Run the node
 
@@ -41,20 +50,27 @@ application uses a private random loopback port instead. Useful endpoints:
 - `GET /health/live`
 - `GET /health/ready`
 - `GET /api/v1/node`
-- `POST /api/v1/operations`
-- `GET /api/v1/operations?after=0&limit=100`
-- `GET /api/v1/entities/{entityId}`
+- `POST /api/v2/spaces/{spaceId}/operations`
+- `GET /api/v2/spaces/{spaceId}/operations/{operationId}`
+- `GET /api/v2/spaces/{spaceId}/changes?after=0&limit=100`
+- `GET /api/v2/spaces/{spaceId}/entities/{entityId}`
 - `OPTIONS` / `POST /api/v1/uploads`
 - `HEAD` / `PATCH /api/v1/uploads/{uploadId}`
 - `GET` / `HEAD /api/v1/blobs/{contentId}`
 - `POST /api/v1/blobs/availability`
+- `GET /api/v1/saros` and the v1 Saros/glyph calculation routes
 - `/api/docs`
 
-Operation requests use canonical UUIDs and a required `Idempotency-Key` header.
-The node derives `actorId`; clients do not submit it. Concurrent entity heads
-are retained until a merge put names every current head, tombstones remain in
-the immutable history, and `localSequence` is only a cursor for the node that
-assigned it. See [operation-log semantics](docs/operation-log.md).
+Version 2 operation requests contain a complete, client-signed COSE
+Sign1/Ed25519 envelope and strict JSON projection. The digest-derived
+`OperationId` is the idempotency key; the node never derives the actor or signs
+on the client's behalf. Concurrent entity heads are retained until a merge put
+names every current head, tombstones remain in immutable history, and
+`localSequence` is only a cursor for the node that assigned it. Unsigned
+`/api/v1/operations` and `/api/v1/entities/{entityId}` requests return `410`
+with `operation_v1_obsolete`; v1 Saros, glyph, and content-transfer routes
+remain available on loopback. See [operation-log semantics](docs/operation-log.md)
+and the [signed HTTP API](docs/signed-operation-api.md).
 
 Record resources are ordered references to immutable IDs of the form
 `sha-256:<64 lowercase hex>`. Missing local blobs do not invalidate operations;
@@ -62,10 +78,10 @@ clients can discover availability and resume bounded uploads independently.
 Committed blobs have no direct deletion or garbage-collection API. See
 [content-addressed storage](docs/content-storage.md).
 
-To inventory or migrate an existing Exeligmos account, first read the
-[API-only importer guide](tools/import-exeligmos/README.md). It documents the
-source scopes, dry-run, source-quiescence requirement, deterministic mapping,
-and resumable checkpoint contract.
+To inventory an existing Exeligmos account or inspect the old development
+migration flow, read the [legacy importer guide](tools/import-exeligmos/README.md).
+Its dry run remains useful, but its write mode deliberately fails closed when
+the destination exposes the signed-v2 boundary.
 
 Use `--data-dir` to keep development data outside the platform default:
 

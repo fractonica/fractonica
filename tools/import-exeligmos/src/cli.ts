@@ -21,6 +21,9 @@ async function main(): Promise<void> {
   process.stderr.write(
     "Important: keep the Exeligmos source quiescent during migration; its cursor is not a snapshot boundary.\n",
   );
+  process.stderr.write(
+    "Compatibility: this legacy tool emits unsigned operation protocol v1 and intentionally refuses signed-v2 destinations.\n",
+  );
   if (options.dryRun) {
     process.stderr.write("Dry run: no requests that mutate Fractonica will be made.\n");
   }
@@ -126,6 +129,12 @@ not mutate the destination or write a checkpoint.
 Transport:
   Plain HTTP is accepted only for localhost, 127.0.0.0/8, and [::1].
   Every LAN or internet source and destination must use HTTPS.
+
+Compatibility:
+  This is a legacy protocol-v1 migration tool. A real run first performs a
+  read-only destination probe and refuses signed operation protocol v2. It
+  never asks the server to sign on the importing actor's behalf. Dry-run mode
+  remains destination-independent.
 `;
 }
 

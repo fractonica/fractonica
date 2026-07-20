@@ -1,5 +1,9 @@
 //! Process-level safeguards for the Fractonica node executable.
 
+pub mod bootstrap;
+pub mod durable_pairing;
+pub mod installation;
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -106,25 +110,27 @@ impl NodeProcessLock {
     pub fn acquire(data_dir: &Path) -> Result<Self, NodeStartupError> {
         prepare_private_directory(data_dir)?;
         let path = data_dir.join("node.lock");
-        if matches!(fs::symlink_metadata(&path), Ok(metadata) if metadata.file_type().is_symlink())
-        {
-            return Err(NodeStartupError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} must not be a symbolic link", path.display()),
-            )));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(NodeStartupError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} must be a regular lock file", path.display()),
+                )));
+            }
+            Ok(metadata) => validate_private_file(&path, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(NodeStartupError::Io(error)),
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)?;
-
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let file = options.open(&path)?;
+
+        validate_private_file(&path, &file.metadata()?)?;
 
         match fs4::FileExt::try_lock(&file) {
             Ok(()) => Ok(Self { file, path }),
@@ -147,17 +153,77 @@ fn prepare_private_directory(path: &Path) -> io::Result<()> {
                 format!("{} is not a private data directory", path.display()),
             ));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Ok(metadata) => validate_private_directory(path, &metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+            validate_private_directory(path, &fs::symlink_metadata(path)?)?;
+        }
         Err(error) => return Err(error),
     }
+    Ok(())
+}
 
+fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::MetadataExt;
+        validate_owner(path, metadata)?;
+        let mode = metadata.mode() & 0o7777;
+        if mode != 0o700 {
+            return Err(private_state_error(
+                path,
+                format!("mode is {mode:#o}, expected 0o700"),
+            ));
+        }
     }
     Ok(())
+}
+
+fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        validate_owner(path, metadata)?;
+        let mode = metadata.mode() & 0o7777;
+        if mode != 0o600 {
+            return Err(private_state_error(
+                path,
+                format!("mode is {mode:#o}, expected 0o600"),
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(private_state_error(
+                path,
+                format!("has {} hard links, expected exactly one", metadata.nlink()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_owner(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let expected = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected {
+        return Err(private_state_error(
+            path,
+            format!("owner is uid {}, expected uid {expected}", metadata.uid()),
+        ));
+    }
+    Ok(())
+}
+
+fn private_state_error(path: &Path, detail: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{} is not private node state: {detail}", path.display()),
+    )
 }
 
 #[cfg(test)]
@@ -182,12 +248,13 @@ mod tests {
     #[test]
     fn process_lock_prevents_two_nodes_using_one_directory() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let first = NodeProcessLock::acquire(directory.path()).expect("first lock");
-        let second = NodeProcessLock::acquire(directory.path());
+        let data_dir = directory.path().join("node");
+        let first = NodeProcessLock::acquire(&data_dir).expect("first lock");
+        let second = NodeProcessLock::acquire(&data_dir);
 
         assert!(matches!(second, Err(NodeStartupError::AlreadyRunning(_))));
         drop(first);
-        assert!(NodeProcessLock::acquire(directory.path()).is_ok());
+        assert!(NodeProcessLock::acquire(&data_dir).is_ok());
     }
 
     #[cfg(unix)]
@@ -215,6 +282,35 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_process_state_is_rejected_not_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let data_dir = root.path().join("node");
+        fs::create_dir(&data_dir).unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            NodeProcessLock::acquire(&data_dir),
+            Err(NodeStartupError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = NodeProcessLock::acquire(&data_dir).unwrap();
+        let lock_path = lock.path().to_owned();
+        drop(lock);
+        fs::hard_link(&lock_path, root.path().join("lock-copy")).unwrap();
+        assert!(matches!(
+            NodeProcessLock::acquire(&data_dir),
+            Err(NodeStartupError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
     }
 
     #[test]

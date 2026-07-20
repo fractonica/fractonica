@@ -8,11 +8,15 @@ members = [
     "crates/fractonica-core",
     "crates/fractonica-data-model",
     "crates/fractonica-glyph",
+    "crates/fractonica-keystore",
     "crates/fractonica-node",
+    "crates/fractonica-pairing",
+    "crates/fractonica-peer",
     "crates/fractonica-saros-engine",
     "crates/fractonica-saros-geo",
     "crates/fractonica-store-sqlite",
     "crates/fractonica-temporal-core",
+    "crates/fractonica-trust",
 ]
 resolver = "3"
 
@@ -36,21 +40,28 @@ fractonica-content = { path = "crates/fractonica-content" }
 fractonica-core = { path = "crates/fractonica-core" }
 fractonica-data-model = { path = "crates/fractonica-data-model" }
 fractonica-glyph = { path = "crates/fractonica-glyph" }
+fractonica-keystore = { path = "crates/fractonica-keystore" }
+fractonica-pairing = { path = "crates/fractonica-pairing" }
+fractonica-peer = { path = "crates/fractonica-peer" }
 fractonica-saros-engine = { path = "crates/fractonica-saros-engine" }
 fractonica-saros-geo = { path = "crates/fractonica-saros-geo" }
 fractonica-store-sqlite = { path = "crates/fractonica-store-sqlite" }
 fractonica-temporal-core = { path = "crates/fractonica-temporal-core" }
+fractonica-trust = { path = "crates/fractonica-trust" }
 fs4 = "1.1.0"
+getrandom = "0.4.3"
 http-body-util = "0.1.4"
 httpdate = "1.0.3"
 libc = "0.2.186"
 libm = "0.2.16"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml_ng = "0.10.0"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
+snow = { version = "0.10.0", default-features = false, features = ["std", "default-resolver-crypto", "use-curve25519", "use-chacha20poly1305", "use-blake2"] }
 subtle = "2.6.1"
 tempfile = "3.27.0"
 tauri = "2.11.5"
@@ -66,3 +77,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 uuid = { version = "1.24.0", features = ["serde", "v4", "v7"] }
+zeroize = "1.9.0"
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }

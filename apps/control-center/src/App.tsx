@@ -1,8 +1,15 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { OctalGlyph } from "@fractonica/glyph-react";
 import { Button, Metric, Panel, Skeleton, StatusBadge } from "@fractonica/ui";
+import { QRCodeSVG } from "qrcode.react";
 import { createRuntimeNodeClient } from "./api";
-import type { NodeClient, NodeSnapshot } from "./api";
+import type {
+  NodeClient,
+  NodeSnapshot,
+  PairingInvitation,
+  PairingSession,
+  SpaceDescriptor,
+} from "./api";
 import { formatCheckedAt, formatLocalDateTime, formatUptime } from "./format";
 import { useNodeStatus } from "./use-node-status";
 import "./app.css";
@@ -57,12 +64,7 @@ interface OfflineOverviewProps {
   onRetry(): void;
 }
 
-function OfflineOverview({
-  baseUrl,
-  error,
-  onRetry,
-  refreshing,
-}: OfflineOverviewProps) {
+function OfflineOverview({ baseUrl, error, onRetry, refreshing }: OfflineOverviewProps) {
   return (
     <Panel className="hero hero--offline">
       <div className="hero__copy" role="alert">
@@ -144,11 +146,7 @@ function ReadyOverview({ snapshot }: { snapshot: NodeSnapshot }) {
           />
         </Panel>
         <Panel className="metric-card">
-          <Metric
-            detail="Node software"
-            label="Version"
-            value={snapshot.node.version}
-          />
+          <Metric detail="Node software" label="Version" value={snapshot.node.version} />
         </Panel>
       </div>
 
@@ -163,6 +161,12 @@ function ReadyOverview({ snapshot }: { snapshot: NodeSnapshot }) {
               <dt>Installation ID</dt>
               <dd className="mono-value">{snapshot.node.installationId}</dd>
             </div>
+            {snapshot.node.nodeId ? (
+              <div>
+                <dt>Node identity</dt>
+                <dd className="mono-value">{snapshot.node.nodeId}</dd>
+              </div>
+            ) : null}
           </dl>
         </Panel>
 
@@ -182,6 +186,308 @@ function ReadyOverview({ snapshot }: { snapshot: NodeSnapshot }) {
   );
 }
 
+function ConfirmationGlyphs({ value }: { value: string }) {
+  return (
+    <div aria-label={`Confirmation code ${value}`} className="confirmation-glyphs">
+      {[value.slice(0, 5), value.slice(5)].map((half, index) => (
+        <div className="confirmation-glyph" key={`${half}-${index}`}>
+          <OctalGlyph decorative depth={5} value={half} />
+          <code>{half}</code>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PairingIdentity({ session }: { session: PairingSession }) {
+  return (
+    <dl className="pairing-identity">
+      {session.joinerNodeId ? (
+        <div>
+          <dt>Joining node</dt>
+          <dd>{session.joinerNodeId}</dd>
+        </div>
+      ) : null}
+      {session.subjectActorId ? (
+        <div>
+          <dt>Joining actor</dt>
+          <dd>{session.subjectActorId}</dd>
+        </div>
+      ) : null}
+      {session.grantOperationId ? (
+        <div>
+          <dt>Capability grant</dt>
+          <dd>{session.grantOperationId}</dd>
+        </div>
+      ) : null}
+    </dl>
+  );
+}
+
+interface PairingPanelProps {
+  client: NodeClient;
+  snapshot: NodeSnapshot;
+}
+
+function PairingPanel({ client, snapshot }: PairingPanelProps) {
+  const spaces = snapshot.node.spaces ?? [];
+  const [spaceId, setSpaceId] = useState(spaces[0]?.spaceId ?? "");
+  const [invitation, setInvitation] = useState<PairingInvitation | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pairingAvailable = snapshot.node.capabilities.includes("noise-pairing-v1");
+  const session = invitation?.session;
+  const qr = invitation?.qr ?? "";
+  const terminal = session && ["completed", "cancelled", "expired"].includes(session.state);
+
+  useEffect(() => {
+    if (!session || terminal) return;
+    let stopped = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const next = await client.readPairing(session.invitationId);
+        if (!stopped) {
+          setInvitation((current) => (current ? { qr: "", session: next } : null));
+          setError(null);
+          if (!["completed", "cancelled", "expired"].includes(next.state)) {
+            timer = window.setTimeout(() => void poll(), 1_000);
+          }
+        }
+      } catch (reason) {
+        if (!stopped) {
+          setError(reason instanceof Error ? reason.message : "Could not refresh pairing state.");
+          timer = window.setTimeout(() => void poll(), 2_000);
+        }
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 750);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [client, session?.invitationId, session?.state, terminal]);
+
+  const create = async () => {
+    setBusy(true);
+    setError(null);
+    setCopied(false);
+    try {
+      setInvitation(
+        await client.createPairing({
+          spaceId,
+          expiresInMs: 5 * 60 * 1_000,
+          capability: {
+            actions: ["appendOperation", "readSpace", "writeContent"],
+            schemas: ["record.v1"],
+            recordVisibilities: ["public", "private"],
+            contentRoles: ["record.media"],
+            maxResourceByteLength: 1_073_741_824,
+            delegationDepth: 0,
+            label: "Personal device",
+          },
+        }),
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not create a pairing invitation.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refresh = async () => {
+    if (!session) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await client.readPairing(session.invitationId);
+      setInvitation((current) => (current ? { qr: next.state === "created" ? current.qr : "", session: next } : null));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not refresh pairing state.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirm = async () => {
+    if (!session?.confirmationOctal) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await client.confirmPairing(session.invitationId, session.confirmationOctal);
+      setInvitation({ qr: "", session: next });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not authorize the joining device.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (!session) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setInvitation({ qr: "", session: await client.cancelPairing(session.invitationId) });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not cancel the invitation.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyInvitation = async () => {
+    if (!invitation?.qr) return;
+    try {
+      await navigator.clipboard.writeText(invitation.qr);
+      setCopied(true);
+    } catch {
+      setError("The invitation could not be copied. Use the QR code instead.");
+    }
+  };
+
+  const reset = () => {
+    setInvitation(null);
+    setError(null);
+    setCopied(false);
+  };
+
+  return (
+    <section aria-labelledby="pairing-title" className="pairing-section" id="pairing">
+      <header className="section-header">
+        <div>
+          <p className="section-kicker">Local authority</p>
+          <h2 id="pairing-title">Pair a device</h2>
+          <p>
+            Grant a new actor access without copying this node’s private keys. The invitation expires
+            after five minutes and can be claimed once.
+          </p>
+        </div>
+        {pairingAvailable ? <StatusBadge tone="ready">Noise v1 ready</StatusBadge> : null}
+      </header>
+
+      {!pairingAvailable || snapshot.node.profile !== "node" ? (
+        <Panel className="pairing-card pairing-card--notice">
+          <h3>Pairing is unavailable in this profile</h3>
+          <p>Start the full local node profile to create durable device capabilities.</p>
+        </Panel>
+      ) : null}
+
+      {pairingAvailable && snapshot.node.profile === "node" && !session ? (
+        <Panel className="pairing-card pairing-setup">
+          <div>
+            <p className="pairing-step">Step 1 · Scope</p>
+            <h3>Personal device</h3>
+            <p>
+              Read the selected space, append public or private records, and transfer record media.
+              This grant cannot issue or revoke other capabilities.
+            </p>
+          </div>
+          <label className="field-label">
+            Trusted space
+            <select value={spaceId} onChange={(event) => setSpaceId(event.target.value)}>
+              {spaces.map((space: SpaceDescriptor) => (
+                <option key={space.spaceId} value={space.spaceId}>
+                  {space.displayName}
+                </option>
+              ))}
+            </select>
+          </label>
+          <ul className="grant-summary" aria-label="Requested device capability">
+            <li>Read space</li>
+            <li>Create and revise records</li>
+            <li>Public and private visibility</li>
+            <li>Record media up to 1 GiB each</li>
+            <li>No delegation</li>
+          </ul>
+          <div className="pairing-actions">
+            <Button disabled={busy || !spaceId} onClick={() => void create()}>
+              {busy ? "Creating…" : "Create invitation"}
+            </Button>
+          </div>
+        </Panel>
+      ) : null}
+
+      {session?.state === "created" && qr ? (
+        <Panel className="pairing-card pairing-invitation">
+          <div className="qr-frame">
+            <QRCodeSVG bgColor="#ffffff" fgColor="#07110e" level="M" marginSize={2} size={244} value={qr} />
+          </div>
+          <div className="pairing-copy">
+            <p className="pairing-step">Step 2 · One-time invitation</p>
+            <h3>Scan from the joining client</h3>
+            <p>
+              The QR contains a short-lived secret. Fractonica never writes it to SQLite, logs, URLs,
+              or the signed graph.
+            </p>
+            <p className="security-note">
+              Network binding is still loopback-only. This invitation currently works with local
+              protocol clients; LAN discovery remains intentionally disabled.
+            </p>
+            <dl className="pairing-facts">
+              <div><dt>Expires</dt><dd>{new Date(session.expiresAtUnixMs).toLocaleString()}</dd></div>
+              <div><dt>Invitation</dt><dd>{session.invitationId}</dd></div>
+            </dl>
+            <div className="pairing-actions">
+              <Button disabled={busy} onClick={() => void refresh()} variant="quiet">Check claim</Button>
+              <Button disabled={busy} onClick={() => void copyInvitation()} variant="quiet">
+                {copied ? "Copied" : "Copy payload"}
+              </Button>
+              <Button className="danger-button" disabled={busy} onClick={() => void cancel()} variant="quiet">Cancel</Button>
+            </div>
+          </div>
+        </Panel>
+      ) : null}
+
+      {(session?.state === "claimed" || session?.state === "confirmed") && session.confirmationOctal ? (
+        <Panel className="pairing-card pairing-confirmation">
+          <div>
+            <p className="pairing-step">Step 3 · Human confirmation</p>
+            <h3>Compare both glyphs</h3>
+            <p>
+              Verify that these two five-digit glyphs and all ten octal digits exactly match the
+              joining device. A partial match is not sufficient.
+            </p>
+          </div>
+          <ConfirmationGlyphs value={session.confirmationOctal} />
+          <PairingIdentity session={session} />
+          <div className="pairing-actions">
+            <Button disabled={busy} onClick={() => void confirm()}>
+              {busy ? "Authorizing…" : session.state === "confirmed" ? "Finish authorization" : "Codes match · authorize"}
+            </Button>
+            <Button className="danger-button" disabled={busy} onClick={() => void cancel()} variant="quiet">Reject and cancel</Button>
+          </div>
+        </Panel>
+      ) : null}
+
+      {session?.state === "completed" ? (
+        <Panel className="pairing-card pairing-complete">
+          <StatusBadge tone="ready">Device authorized</StatusBadge>
+          <div>
+            <p className="pairing-step">Complete</p>
+            <h3>Capability admitted</h3>
+            <p>The joining actor now has exactly the bounded authority shown above.</p>
+          </div>
+          <PairingIdentity session={session} />
+          <Button onClick={reset} variant="quiet">Pair another device</Button>
+        </Panel>
+      ) : null}
+
+      {(session?.state === "cancelled" || session?.state === "expired") ? (
+        <Panel className="pairing-card pairing-card--notice">
+          <StatusBadge tone="offline">Invitation {session.state}</StatusBadge>
+          <h3>No authority was issued</h3>
+          <p>Create a fresh one-time invitation when the joining device is ready.</p>
+          <Button onClick={reset} variant="quiet">Start again</Button>
+        </Panel>
+      ) : null}
+
+      {error ? <p className="pairing-error" role="alert">{error}</p> : null}
+    </section>
+  );
+}
+
 export default function App({ client: suppliedClient }: AppProps) {
   const client = useMemo(() => suppliedClient ?? createRuntimeNodeClient(), [suppliedClient]);
   const { error, lastCheckedAt, phase, refresh, refreshing, snapshot } = useNodeStatus(client);
@@ -191,20 +497,13 @@ export default function App({ client: suppliedClient }: AppProps) {
       <aside className="sidebar">
         <div className="brand-lockup">
           <FractonicaMark />
-          <div>
-            <strong>Fractonica</strong>
-            <span>Control center</span>
-          </div>
+          <div><strong>Fractonica</strong><span>Control center</span></div>
         </div>
-
         <nav aria-label="Control center">
           <span className="nav-label">Local workspace</span>
-          <a aria-current="page" className="nav-item" href="#overview">
-            <span aria-hidden="true" className="nav-item__glyph">◈</span>
-            Node overview
-          </a>
+          <a className="nav-item" href="#overview"><span aria-hidden="true" className="nav-item__glyph">◈</span>Node overview</a>
+          <a className="nav-item nav-item--secondary" href="#pairing"><span aria-hidden="true" className="nav-item__glyph">⌁</span>Pair devices</a>
         </nav>
-
         <div className="sidebar__status">
           <StatusBadge tone={toneForPhase(phase)}>{labelForPhase(phase)}</StatusBadge>
           <span>{formatCheckedAt(lastCheckedAt)}</span>
@@ -217,14 +516,9 @@ export default function App({ client: suppliedClient }: AppProps) {
           <div>
             <p className="section-kicker">Control plane · local</p>
             <h1>Node overview</h1>
-            <p>Observe the local Fractonica runtime from one quiet surface.</p>
+            <p>Observe the runtime and grant bounded authority from one local surface.</p>
           </div>
-          <Button
-            aria-label={refreshing ? "Checking node status" : "Refresh node status"}
-            disabled={refreshing}
-            onClick={() => void refresh()}
-            variant="quiet"
-          >
+          <Button aria-label={refreshing ? "Checking node status" : "Refresh node status"} disabled={refreshing} onClick={() => void refresh()} variant="quiet">
             <span aria-hidden="true" className={refreshing ? "refresh-icon is-spinning" : "refresh-icon"}>↻</span>
             {refreshing ? "Checking" : "Refresh"}
           </Button>
@@ -232,20 +526,14 @@ export default function App({ client: suppliedClient }: AppProps) {
 
         <div aria-live="polite" className="content-stack">
           {phase === "loading" ? <LoadingOverview baseUrl={client.baseUrl} /> : null}
-          {phase === "offline" ? (
-            <OfflineOverview
-              baseUrl={client.baseUrl}
-              error={error}
-              onRetry={() => void refresh()}
-              refreshing={refreshing}
-            />
-          ) : null}
+          {phase === "offline" ? <OfflineOverview baseUrl={client.baseUrl} error={error} onRetry={() => void refresh()} refreshing={refreshing} /> : null}
           {phase === "ready" && snapshot ? <ReadyOverview snapshot={snapshot} /> : null}
         </div>
+        {phase === "ready" && snapshot ? <PairingPanel client={client} snapshot={snapshot} /> : null}
 
         <footer className="page-footer">
           <span>Fractonica local control center</span>
-          <span>Read-only node status</span>
+          <span>Loopback authority boundary</span>
         </footer>
       </main>
     </div>

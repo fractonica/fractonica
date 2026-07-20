@@ -6,11 +6,19 @@ info:
     name: AGPL-3.0-or-later
     url: https://www.gnu.org/licenses/agpl-3.0.html
   description: >-
-    Loopback-only API for a Fractonica node and its deterministic Saros engine.
+    Obsolete pre-signature API retained as a historical migration contract.
+    Version 2 nodes reject version 1 operation submission and do not reinterpret
+    unsigned UUID operations as signed operations. Saros, glyph, and legacy
+    content shapes remain documented so migration tooling can identify old
+    responses. New clients use `contracts/openapi/v2.yaml`.
+    This was a loopback-only API for a Fractonica node and its deterministic Saros engine.
     The `saros` profile is stateless and serves only temporal/geometry routes;
     the `node` profile also owns local SQLite storage. The server must not bind
     to a non-loopback interface until pairing and authentication have been
     specified and implemented.
+    A running node rewrites the served document's top-level `security`
+    requirement to bearer-only when `--bootstrap-token` is configured and to
+    anonymous loopback otherwise.
 servers:
   - url: http://127.0.0.1:8789
     description: Local node
@@ -21,8 +29,8 @@ tags:
     description: Local node-profile identity and declared capabilities.
   - name: Operations
     description: >-
-      Durable node-profile operation log and materialized entity heads. These
-      routes return 503 when the stateless `saros` profile is selected.
+      Obsolete unsigned UUID operation log. Version 2 nodes reject these
+      routes; this description exists only for one-way migration tooling.
   - name: Content
     description: >-
       Stateful content-addressed blob discovery, tus 1.0.0 resumable upload,
@@ -32,7 +40,6 @@ tags:
   - name: Glyphs
     description: Canonical octal-glyph grammar, versioned font outlines, compound contour geometry, and raw RGBA8 raster output.
 security:
-  - {}
   - bootstrapBearer: []
 paths:
   /health/live:
@@ -96,7 +103,12 @@ paths:
     post:
       tags:
         - Operations
-      summary: Append an idempotent operation to the local node log
+      summary: Obsolete unsigned operation submission
+      description: >-
+        Version 2 nodes reject this operation with `410 operation_v1_obsolete`.
+        The historical request and response schemas below are retained only so
+        explicit one-way migration tools can decode pre-v2 data.
+      deprecated: true
       operationId: appendOperation
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
@@ -107,103 +119,56 @@ paths:
             schema:
               $ref: "#/components/schemas/OperationSubmission"
       responses:
-        "201":
+        "410":
           description: >-
-            The operation was accepted and assigned a node-local sequence.
+            Unsigned UUID operations are obsolete and must be migrated and
+            signed explicitly before submission to `/api/v2`.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/StoredOperation"
-        "200":
-          description: >-
-            The same idempotency key and canonical request were already
-            accepted; the original stored operation is replayed unchanged.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StoredOperation"
+                $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
-        "409":
-          description: >-
-            The idempotency key was reused with a different request, or a
-            causal parent conflicts with the operation log.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "422":
-          description: The operation is malformed or violates a domain invariant.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "503":
-          description: Persistent storage is unavailable for the selected profile.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
     get:
       tags:
         - Operations
-      summary: Read a node-local page of stored operations
+      summary: Obsolete unsigned operation-log read
+      description: >-
+        Version 2 nodes reject this route. A one-way offline migration tool may
+        read it only from a legacy version 1 node.
+      deprecated: true
       operationId: listOperations
       parameters:
         - $ref: "#/components/parameters/OperationsAfter"
         - $ref: "#/components/parameters/OperationsLimit"
       responses:
-        "200":
-          description: >-
-            Operations ordered by ascending node-local sequence, strictly
-            after the requested cursor.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OperationPage"
-        "401":
-          $ref: "#/components/responses/BootstrapUnauthorized"
-        "422":
-          $ref: "#/components/responses/ProblemResponse"
-        "503":
-          description: Persistent storage is unavailable for the selected profile.
+        "410":
+          description: Version 1 operation reads are obsolete on a version 2 node.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/BootstrapUnauthorized"
   /api/v1/entities/{entityId}:
     get:
       tags:
         - Operations
-      summary: Resolve the current causal heads of an entity
+      summary: Obsolete unsigned entity-head read
+      description: Version 2 nodes reject this route; use the space-scoped v2 route.
+      deprecated: true
       operationId: getEntity
       parameters:
         - $ref: "#/components/parameters/EntityId"
       responses:
-        "200":
-          description: >-
-            The entity's current stored heads. Concurrent heads are retained
-            rather than resolved by arrival order.
+        "410":
+          description: Version 1 entity reads are obsolete on a version 2 node.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/EntityState"
+                $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
-        "404":
-          description: No operation for the canonical entity UUID is stored.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "422":
-          $ref: "#/components/responses/ProblemResponse"
-        "503":
-          description: Persistent storage is unavailable for the selected profile.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
   /api/v1/uploads:
     options:
       tags:
@@ -1258,10 +1223,19 @@ components:
       type: string
       enum: [node, saros]
     NodeInfo:
+      oneOf:
+        - $ref: "#/components/schemas/FullNodeInfo"
+        - $ref: "#/components/schemas/SarosNodeInfo"
+      description: >-
+        Public node metadata. Full nodes disclose only self-certifying public
+        IDs and trusted-space descriptors; no private key material is exposed.
+    FullNodeInfo:
       type: object
       additionalProperties: false
       required:
         - installationId
+        - nodeId
+        - spaces
         - profile
         - displayName
         - version
@@ -1273,11 +1247,17 @@ components:
           type: string
           minLength: 1
           maxLength: 128
-          description: >-
-            Persistent installation ID for the `node` profile, or the fixed
-            `saros-engine` profile marker for the stateless `saros` profile.
+          description: Persistent installation lifecycle ID.
+        nodeId:
+          $ref: "#/components/schemas/PublicNodeId"
+        spaces:
+          type: array
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/PublicSpaceDescriptor"
         profile:
-          $ref: "#/components/schemas/NodeProfile"
+          type: string
+          const: node
         displayName:
           type: string
           minLength: 1
@@ -1300,6 +1280,85 @@ components:
             type: string
             minLength: 1
             maxLength: 64
+    SarosNodeInfo:
+      type: object
+      additionalProperties: false
+      required:
+        - installationId
+        - profile
+        - displayName
+        - version
+        - startedAt
+        - uptimeSeconds
+        - capabilities
+      properties:
+        installationId:
+          type: string
+          const: saros-engine
+        profile:
+          type: string
+          const: saros
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 128
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        startedAt:
+          type: string
+          format: date-time
+        uptimeSeconds:
+          type: integer
+          minimum: 0
+        capabilities:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+    PublicNodeId:
+      type: string
+      pattern: '^node:ed25519:[0-9a-f]{64}$'
+      description: Self-certifying Ed25519 node identity; this is not a secret key.
+    PublicSpaceDescriptor:
+      type: object
+      additionalProperties: false
+      required:
+        - spaceId
+        - displayName
+        - genesisOperationId
+        - initialGrantOperationId
+        - controllerActorId
+        - localWriterActorId
+        - createdAtUnixMs
+      properties:
+        spaceId:
+          type: string
+          pattern: '^space:(?!0{64}$)[0-9a-f]{64}$'
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 128
+        genesisOperationId:
+          type: string
+          pattern: '^sha-256:[0-9a-f]{64}$'
+        initialGrantOperationId:
+          type: string
+          pattern: '^sha-256:[0-9a-f]{64}$'
+        controllerActorId:
+          type: string
+          pattern: '^actor:ed25519:[0-9a-f]{64}$'
+        localWriterActorId:
+          type: string
+          pattern: '^actor:ed25519:[0-9a-f]{64}$'
+        createdAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
     OperationSubmission:
       type: object
       additionalProperties: false

@@ -50,6 +50,11 @@ export async function importExeligmos(options: ImportOptions): Promise<ImportSum
   );
   const summary = emptySummary();
 
+  if (!options.dryRun) {
+    log("Checking destination compatibility with legacy operation protocol v1...");
+    await destination.assertLegacyV1Compatible();
+  }
+
   log("Reading the Exeligmos tag catalog...");
   const tags = await readTags(source);
   summary.tags = tags.size;

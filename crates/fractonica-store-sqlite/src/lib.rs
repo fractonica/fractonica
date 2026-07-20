@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 //! SQLite persistence for embedded and headless Fractonica nodes.
 
+mod pairing_repository;
+mod signed_repository;
+
+pub use pairing_repository::{PairingLifecycle, PairingSession, PairingStoreError};
+
 use std::{
     fs::{self, OpenOptions},
     io,
@@ -10,20 +15,16 @@ use std::{
 };
 
 use fractonica_application::{
-    ContentRepository, ContentRepositoryError, EntityState, MAX_AVAILABILITY_CONTENT_IDS,
-    MAX_CHANGE_LIMIT, MAX_ENTITY_HEADS, MAX_IDEMPOTENCY_KEY_LENGTH, MIN_IDEMPOTENCY_KEY_LENGTH,
-    NewUpload, OperationChangePage, OperationRepository, RepositoryError, RepositoryReadiness,
-    StoredOperation, SubmitOperationRequest, SubmitOperationResult, UploadId, UploadSession,
-    UploadState,
+    ContentRepository, ContentRepositoryError, MAX_AVAILABILITY_CONTENT_IDS, NewUpload,
+    RepositoryError, UploadId, UploadSession, UploadState,
 };
 use fractonica_content::{ContentDescriptor, ContentId};
 use fractonica_core::{InstallationId, InstallationMetadata};
-use fractonica_data_model::{EntityId, EntitySchema, OperationBody, OperationEnvelope};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 6;
 
 struct Migration {
     version: u32,
@@ -42,6 +43,18 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: include_str!("../migrations/0003_content_store.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/0004_signed_spaces.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("../migrations/0005_pairing_lifecycle.sql"),
+    },
+    Migration {
+        version: 6,
+        sql: include_str!("../migrations/0006_peer_request_replay.sql"),
     },
 ];
 
@@ -66,6 +79,9 @@ pub enum StoreError {
 
     #[error("SQLite migration declared schema {expected}, but database reports {found}")]
     MigrationVersionMismatch { expected: u32, found: u32 },
+
+    #[error("the local unsigned operation store requires explicit version 2 migration")]
+    LegacyMigrationRequired,
 
     #[error("stored installation ID is invalid: {0}")]
     InvalidInstallationId(#[from] uuid::Error),
@@ -156,313 +172,6 @@ impl SqliteStore {
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
         operation(&connection)
-    }
-}
-
-impl OperationRepository for SqliteStore {
-    fn readiness(&self) -> Result<RepositoryReadiness, RepositoryError> {
-        SqliteStore::readiness(self)
-            .map(|ready| RepositoryReadiness {
-                schema_version: ready.schema_version,
-            })
-            .map_err(repository_unavailable)
-    }
-
-    fn installation(&self) -> Result<InstallationMetadata, RepositoryError> {
-        SqliteStore::installation(self).map_err(repository_unavailable)
-    }
-
-    fn submit_operation(
-        &self,
-        request: &SubmitOperationRequest,
-    ) -> Result<SubmitOperationResult, RepositoryError> {
-        request
-            .operation
-            .validate()
-            .map_err(|error| RepositoryError::InvalidTopology(error.to_string()))?;
-        validate_idempotency_key(&request.idempotency.key)?;
-
-        let encoded = serde_json::to_vec(&request.operation)
-            .map_err(|error| RepositoryError::InvalidTopology(error.to_string()))?;
-        let actor_id = request.operation.actor_id.to_string();
-        let operation_id = request.operation.operation_id.to_string();
-        let entity_id = request.operation.entity_id.to_string();
-        let schema_id = schema_key(request.operation.schema);
-        let now = unix_time_millis().map_err(repository_unavailable)?;
-
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| RepositoryError::Unavailable("node database lock was poisoned".into()))?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(repository_sqlite)?;
-
-        if let Some((stored_hash, stored_operation_id)) = transaction
-            .query_row(
-                "SELECT semantic_request_hash, operation_id
-                 FROM idempotency_receipts
-                 WHERE actor_id = ?1 AND idempotency_key = ?2",
-                params![actor_id, request.idempotency.key],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(repository_sqlite)?
-        {
-            if stored_hash.as_slice() != request.idempotency.semantic_request_hash {
-                return Err(RepositoryError::IdempotencyConflict);
-            }
-            let stored = load_operation(&transaction, &stored_operation_id)?.ok_or_else(|| {
-                RepositoryError::Corrupt(format!(
-                    "idempotency receipt references missing operation {stored_operation_id}"
-                ))
-            })?;
-            transaction.commit().map_err(repository_sqlite)?;
-            return Ok(SubmitOperationResult {
-                operation: stored,
-                replayed: true,
-            });
-        }
-
-        if let Some((stored, stored_payload)) =
-            load_operation_and_payload(&transaction, &operation_id)?
-        {
-            if stored_payload != encoded {
-                return Err(RepositoryError::OperationConflict(
-                    request.operation.operation_id,
-                ));
-            }
-            insert_idempotency_receipt(&transaction, request, now)?;
-            transaction.commit().map_err(repository_sqlite)?;
-            return Ok(SubmitOperationResult {
-                operation: stored,
-                replayed: true,
-            });
-        }
-
-        validate_topology(&transaction, &request.operation, &entity_id, schema_id)?;
-        validate_resulting_head_count(&transaction, &request.operation, &entity_id)?;
-
-        transaction
-            .execute(
-                "INSERT INTO operations (
-                    operation_id, protocol_version, entity_id, schema_id, actor_id,
-                    kind, occurred_at_unix_ms, received_at_unix_ms, payload
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    operation_id,
-                    request.operation.protocol_version,
-                    entity_id,
-                    schema_id,
-                    actor_id,
-                    operation_kind(&request.operation.body),
-                    request.operation.occurred_at_unix_ms,
-                    now,
-                    encoded,
-                ],
-            )
-            .map_err(repository_sqlite)?;
-        let local_sequence = u64::try_from(transaction.last_insert_rowid()).map_err(|_| {
-            RepositoryError::Corrupt("SQLite allocated a negative operation sequence".into())
-        })?;
-
-        if let OperationBody::Put { document } = &request.operation.body {
-            for (position, resource) in document.resources.iter().enumerate() {
-                transaction
-                    .execute(
-                        "INSERT INTO operation_resources (
-                            operation_id, position, content_id, byte_length,
-                            media_type, role, original_name
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            operation_id,
-                            i64::try_from(position).map_err(|_| {
-                                RepositoryError::InvalidTopology(
-                                    "resource position exceeds SQLite integer range".into(),
-                                )
-                            })?,
-                            resource.content_id.to_string(),
-                            i64::try_from(resource.byte_length).map_err(|_| {
-                                RepositoryError::InvalidTopology(
-                                    "resource length exceeds SQLite integer range".into(),
-                                )
-                            })?,
-                            resource.media_type,
-                            resource.role,
-                            resource.original_name,
-                        ],
-                    )
-                    .map_err(repository_sqlite)?;
-            }
-        }
-
-        for (position, parent) in request.operation.causal_parents.iter().enumerate() {
-            transaction
-                .execute(
-                    "INSERT INTO operation_parents (
-                        entity_id, schema_id, operation_id,
-                        parent_operation_id, position
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        entity_id,
-                        schema_id,
-                        operation_id,
-                        parent.to_string(),
-                        i64::try_from(position).map_err(|_| {
-                            RepositoryError::InvalidTopology(
-                                "causal parent position exceeds SQLite integer range".into(),
-                            )
-                        })?,
-                    ],
-                )
-                .map_err(repository_sqlite)?;
-            transaction
-                .execute(
-                    "DELETE FROM entity_heads
-                     WHERE entity_id = ?1 AND operation_id = ?2",
-                    params![entity_id, parent.to_string()],
-                )
-                .map_err(repository_sqlite)?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO entity_heads (entity_id, operation_id) VALUES (?1, ?2)",
-                params![entity_id, operation_id],
-            )
-            .map_err(repository_sqlite)?;
-        insert_idempotency_receipt(&transaction, request, now)?;
-        transaction.commit().map_err(repository_sqlite)?;
-
-        Ok(SubmitOperationResult {
-            operation: StoredOperation {
-                local_sequence,
-                operation: request.operation.clone(),
-            },
-            replayed: false,
-        })
-    }
-
-    fn entity_state(&self, entity_id: EntityId) -> Result<Option<EntityState>, RepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| RepositoryError::Unavailable("node database lock was poisoned".into()))?;
-        let entity_id_text = entity_id.to_string();
-        let mut summary = connection
-            .prepare(
-                "SELECT schema_id, count(*)
-                 FROM operations
-                 WHERE entity_id = ?1
-                 GROUP BY schema_id
-                 ORDER BY schema_id",
-            )
-            .map_err(repository_sqlite)?;
-        let mut summaries = summary
-            .query(params![entity_id_text])
-            .map_err(repository_sqlite)?;
-        let Some(first) = summaries.next().map_err(repository_sqlite)? else {
-            return Ok(None);
-        };
-        let schema_id: String = first.get(0).map_err(repository_sqlite)?;
-        let operation_count = positive_u64(first.get::<_, i64>(1).map_err(repository_sqlite)?)?;
-        if summaries.next().map_err(repository_sqlite)?.is_some() {
-            return Err(RepositoryError::Corrupt(format!(
-                "entity {entity_id} has operations from more than one schema"
-            )));
-        }
-        drop(summaries);
-        drop(summary);
-
-        let schema = parse_schema_key(&schema_id)?;
-        let mut statement = connection
-            .prepare(&format!(
-                "SELECT {OPERATION_COLUMNS}
-                 FROM operations
-                 JOIN entity_heads USING (operation_id)
-                 WHERE entity_heads.entity_id = ?1
-                 ORDER BY operations.operation_id"
-            ))
-            .map_err(repository_sqlite)?;
-        let mut rows = statement
-            .query(params![entity_id_text])
-            .map_err(repository_sqlite)?;
-        let mut heads = Vec::new();
-        while let Some(row) = rows.next().map_err(repository_sqlite)? {
-            let stored = decode_operation_row(row)?;
-            if stored.operation.entity_id != entity_id || stored.operation.schema != schema {
-                return Err(RepositoryError::Corrupt(format!(
-                    "entity head {} does not match its projection",
-                    stored.operation.operation_id
-                )));
-            }
-            heads.push(stored);
-        }
-        if heads.is_empty() {
-            return Err(RepositoryError::Corrupt(format!(
-                "entity {entity_id} has history but no current head"
-            )));
-        }
-
-        Ok(Some(EntityState {
-            entity_id,
-            schema,
-            operation_count,
-            heads,
-        }))
-    }
-
-    fn changes_after(
-        &self,
-        after_local_sequence: u64,
-        limit: usize,
-    ) -> Result<OperationChangePage, RepositoryError> {
-        if !(1..=MAX_CHANGE_LIMIT).contains(&limit) {
-            return Err(RepositoryError::InvalidTopology(format!(
-                "change limit must be between 1 and {MAX_CHANGE_LIMIT}"
-            )));
-        }
-        let Ok(after) = i64::try_from(after_local_sequence) else {
-            return Ok(OperationChangePage {
-                operations: Vec::new(),
-                next_after: after_local_sequence,
-                has_more: false,
-            });
-        };
-        let fetch_limit = i64::try_from(limit + 1)
-            .map_err(|_| RepositoryError::InvalidTopology("change limit overflow".into()))?;
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| RepositoryError::Unavailable("node database lock was poisoned".into()))?;
-        let mut statement = connection
-            .prepare(&format!(
-                "SELECT {OPERATION_COLUMNS}
-                 FROM operations
-                 WHERE local_sequence > ?1
-                 ORDER BY local_sequence
-                 LIMIT ?2"
-            ))
-            .map_err(repository_sqlite)?;
-        let mut rows = statement
-            .query(params![after, fetch_limit])
-            .map_err(repository_sqlite)?;
-        let mut operations = Vec::with_capacity(limit + 1);
-        while let Some(row) = rows.next().map_err(repository_sqlite)? {
-            operations.push(decode_operation_row(row)?);
-        }
-        let has_more = operations.len() > limit;
-        if has_more {
-            operations.pop();
-        }
-        let next_after = operations
-            .last()
-            .map_or(after_local_sequence, |stored| stored.local_sequence);
-
-        Ok(OperationChangePage {
-            operations,
-            next_after,
-            has_more,
-        })
     }
 }
 
@@ -771,262 +480,6 @@ impl ContentRepository for SqliteStore {
     }
 }
 
-const OPERATION_COLUMNS: &str = "operations.local_sequence, operations.operation_id, \
-    operations.protocol_version, operations.entity_id, operations.schema_id, \
-    operations.actor_id, operations.kind, operations.occurred_at_unix_ms, \
-    operations.received_at_unix_ms, operations.payload";
-
-fn validate_topology(
-    connection: &Connection,
-    operation: &OperationEnvelope,
-    entity_id: &str,
-    schema_id: &str,
-) -> Result<(), RepositoryError> {
-    let existing_schema = connection
-        .query_row(
-            "SELECT schema_id FROM operations WHERE entity_id = ?1 LIMIT 1",
-            params![entity_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(repository_sqlite)?;
-
-    if operation.causal_parents.is_empty() {
-        if existing_schema.is_some() {
-            return Err(RepositoryError::EntityAlreadyExists(operation.entity_id));
-        }
-        if matches!(operation.body, OperationBody::Tombstone) {
-            return Err(RepositoryError::InvalidTopology(
-                "an entity cannot begin with a tombstone".into(),
-            ));
-        }
-        return Ok(());
-    }
-    for parent in &operation.causal_parents {
-        let parent_state = connection
-            .query_row(
-                "SELECT entity_id, schema_id
-                 FROM operations
-                 WHERE operation_id = ?1",
-                params![parent.to_string()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(repository_sqlite)?;
-        let Some((parent_entity, parent_schema)) = parent_state else {
-            return Err(RepositoryError::MissingParent(*parent));
-        };
-        if parent_entity != entity_id || parent_schema != schema_id {
-            return Err(RepositoryError::ParentMismatch { parent: *parent });
-        }
-    }
-    if existing_schema.as_deref() != Some(schema_id) {
-        return Err(RepositoryError::Corrupt(format!(
-            "validated parents exist for entity {}, but its schema projection is missing",
-            operation.entity_id
-        )));
-    }
-    Ok(())
-}
-
-fn validate_resulting_head_count(
-    connection: &Connection,
-    operation: &OperationEnvelope,
-    entity_id: &str,
-) -> Result<(), RepositoryError> {
-    let stored_head_count: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM entity_heads WHERE entity_id = ?1",
-            params![entity_id],
-            |row| row.get(0),
-        )
-        .map_err(repository_sqlite)?;
-    let mut surviving_heads = usize::try_from(stored_head_count).map_err(|_| {
-        RepositoryError::Corrupt(format!("invalid entity head count {stored_head_count}"))
-    })?;
-    for parent in &operation.causal_parents {
-        let is_current: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM entity_heads
-                    WHERE entity_id = ?1 AND operation_id = ?2
-                 )",
-                params![entity_id, parent.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(repository_sqlite)?;
-        if is_current {
-            surviving_heads = surviving_heads
-                .checked_sub(1)
-                .ok_or_else(|| RepositoryError::Corrupt("entity head count underflow".into()))?;
-        }
-    }
-    let resulting_heads = surviving_heads
-        .checked_add(1)
-        .ok_or_else(|| RepositoryError::InvalidTopology("entity head count overflow".into()))?;
-    if resulting_heads > MAX_ENTITY_HEADS {
-        return Err(RepositoryError::InvalidTopology(format!(
-            "operation would create {resulting_heads} concurrent entity heads; maximum is {MAX_ENTITY_HEADS}"
-        )));
-    }
-    Ok(())
-}
-
-fn insert_idempotency_receipt(
-    connection: &Connection,
-    request: &SubmitOperationRequest,
-    created_at_unix_ms: i64,
-) -> Result<(), RepositoryError> {
-    connection
-        .execute(
-            "INSERT INTO idempotency_receipts (
-                actor_id, idempotency_key, semantic_request_hash,
-                operation_id, created_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                request.operation.actor_id.to_string(),
-                request.idempotency.key,
-                request.idempotency.semantic_request_hash.as_slice(),
-                request.operation.operation_id.to_string(),
-                created_at_unix_ms,
-            ],
-        )
-        .map_err(repository_sqlite)?;
-    Ok(())
-}
-
-fn load_operation(
-    connection: &Connection,
-    operation_id: &str,
-) -> Result<Option<StoredOperation>, RepositoryError> {
-    connection
-        .query_row(
-            &format!("SELECT {OPERATION_COLUMNS} FROM operations WHERE operation_id = ?1"),
-            params![operation_id],
-            decode_operation_row_sqlite,
-        )
-        .optional()
-        .map_err(repository_sqlite)?
-        .map(decode_checked_row)
-        .transpose()
-}
-
-fn load_operation_and_payload(
-    connection: &Connection,
-    operation_id: &str,
-) -> Result<Option<(StoredOperation, Vec<u8>)>, RepositoryError> {
-    connection
-        .query_row(
-            &format!("SELECT {OPERATION_COLUMNS} FROM operations WHERE operation_id = ?1"),
-            params![operation_id],
-            decode_operation_row_sqlite,
-        )
-        .optional()
-        .map_err(repository_sqlite)?
-        .map(|row| {
-            let payload = row.payload.clone();
-            decode_checked_row(row).map(|stored| (stored, payload))
-        })
-        .transpose()
-}
-
-#[derive(Debug)]
-struct StoredOperationRow {
-    local_sequence: i64,
-    operation_id: String,
-    protocol_version: i64,
-    entity_id: String,
-    schema_id: String,
-    actor_id: String,
-    kind: String,
-    occurred_at_unix_ms: i64,
-    received_at_unix_ms: i64,
-    payload: Vec<u8>,
-}
-
-fn decode_operation_row_sqlite(row: &Row<'_>) -> rusqlite::Result<StoredOperationRow> {
-    Ok(StoredOperationRow {
-        local_sequence: row.get(0)?,
-        operation_id: row.get(1)?,
-        protocol_version: row.get(2)?,
-        entity_id: row.get(3)?,
-        schema_id: row.get(4)?,
-        actor_id: row.get(5)?,
-        kind: row.get(6)?,
-        occurred_at_unix_ms: row.get(7)?,
-        received_at_unix_ms: row.get(8)?,
-        payload: row.get(9)?,
-    })
-}
-
-fn decode_operation_row(row: &Row<'_>) -> Result<StoredOperation, RepositoryError> {
-    decode_operation_row_sqlite(row)
-        .map_err(repository_sqlite)
-        .and_then(decode_checked_row)
-}
-
-fn decode_checked_row(row: StoredOperationRow) -> Result<StoredOperation, RepositoryError> {
-    let operation: OperationEnvelope = serde_json::from_slice(&row.payload)
-        .map_err(|error| RepositoryError::Corrupt(error.to_string()))?;
-    operation
-        .validate()
-        .map_err(|error| RepositoryError::Corrupt(error.to_string()))?;
-    if row.received_at_unix_ms < 0
-        || i64::from(operation.protocol_version) != row.protocol_version
-        || operation.operation_id.to_string() != row.operation_id
-        || operation.entity_id.to_string() != row.entity_id
-        || schema_key(operation.schema) != row.schema_id
-        || operation.actor_id.to_string() != row.actor_id
-        || operation_kind(&operation.body) != row.kind
-        || operation.occurred_at_unix_ms != row.occurred_at_unix_ms
-    {
-        return Err(RepositoryError::Corrupt(format!(
-            "operation {} columns do not match its canonical payload",
-            row.operation_id
-        )));
-    }
-    Ok(StoredOperation {
-        local_sequence: positive_u64(row.local_sequence)?,
-        operation,
-    })
-}
-
-fn schema_key(schema: EntitySchema) -> &'static str {
-    match schema {
-        EntitySchema::RecordV1 => "record.v1",
-    }
-}
-
-fn parse_schema_key(value: &str) -> Result<EntitySchema, RepositoryError> {
-    match value {
-        "record.v1" => Ok(EntitySchema::RecordV1),
-        _ => Err(RepositoryError::Corrupt(format!(
-            "unsupported stored entity schema {value}"
-        ))),
-    }
-}
-
-fn operation_kind(body: &OperationBody) -> &'static str {
-    match body {
-        OperationBody::Put { .. } => "put",
-        OperationBody::Tombstone => "tombstone",
-    }
-}
-
-fn validate_idempotency_key(value: &str) -> Result<(), RepositoryError> {
-    if !(MIN_IDEMPOTENCY_KEY_LENGTH..=MAX_IDEMPOTENCY_KEY_LENGTH).contains(&value.len())
-        || !value.is_ascii()
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        return Err(RepositoryError::InvalidTopology(format!(
-            "idempotency key must be {MIN_IDEMPOTENCY_KEY_LENGTH}-{MAX_IDEMPOTENCY_KEY_LENGTH} visible non-whitespace ASCII characters"
-        )));
-    }
-    Ok(())
-}
-
 const UPLOAD_COLUMNS: &str = "upload_id, upload_length, upload_offset, state, \
     expected_content_id, final_content_id, upload_metadata, media_type, original_name, \
     created_at_unix_ms, expires_at_unix_ms";
@@ -1168,17 +621,11 @@ fn positive_u64(value: i64) -> Result<u64, RepositoryError> {
         .ok_or_else(|| RepositoryError::Corrupt(format!("invalid local sequence {value}")))
 }
 
-fn unix_time_millis() -> Result<i64, StoreError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| StoreError::ClockBeforeUnixEpoch)?
-        .as_millis()
-        .try_into()
-        .map_err(|_| StoreError::ClockBeforeUnixEpoch)
-}
-
-fn repository_unavailable(error: impl std::fmt::Display) -> RepositoryError {
-    RepositoryError::Unavailable(error.to_string())
+fn repository_unavailable(error: StoreError) -> RepositoryError {
+    match error {
+        StoreError::LegacyMigrationRequired => RepositoryError::LegacyMigrationRequired,
+        other => RepositoryError::Unavailable(other.to_string()),
+    }
 }
 
 fn repository_sqlite(error: rusqlite::Error) -> RepositoryError {
@@ -1203,15 +650,17 @@ fn prepare_private_directory(path: &Path) -> io::Result<()> {
                 format!("{} is not a private data directory", path.display()),
             ));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Ok(metadata) => validate_private_directory(path, &metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+            validate_private_directory(path, &fs::symlink_metadata(path)?)?;
+        }
         Err(error) => return Err(error),
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -1224,7 +673,7 @@ fn prepare_private_file(path: &Path) -> io::Result<()> {
                 format!("{} is not a regular database file", path.display()),
             ));
         }
-        Ok(_) => {}
+        Ok(metadata) => validate_private_file(path, &metadata)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut options = OpenOptions::new();
             options.create_new(true).read(true).write(true);
@@ -1233,17 +682,70 @@ fn prepare_private_file(path: &Path) -> io::Result<()> {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            options.open(path)?;
+            options.open(path)?.sync_all()?;
+            validate_private_file(path, &fs::symlink_metadata(path)?)?;
         }
         Err(error) => return Err(error),
     }
+    Ok(())
+}
 
+fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::MetadataExt;
+        validate_owner(path, metadata)?;
+        let mode = metadata.mode() & 0o7777;
+        if mode != 0o700 {
+            return Err(private_state_error(
+                path,
+                format!("mode is {mode:#o}, expected 0o700"),
+            ));
+        }
     }
     Ok(())
+}
+
+fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        validate_owner(path, metadata)?;
+        let mode = metadata.mode() & 0o7777;
+        if mode != 0o600 {
+            return Err(private_state_error(
+                path,
+                format!("mode is {mode:#o}, expected 0o600"),
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(private_state_error(
+                path,
+                format!("has {} hard links, expected exactly one", metadata.nlink()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_owner(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let expected = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected {
+        return Err(private_state_error(
+            path,
+            format!("owner is uid {}, expected uid {expected}", metadata.uid()),
+        ));
+    }
+    Ok(())
+}
+
+fn private_state_error(path: &Path, detail: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{} is not private node state: {detail}", path.display()),
+    )
 }
 
 fn schema_version(connection: &Connection) -> Result<u32, StoreError> {
@@ -1259,6 +761,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             found: current,
             supported: SCHEMA_VERSION,
         });
+    }
+    if (2..4).contains(&current) {
+        let legacy_operation_count: i64 =
+            connection.query_row("SELECT count(*) FROM operations", [], |row| row.get(0))?;
+        if legacy_operation_count != 0 {
+            return Err(StoreError::LegacyMigrationRequired);
+        }
     }
 
     for migration in MIGRATIONS {
@@ -1314,651 +823,47 @@ fn ensure_installation(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
+#[cfg(all(test, unix))]
+mod private_state_tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
 
-    use fractonica_application::{IdempotencyContext, SubmitOperationRequest};
-    use fractonica_content::{ResourceRef, hash_bytes};
-    use fractonica_data_model::{
-        ActorId, EntityId, EntitySchema, OperationBody, OperationEnvelope, OperationId,
-        PROTOCOL_VERSION, RecordDocument, RecordVisibility,
-    };
+    use tempfile::tempdir;
 
     use super::*;
 
     #[test]
-    fn creates_a_ready_database() {
-        let store = SqliteStore::open_in_memory().expect("open database");
+    fn existing_database_permissions_are_rejected_not_repaired() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("node");
+        fs::create_dir(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        let database = data.join("fractonica.db");
+        drop(SqliteStore::open(&database).unwrap());
 
-        assert_eq!(
-            store.readiness().expect("database ready"),
-            StoreReadiness {
-                schema_version: SCHEMA_VERSION,
-            }
-        );
-        assert!(store.installation().is_ok());
-    }
-
-    #[test]
-    fn installation_identity_survives_reopen() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("fractonica.db");
-
-        let first_id = {
-            let store = SqliteStore::open(&path).expect("first open");
-            store.installation().expect("installation").installation_id
-        };
-
-        let reopened = SqliteStore::open(&path).expect("second open");
-        let second_id = reopened
-            .installation()
-            .expect("installation")
-            .installation_id;
-
-        assert_eq!(first_id, second_id);
-    }
-
-    #[test]
-    fn migrates_a_v1_database_without_replacing_its_installation() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("fractonica.db");
-        let installation_id = Uuid::now_v7();
-        {
-            let connection = Connection::open(&path).expect("legacy database");
-            connection
-                .execute_batch(MIGRATIONS[0].sql)
-                .expect("schema v1");
-            connection
-                .execute(
-                    "INSERT INTO node_installation (
-                        singleton, installation_id, created_at_unix_ms
-                     ) VALUES (1, ?1, 1234)",
-                    params![installation_id.to_string()],
-                )
-                .expect("legacy installation");
-        }
-
-        let store = SqliteStore::open(&path).expect("migrated store");
-        assert_eq!(
-            store
-                .installation()
-                .expect("installation after migration")
-                .installation_id
-                .as_uuid(),
-            installation_id
-        );
-        assert_eq!(
-            store.readiness().expect("ready").schema_version,
-            SCHEMA_VERSION
-        );
-        store
-            .with_connection(|connection| {
-                let strict: i64 = connection.query_row(
-                    "SELECT strict FROM pragma_table_list WHERE name = 'operations'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                assert_eq!(strict, 1);
-                Ok(())
-            })
-            .expect("operation table metadata");
-    }
-
-    #[test]
-    fn migrates_a_v2_database_to_the_content_schema() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("fractonica.db");
-        {
-            let connection = Connection::open(&path).expect("legacy database");
-            connection
-                .execute_batch(MIGRATIONS[0].sql)
-                .expect("schema v1");
-            connection
-                .execute_batch(MIGRATIONS[1].sql)
-                .expect("schema v2");
-            assert_eq!(schema_version(&connection).expect("version"), 2);
-        }
-
-        let store = SqliteStore::open(&path).expect("migrated store");
-        assert_eq!(store.readiness().expect("ready").schema_version, 3);
-        store
-            .with_connection(|connection| {
-                for table in ["blobs", "upload_sessions", "operation_resources"] {
-                    let strict: i64 = connection.query_row(
-                        "SELECT strict FROM pragma_table_list WHERE name = ?1",
-                        params![table],
-                        |row| row.get(0),
-                    )?;
-                    assert_eq!(strict, 1, "{table} must remain a STRICT table");
-                }
-                Ok(())
-            })
-            .expect("content table metadata");
-    }
-
-    #[test]
-    fn accepts_resource_references_before_the_bytes_are_available() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let entity = EntityId::new(Uuid::now_v7());
-        let actor = ActorId::new(Uuid::now_v7());
-        let content_id = hash_bytes(b"bytes may arrive later");
-        let resource = ResourceRef {
-            content_id,
-            byte_length: 21,
-            media_type: "text/plain".to_owned(),
-            role: "attachment".to_owned(),
-            original_name: Some("note.txt".to_owned()),
-        };
-        let mut operation = put(entity, actor, Vec::new(), "record", 10);
-        let OperationBody::Put { document } = &mut operation.body else {
-            panic!("put helper must create a put operation");
-        };
-        document.resources.push(resource.clone());
-
-        submit(&store, operation.clone(), "missing-content1", 1);
-        assert_eq!(store.content(content_id).expect("lookup"), None);
-        store
-            .with_connection(|connection| {
-                let stored: (String, i64, String, String, Option<String>) = connection.query_row(
-                    "SELECT content_id, byte_length, media_type, role, original_name
-                     FROM operation_resources
-                     WHERE operation_id = ?1 AND position = 0",
-                    params![operation.operation_id.to_string()],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )?;
-                assert_eq!(stored.0, resource.content_id.to_string());
-                assert_eq!(stored.1, 21);
-                assert_eq!(stored.2, resource.media_type);
-                assert_eq!(stored.3, resource.role);
-                assert_eq!(stored.4, resource.original_name);
-                Ok(())
-            })
-            .expect("resource projection");
-    }
-
-    #[test]
-    fn persists_the_resumable_upload_lifecycle_and_content_availability() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let upload_id = UploadId::new(Uuid::now_v7());
-        let content_id = hash_bytes(b"hello");
-        let created = store
-            .create_upload(&NewUpload {
-                upload_id,
-                upload_length: 5,
-                expected_content_id: Some(content_id),
-                upload_metadata: Some("filename aGVsbG8udHh0".to_owned()),
-                media_type: Some("text/plain".to_owned()),
-                original_name: Some("hello.txt".to_owned()),
-                created_at_unix_ms: 100,
-                expires_at_unix_ms: 1_000,
-            })
-            .expect("create upload");
-        assert_eq!(created.upload_offset, 0);
-        assert_eq!(created.state, UploadState::Active);
-        assert_eq!(
-            created.upload_metadata.as_deref(),
-            Some("filename aGVsbG8udHh0")
-        );
-
-        let advanced = store
-            .advance_upload(upload_id, 0, 5, 2_000)
-            .expect("advance upload");
-        assert_eq!(advanced.upload_offset, 5);
-        assert_eq!(advanced.expires_at_unix_ms, 2_000);
-        let finalizing = store
-            .begin_upload_finalize(upload_id, content_id)
-            .expect("begin finalization");
-        assert_eq!(finalizing.state, UploadState::Finalizing);
-        assert_eq!(finalizing.final_content_id, Some(content_id));
-
-        let descriptor = store.complete_upload(upload_id, 300).expect("complete");
-        assert_eq!(descriptor.content_id, content_id);
-        assert_eq!(descriptor.byte_length, 5);
-        assert_eq!(
-            store.content(content_id).expect("content"),
-            Some(descriptor)
-        );
-        assert_eq!(
-            store
-                .available_content(&[hash_bytes(b"missing"), content_id, content_id])
-                .expect("availability"),
-            vec![descriptor]
-        );
-        assert_eq!(
-            store
-                .upload(upload_id)
-                .expect("session")
-                .expect("present")
-                .state,
-            UploadState::Complete
-        );
-    }
-
-    #[test]
-    fn upload_expiration_includes_the_exact_deadline() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let upload_id = UploadId::new(Uuid::now_v7());
-        store
-            .create_upload(&NewUpload {
-                upload_id,
-                upload_length: 1,
-                expected_content_id: None,
-                upload_metadata: Some("agent ZmFrZQ==".to_owned()),
-                media_type: None,
-                original_name: None,
-                created_at_unix_ms: 100,
-                expires_at_unix_ms: 1_000,
-            })
-            .expect("create upload");
-
-        assert_eq!(
-            store.expired_uploads(1_000, 10).expect("expired"),
-            vec![store.upload(upload_id).expect("lookup").expect("session")]
-        );
-    }
-
-    #[test]
-    fn submits_replays_and_linearly_edits_an_entity() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let entity = EntityId::new(Uuid::now_v7());
-        let actor = ActorId::new(Uuid::now_v7());
-        let root = put(entity, actor, Vec::new(), "root", 10);
-        let root_request = request(root.clone(), "create-record-001", 1);
-
-        let created = store.submit_operation(&root_request).expect("create");
-        assert!(!created.replayed);
-        assert_eq!(created.operation.local_sequence, 1);
-        let replayed = store.submit_operation(&root_request).expect("replay");
-        assert!(replayed.replayed);
-        assert_eq!(replayed.operation, created.operation);
-
-        let hash_conflict = SubmitOperationRequest {
-            operation: root.clone(),
-            idempotency: IdempotencyContext {
-                key: root_request.idempotency.key.clone(),
-                semantic_request_hash: [2; 32],
-            },
-        };
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
-            store.submit_operation(&hash_conflict),
-            Err(RepositoryError::IdempotencyConflict)
+            SqliteStore::open(&database),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
-
-        let edit = put(entity, actor, vec![root.operation_id], "edited", 20);
-        let edited = store
-            .submit_operation(&request(edit.clone(), "edit-record-0001", 3))
-            .expect("edit");
-        assert_eq!(edited.operation.local_sequence, 2);
-
-        let duplicate = store
-            .submit_operation(&request(edit.clone(), "edit-record-retry", 3))
-            .expect("operation replay under a new receipt");
-        assert!(duplicate.replayed);
-        assert_eq!(duplicate.operation, edited.operation);
-
-        let mut conflicting_edit = edit.clone();
-        conflicting_edit.occurred_at_unix_ms += 1;
-        assert!(matches!(
-            store.submit_operation(&request(
-                conflicting_edit,
-                "edit-record-conflict",
-                4,
-            )),
-            Err(RepositoryError::OperationConflict(id)) if id == edit.operation_id
-        ));
-
-        let state = store
-            .entity_state(entity)
-            .expect("state")
-            .expect("existing entity");
-        assert_eq!(state.operation_count, 2);
-        assert_eq!(state.heads, vec![edited.operation]);
-        assert!(!state.is_conflicted());
-    }
-
-    #[test]
-    fn stale_parents_branch_all_heads_merge_and_tombstones_retire_only_named_heads() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let entity = EntityId::new(Uuid::now_v7());
-        let actor = ActorId::new(Uuid::now_v7());
-        let root = put(entity, actor, Vec::new(), "root", 10);
-        submit(&store, root.clone(), "branch-root-001", 1);
-
-        let mut left = put(entity, actor, vec![root.operation_id], "left", 20);
-        left.operation_id =
-            OperationId::parse("00000000-0000-7000-8000-000000000002").expect("fixed operation ID");
-        submit(&store, left.clone(), "branch-left-001", 2);
-        let mut right = put(entity, actor, vec![root.operation_id], "right", 21);
-        right.operation_id =
-            OperationId::parse("00000000-0000-7000-8000-000000000001").expect("fixed operation ID");
-        submit(&store, right.clone(), "branch-right-001", 3);
-
-        let branched = store.entity_state(entity).expect("state").expect("entity");
-        assert!(branched.is_conflicted());
         assert_eq!(
-            head_ids(&branched),
-            vec![right.operation_id, left.operation_id]
-        );
-        assert_eq!(
-            branched
-                .heads
-                .iter()
-                .map(|stored| stored.local_sequence)
-                .collect::<Vec<_>>(),
-            vec![3, 2],
-            "head order is canonical operation ID order, not acceptance order"
-        );
-
-        let merge = put(
-            entity,
-            actor,
-            vec![left.operation_id, right.operation_id],
-            "merged",
-            30,
-        );
-        submit(&store, merge.clone(), "branch-merge-001", 4);
-        let merged = store.entity_state(entity).expect("state").expect("entity");
-        assert_eq!(head_ids(&merged), vec![merge.operation_id]);
-
-        let live = put(entity, actor, vec![merge.operation_id], "live", 40);
-        submit(&store, live.clone(), "branch-live-0001", 5);
-        let alternate = put(entity, actor, vec![merge.operation_id], "alternate", 41);
-        submit(&store, alternate.clone(), "branch-alternate", 6);
-        let tombstone = tombstone(entity, actor, vec![live.operation_id], 50);
-        submit(&store, tombstone.clone(), "branch-delete-01", 7);
-
-        let deleted_branch = store.entity_state(entity).expect("state").expect("entity");
-        let mut expected_heads = vec![alternate.operation_id, tombstone.operation_id];
-        expected_heads.sort_unstable();
-        assert_eq!(head_ids(&deleted_branch), expected_heads);
-        assert!(
-            deleted_branch
-                .heads
-                .iter()
-                .any(|head| matches!(head.operation.body, OperationBody::Tombstone))
+            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o644
         );
     }
 
     #[test]
-    fn rejects_missing_foreign_and_parentless_existing_operations() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let actor = ActorId::new(Uuid::now_v7());
-        let first_entity = EntityId::new(Uuid::now_v7());
-        let second_entity = EntityId::new(Uuid::now_v7());
-        let absent_entity = EntityId::new(Uuid::now_v7());
-        let first = put(first_entity, actor, Vec::new(), "first", 10);
-        let second = put(second_entity, actor, Vec::new(), "second", 11);
-        submit(&store, first.clone(), "parents-first-01", 1);
-        submit(&store, second.clone(), "parents-second-1", 2);
-
-        let missing = put(
-            absent_entity,
-            actor,
-            vec![OperationId::new(Uuid::now_v7())],
-            "missing",
-            20,
-        );
-        assert!(matches!(
-            store.submit_operation(&request(missing, "parents-missing1", 3)),
-            Err(RepositoryError::MissingParent(_))
-        ));
-
-        let foreign = put(
-            first_entity,
-            actor,
-            vec![second.operation_id],
-            "foreign",
-            21,
-        );
-        assert!(matches!(
-            store.submit_operation(&request(foreign, "parents-foreign1", 4)),
-            Err(RepositoryError::ParentMismatch { parent }) if parent == second.operation_id
-        ));
-
-        let parentless = put(first_entity, actor, Vec::new(), "again", 22);
-        assert!(matches!(
-            store.submit_operation(&request(parentless, "parents-empty-001", 5)),
-            Err(RepositoryError::EntityAlreadyExists(entity)) if entity == first_entity
-        ));
-    }
-
-    #[test]
-    fn paginates_the_monotonic_operation_feed_without_skips() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let entity = EntityId::new(Uuid::now_v7());
-        let actor = ActorId::new(Uuid::now_v7());
-        let mut parent = None;
-        let mut expected = Vec::new();
-        for index in 0_u8..5 {
-            let operation = put(
-                entity,
-                actor,
-                parent.into_iter().collect(),
-                &format!("operation-{index}"),
-                i64::from(index) + 1,
-            );
-            parent = Some(operation.operation_id);
-            expected.push(operation.operation_id);
-            submit(
-                &store,
-                operation,
-                &format!("pagination-{index:03}"),
-                index + 1,
-            );
-        }
-
-        let first = store.changes_after(0, 2).expect("first page");
-        assert!(first.has_more);
-        assert_eq!(first.next_after, 2);
-        let second = store
-            .changes_after(first.next_after, 2)
-            .expect("second page");
-        assert!(second.has_more);
-        assert_eq!(second.next_after, 4);
-        let third = store
-            .changes_after(second.next_after, 2)
-            .expect("third page");
-        assert!(!third.has_more);
-        assert_eq!(third.next_after, 5);
-
-        let actual: Vec<_> = first
-            .operations
-            .into_iter()
-            .chain(second.operations)
-            .chain(third.operations)
-            .map(|stored| stored.operation.operation_id)
-            .collect();
-        assert_eq!(actual, expected);
-        assert!(matches!(
-            store.changes_after(0, MAX_CHANGE_LIMIT + 1),
-            Err(RepositoryError::InvalidTopology(_))
-        ));
-    }
-
-    #[test]
-    fn operation_history_and_heads_survive_reopen() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("fractonica.db");
-        let entity = EntityId::new(Uuid::now_v7());
-        let actor = ActorId::new(Uuid::now_v7());
-        let root = put(entity, actor, Vec::new(), "persistent", 10);
-        {
-            let store = SqliteStore::open(&path).expect("first open");
-            submit(&store, root.clone(), "persistent-root", 1);
-        }
-
-        let reopened = SqliteStore::open(&path).expect("reopen");
-        let state = reopened
-            .entity_state(entity)
-            .expect("state")
-            .expect("entity");
-        assert_eq!(state.operation_count, 1);
-        assert_eq!(head_ids(&state), vec![root.operation_id]);
-        let changes = reopened.changes_after(0, 10).expect("changes");
-        assert_eq!(changes.operations, state.heads);
-    }
-
-    #[test]
-    fn rejects_a_branch_that_would_exceed_the_head_bound() {
-        let store = SqliteStore::open_in_memory().expect("store");
-        let entity = EntityId::new(Uuid::now_v7());
-        let actor = ActorId::new(Uuid::now_v7());
-        let root = put(entity, actor, Vec::new(), "root", 1);
-        submit(&store, root.clone(), "head-bound-root", 1);
-
-        for index in 0..MAX_ENTITY_HEADS {
-            let branch = put(
-                entity,
-                actor,
-                vec![root.operation_id],
-                &format!("branch-{index}"),
-                i64::try_from(index + 2).expect("test timestamp"),
-            );
-            let result = store.submit_operation(&request(
-                branch,
-                &format!("head-bound-{index:03}"),
-                u8::try_from(index % 255).expect("hash byte"),
-            ));
-            if index < MAX_ENTITY_HEADS {
-                result.expect("branch inside bound");
-            }
-        }
-
-        let overflow = put(entity, actor, vec![root.operation_id], "overflow", 1_000);
-        assert!(matches!(
-            store.submit_operation(&request(overflow, "head-bound-over", 250)),
-            Err(RepositoryError::InvalidTopology(_))
-        ));
-    }
-
-    #[test]
-    fn refuses_a_database_from_a_newer_binary() {
-        let mut connection = Connection::open_in_memory().expect("database");
-        connection
-            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
-            .expect("set schema");
+    fn hardlinked_database_is_refused() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("node");
+        fs::create_dir(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        let database = data.join("fractonica.db");
+        drop(SqliteStore::open(&database).unwrap());
+        fs::hard_link(&database, root.path().join("database-copy")).unwrap();
 
         assert!(matches!(
-            migrate(&mut connection),
-            Err(StoreError::UnsupportedSchema { .. })
+            SqliteStore::open(&database),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persistent_state_is_private_and_fully_synchronous() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let data_directory = directory.path().join("node");
-        let path = data_directory.join("fractonica.db");
-        let store = SqliteStore::open(&path).expect("open database");
-
-        assert_eq!(
-            fs::metadata(&data_directory)
-                .expect("data directory")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(&path).expect("database").permissions().mode() & 0o777,
-            0o600
-        );
-        store
-            .with_connection(|connection| {
-                let synchronous: u8 =
-                    connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
-                assert_eq!(synchronous, 2);
-                Ok(())
-            })
-            .expect("synchronous mode");
-    }
-
-    fn put(
-        entity_id: EntityId,
-        actor_id: ActorId,
-        causal_parents: Vec<OperationId>,
-        text: &str,
-        occurred_at_unix_ms: i64,
-    ) -> OperationEnvelope {
-        OperationEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            operation_id: OperationId::new(Uuid::now_v7()),
-            entity_id,
-            schema: EntitySchema::RecordV1,
-            actor_id,
-            causal_parents,
-            occurred_at_unix_ms,
-            body: OperationBody::Put {
-                document: RecordDocument {
-                    start_at_unix_ms: occurred_at_unix_ms,
-                    end_at_unix_ms: None,
-                    visibility: RecordVisibility::Public,
-                    emoji: None,
-                    text: Some(text.to_owned()),
-                    metadata: BTreeMap::new(),
-                    resources: Vec::new(),
-                },
-            },
-        }
-    }
-
-    fn tombstone(
-        entity_id: EntityId,
-        actor_id: ActorId,
-        causal_parents: Vec<OperationId>,
-        occurred_at_unix_ms: i64,
-    ) -> OperationEnvelope {
-        OperationEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            operation_id: OperationId::new(Uuid::now_v7()),
-            entity_id,
-            schema: EntitySchema::RecordV1,
-            actor_id,
-            causal_parents,
-            occurred_at_unix_ms,
-            body: OperationBody::Tombstone,
-        }
-    }
-
-    fn request(operation: OperationEnvelope, key: &str, hash_byte: u8) -> SubmitOperationRequest {
-        SubmitOperationRequest {
-            operation,
-            idempotency: IdempotencyContext {
-                key: key.to_owned(),
-                semantic_request_hash: [hash_byte; 32],
-            },
-        }
-    }
-
-    fn submit(
-        store: &SqliteStore,
-        operation: OperationEnvelope,
-        key: &str,
-        hash_byte: u8,
-    ) -> StoredOperation {
-        store
-            .submit_operation(&request(operation, key, hash_byte))
-            .expect("submit operation")
-            .operation
-    }
-
-    fn head_ids(state: &EntityState) -> Vec<OperationId> {
-        state
-            .heads
-            .iter()
-            .map(|stored| stored.operation.operation_id)
-            .collect()
     }
 }

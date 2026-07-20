@@ -12,6 +12,13 @@ and HTTP digest fields follow [RFC 9530](https://www.rfc-editor.org/rfc/rfc9530.
 All content routes require the stateful `node` profile. The stateless `saros`
 profile returns `503` and creates no staging or blob directories.
 
+These v1 routes are currently loopback content-transfer mechanics, not a
+space-authorized remote API. They do not accept actor proof or evaluate
+`readSpace`/`writeContent`; the optional node-wide bearer is transport gating
+only. Before content moves under a v2 space path, upload, resume, availability,
+metadata, and blob reads must enforce the applicable capability without leaking
+cross-space blob presence through physical deduplication.
+
 ## Content identity and record references
 
 A canonical content ID has exactly this form:

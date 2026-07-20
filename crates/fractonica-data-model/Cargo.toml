@@ -8,7 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 fractonica-content.workspace = true
+fractonica-trust.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

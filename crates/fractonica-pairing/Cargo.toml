@@ -1,0 +1,23 @@
+[package]
+name = "fractonica-pairing"
+description = "Bounded QR invitation and Noise pairing protocol for Fractonica nodes"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/fractonica/fractonica"
+
+[dependencies]
+base64.workspace = true
+fractonica-data-model.workspace = true
+fractonica-trust.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+sha2.workspace = true
+snow.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

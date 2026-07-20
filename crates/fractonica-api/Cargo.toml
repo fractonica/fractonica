@@ -15,8 +15,11 @@ fractonica-blob-store.workspace = true
 fractonica-content.workspace = true
 fractonica-data-model.workspace = true
 fractonica-glyph.workspace = true
+fractonica-pairing.workspace = true
+fractonica-peer.workspace = true
 fractonica-saros-engine.workspace = true
 fractonica-temporal-core.workspace = true
+fractonica-trust.workspace = true
 httpdate.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -32,6 +35,7 @@ tower-http.workspace = true
 utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
+fractonica-core.workspace = true
 fractonica-store-sqlite.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true

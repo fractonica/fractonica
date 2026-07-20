@@ -1,9 +1,17 @@
-# Exeligmos HTTP importer
+# Legacy Exeligmos to Fractonica protocol-v1 HTTP importer
+
+> [!WARNING]
+> This tool emits **unsigned operation protocol v1**. It is retained for
+> explicit migrations into a legacy v1 Fractonica node and cannot import into a
+> current signed-operation-v2 node. It does not ask the server to sign on an
+> actor's behalf. A dedicated client-side actor-key/signing adapter is required
+> before this importer can target v2.
 
 `@fractonica/import-exeligmos` is a one-way, API-only migration tool for moving
-the current Exeligmos record collection into a Fractonica node. It never opens
-the Exeligmos PostgreSQL database or media directory. Source access is read-only;
-destination writes use Fractonica's public operation and content APIs.
+the current Exeligmos record collection into a **legacy protocol-v1** Fractonica
+node. It never opens the Exeligmos PostgreSQL database or media directory.
+Source access is read-only; destination writes use the legacy Fractonica v1
+operation and content APIs.
 
 This is deliberately an explicit migration tool, not a permanent compatibility
 layer. The mapping contract is versioned as `exeligmos-record-v1`.
@@ -30,8 +38,8 @@ real migration and retain the Exeligmos backup until these limits are acceptable
 
 - Node.js 24 or newer;
 - a running Exeligmos server reachable over HTTP(S);
-- a running stateful Fractonica `node` profile with the operation, blob
-  availability, and TUS upload endpoints enabled;
+- a running legacy stateful Fractonica node that still accepts unsigned
+  `/api/v1/operations`, with blob availability and TUS upload endpoints enabled;
 - enough destination disk space for the content store;
 - an Exeligmos JWT or API key with `records:read`, `tags:read`, and `media:read`;
 - a Fractonica bearer token if the destination requires one. A loopback node may
@@ -79,12 +87,22 @@ pnpm --filter @fractonica/import-exeligmos start -- \
 
 Dry-run mode reads and validates every source page, maps every record, inventories
 media sizes, and reports unsupported records. It makes no destination requests
-and does not create or modify a checkpoint.
+and does not create or modify a checkpoint. This remains useful when the eventual
+destination is a signed-v2 node: the dry run validates source coverage and
+mapping limits without pretending the resulting v1 operation can be submitted.
 
 The command exits with status `2` if any record was skipped because it could not
 be represented without truncation. Other failures exit with status `1`.
 
 ## Migration
+
+Real migration is available only against a legacy operation-v1 node. Before
+reading the Exeligmos source, the importer performs a read-only
+`GET /api/v1/operations?after=0&limit=1` compatibility probe. If the endpoint is
+absent, malformed, unauthorized, unavailable, or returns the v2 node's
+`410 operation_v1_obsolete`, the run fails before uploading content, submitting
+an operation, or writing a checkpoint. The importer never falls back to a
+server-side signer.
 
 Remove `--dry-run` after reviewing its JSON summary:
 
@@ -202,4 +220,6 @@ Tests cover UUID fixtures, public and private mapping, lossless-bound rejection,
 checkpoint endpoint validation and permissions, HTTPS enforcement, bounded error
 capture, source-stream cancellation, dry-run isolation, authenticated source
 reads, content upload, lost-PATCH recovery, safe checkpoint-loss continuation and
-rejection, operation append, verification, and a completed-checkpoint rerun.
+rejection, operation append, verification, a completed-checkpoint rerun, and
+fail-closed rejection of signed-v2 destinations before any source scan or
+destination mutation.

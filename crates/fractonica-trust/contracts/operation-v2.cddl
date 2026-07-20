@@ -1,0 +1,39 @@
+; Fractonica operation protocol v2.
+; RFC 8610 notation plus deterministic-encoding requirements from RFC 8949.
+
+operation-payload-v2 = [
+  domain: "org.fractonica.operation.v2",
+  protocol-version: 2,
+  ; All-zero is invalid; CDDL cannot express the nonzero predicate itself.
+  space-id: bytes .size 32,
+  ; Must decode as a non-weak Ed25519 verification key.
+  actor-ed25519-public-key: bytes .size 32,
+  ; The nil UUID is invalid.
+  entity-uuid: bytes .size 16,
+  ; Additionally matches [a-z0-9][a-z0-9._-]{0,63}; the portable CDDL
+  ; vocabulary here leaves that ASCII-token predicate to the validator.
+  schema: tstr .size (1..64),
+  causal-parents: operation-digest-set,
+  authorization: operation-digest-set,
+  occurred-at-unix-ms: 0..9223372036854775807,
+  nonce: bytes .size 16,
+  body: canonical-body
+]
+
+; Both arrays contain at most 64 unique byte strings in strictly ascending raw
+; byte order. CDDL cannot express the ordering/uniqueness constraint itself.
+operation-digest-set = [0*64 (bytes .size 32)]
+
+; A schema replaces this open slot with its bounded deterministic CBOR value.
+; Tags, indefinite lengths, non-finite floats, and duplicate map keys are not
+; admitted by the v2 trust decoder.
+canonical-body = any
+
+; Exact wire envelope. The protected bytes decode to { 1: -8 } (EdDSA), the
+; unprotected map is empty, and the payload is embedded rather than detached.
+cose-sign1-v2 = #6.18([
+  protected: h'a10127',
+  unprotected: {},
+  payload: bytes,
+  signature: bytes .size 64
+])

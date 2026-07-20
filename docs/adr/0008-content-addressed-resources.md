@@ -53,8 +53,12 @@ store paths.
 SHA-256 identifies bytes and detects accidental or adversarial substitution;
 it does not identify an author. An HTTP `Content-Digest` header is transport
 integrity metadata and likewise is not evidence of authorship or authority.
-Actor signatures and canonical signing bytes remain subject to the security
-threat model and a separate ADR.
+Version 2 operations authenticate the `ResourceRef` fields through the signed
+record body, as defined by
+[ADR 0009](0009-signed-operation-trust-kernel.md), but that signature does not
+prove that the referenced bytes are safe or confidential. The
+[threat model](../threat-model.md) defines the metadata exposed by private
+resource references.
 
 ## Lifecycle
 

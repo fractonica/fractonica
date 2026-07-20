@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::{
-        Path, Query, Request, State,
+        DefaultBodyLimit, Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
@@ -21,17 +21,24 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, head, options, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+};
 use fractonica_application::{
     ApplicationError, ApplicationService, DEFAULT_CHANGE_LIMIT, EntityState,
-    MAX_AVAILABILITY_CONTENT_IDS, OperationChangePage, RepositoryError, StoredOperation,
-    SubmitOperationCommand, UploadId, UploadSession, UploadState,
+    MAX_AVAILABILITY_CONTENT_IDS, OperationChangePage, PeerReadChangesRequest, RepositoryError,
+    SpaceDescriptor, StoredOperation, SubmitOperationRequest, UploadId, UploadSession, UploadState,
+    authorization::AuthorizationError,
 };
 use fractonica_blob_store::{BlobStore, BlobStoreError, CreateUpload, MAX_PATCH_BYTES};
 use fractonica_content::{
     ContentDescriptor, ContentId, MAX_MEDIA_TYPE_BYTES, MAX_ORIGINAL_NAME_CHARS,
 };
-use fractonica_data_model::{EntityId, EntitySchema};
+use fractonica_data_model::{
+    ActorId, DataModelError, EntityId, EntitySchema, NodeId, OperationEnvelope, OperationId,
+    SpaceId,
+};
 use fractonica_glyph::{
     DEFAULT_DIGITS, FONT_ID as GLYPH_FONT_ID, FONT_SHA256 as GLYPH_FONT_SHA256,
     FONT_VERSION as GLYPH_FONT_VERSION, GEOMETRY_VERSION as GLYPH_GEOMETRY_VERSION,
@@ -40,11 +47,14 @@ use fractonica_glyph::{
     MIN_DIGITS as GLYPH_MIN_DIGITS, OctalGlyph, RADIX as GLYPH_RADIX, Rgba8,
     SPEC_SHA256 as GLYPH_SPEC_SHA256,
 };
+use fractonica_pairing::{CapabilityGrantTemplate, InvitationId};
+use fractonica_peer::PeerReadChangesProof;
 use fractonica_saros_engine::{
     EclipseIdentity, EclipsePath, GeometryRelease, SarosEngine, SarosEngineError, SarosPulse,
     SarosReading,
 };
 use fractonica_temporal_core::{BitPrecision, PhaseRatio, Rarity, TemporalError, Timestamp};
+use fractonica_trust::TrustError;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -57,7 +67,7 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::{SwaggerUi, Url};
 
 const SAROS_CAPABILITIES: &[&str] = &[
     "canonical-octal-glyphs",
@@ -68,7 +78,7 @@ const SAROS_CAPABILITIES: &[&str] = &[
 ];
 const FULL_NODE_CAPABILITIES: &[&str] = &[
     "canonical-octal-glyphs",
-    "causal-operation-log",
+    "signed-operation-log-v2",
     "local-storage",
     "node-http-api",
     "openapi",
@@ -77,7 +87,7 @@ const FULL_NODE_CAPABILITIES: &[&str] = &[
 ];
 const FULL_NODE_CONTENT_CAPABILITIES: &[&str] = &[
     "canonical-octal-glyphs",
-    "causal-operation-log",
+    "signed-operation-log-v2",
     "content-addressed-resources",
     "local-storage",
     "node-http-api",
@@ -86,7 +96,8 @@ const FULL_NODE_CONTENT_CAPABILITIES: &[&str] = &[
     "reviewed-eclipse-geometry",
 ];
 const SAROS_PROFILE_INSTALLATION_ID: &str = "saros-engine";
-const OPENAPI_CONTRACT: &str = include_str!("../../../contracts/openapi/v1.yaml");
+const OPENAPI_V1_CONTRACT: &str = include_str!("../../../contracts/openapi/v1.yaml");
+const OPENAPI_CONTRACT: &str = include_str!("../../../contracts/openapi/v2.yaml");
 const DISPLAY_NAME_MAX_LENGTH: usize = 128;
 const VERSION_MAX_LENGTH: usize = 64;
 const BEARER_TOKEN_MIN_LENGTH: usize = 32;
@@ -99,9 +110,15 @@ const TUS_EXTENSIONS: &str = "creation,expiration,checksum";
 const TUS_CHECKSUM_ALGORITHMS: &str = "sha1,sha256";
 const MAX_UPLOAD_METADATA_BYTES: usize = 8_192;
 const FILE_DIGEST_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_SIGNED_OPERATION_JSON_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PAIRING_JSON_BYTES: usize = 16 * 1024;
+const MAX_PEER_JSON_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ApiStateError {
+    #[error("node ID must contain a valid non-weak Ed25519 public key")]
+    InvalidNodeId,
+
     #[error("display name must contain between 1 and {DISPLAY_NAME_MAX_LENGTH} characters")]
     InvalidDisplayName,
 
@@ -152,6 +169,7 @@ impl NodeProfile {
 #[derive(Clone)]
 pub struct ApiState {
     application: Option<Arc<ApplicationService>>,
+    node_id: Option<NodeId>,
     blob_store: Option<Arc<BlobStore>>,
     saros: Arc<SarosEngine>,
     profile: NodeProfile,
@@ -160,15 +178,26 @@ pub struct ApiState {
     started_at: Arc<str>,
     started_instant: Instant,
     bearer_token: Option<Arc<str>>,
+    pairing: Option<Arc<dyn PairingControl>>,
 }
 
 impl ApiState {
     pub fn new(
         application: Arc<ApplicationService>,
+        node_id: NodeId,
         display_name: impl Into<Arc<str>>,
         version: impl Into<Arc<str>>,
     ) -> Result<Self, ApiStateError> {
-        Self::new_inner(Some(application), NodeProfile::Full, display_name, version)
+        node_id
+            .public_key()
+            .map_err(|_| ApiStateError::InvalidNodeId)?;
+        Self::new_inner(
+            Some(application),
+            Some(node_id),
+            NodeProfile::Full,
+            display_name,
+            version,
+        )
     }
 
     /// Builds a stateless Saros-only HTTP surface.
@@ -180,11 +209,12 @@ impl ApiState {
         display_name: impl Into<Arc<str>>,
         version: impl Into<Arc<str>>,
     ) -> Result<Self, ApiStateError> {
-        Self::new_inner(None, NodeProfile::Saros, display_name, version)
+        Self::new_inner(None, None, NodeProfile::Saros, display_name, version)
     }
 
     fn new_inner(
         application: Option<Arc<ApplicationService>>,
+        node_id: Option<NodeId>,
         profile: NodeProfile,
         display_name: impl Into<Arc<str>>,
         version: impl Into<Arc<str>>,
@@ -202,6 +232,7 @@ impl ApiState {
         let started_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         Ok(Self {
             application,
+            node_id,
             blob_store: None,
             saros: Arc::new(SarosEngine::embedded_reviewed()?),
             profile,
@@ -210,6 +241,7 @@ impl ApiState {
             started_at: Arc::from(started_at),
             started_instant: Instant::now(),
             bearer_token: None,
+            pairing: None,
         })
     }
 
@@ -238,6 +270,12 @@ impl ApiState {
         Ok(self)
     }
 
+    #[must_use]
+    pub fn with_pairing(mut self, pairing: Arc<dyn PairingControl>) -> Self {
+        self.pairing = Some(pairing);
+        self
+    }
+
     /// Installs the node-profile immutable content store.
     ///
     /// Keeping this explicit prevents the stateless Saros profile from ever
@@ -249,9 +287,103 @@ impl ApiState {
     }
 }
 
+pub trait PairingControl: Send + Sync {
+    fn create_invitation(
+        &self,
+        request: PairingCreateCommand,
+        now_unix_ms: i64,
+    ) -> Result<PairingInvitationCreated, PairingControlError>;
+    fn invitation(
+        &self,
+        id: InvitationId,
+    ) -> Result<Option<PairingSessionView>, PairingControlError>;
+    fn handshake(
+        &self,
+        id: InvitationId,
+        first_frame: &[u8],
+        now_unix_ms: i64,
+    ) -> Result<PairingHandshakeResult, PairingControlError>;
+    fn confirm(
+        &self,
+        id: InvitationId,
+        confirmation_octal: &str,
+        now_unix_ms: i64,
+    ) -> Result<PairingSessionView, PairingControlError>;
+    fn cancel(
+        &self,
+        id: InvitationId,
+        now_unix_ms: i64,
+    ) -> Result<PairingSessionView, PairingControlError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingCreateCommand {
+    pub space_id: SpaceId,
+    pub expires_in_ms: i64,
+    pub endpoint_hints: Vec<String>,
+    pub capability: CapabilityGrantTemplate,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingInvitationCreated {
+    pub qr: String,
+    pub session: PairingSessionView,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingHandshakeResult {
+    pub response_frame: Vec<u8>,
+    pub receipt_frame: Vec<u8>,
+    pub session: PairingSessionView,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PairingState {
+    Created,
+    Claimed,
+    Confirmed,
+    Completed,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingSessionView {
+    pub invitation_id: InvitationId,
+    pub space_id: SpaceId,
+    pub state: PairingState,
+    pub expires_at_unix_ms: i64,
+    pub joiner_node_id: Option<NodeId>,
+    pub subject_actor_id: Option<fractonica_trust::ActorId>,
+    pub confirmation_octal: Option<String>,
+    pub grant_operation_id: Option<OperationId>,
+}
+
+#[derive(Debug, Error)]
+pub enum PairingControlError {
+    #[error("pairing is unavailable for this node profile")]
+    ProfileUnavailable,
+    #[error("pairing invitation was not found")]
+    NotFound,
+    #[error("pairing invitation is expired, cancelled, or already used")]
+    Unavailable,
+    #[error("pairing request is invalid: {0}")]
+    Invalid(String),
+    #[error("pairing confirmation does not match")]
+    ConfirmationMismatch,
+    #[error("pairing persistence is unavailable")]
+    Storage,
+}
+
 pub fn router(state: ApiState) -> Router {
-    let openapi = serde_yaml_ng::from_str::<serde_json::Value>(OPENAPI_CONTRACT)
+    let mut openapi = serde_yaml_ng::from_str::<serde_json::Value>(OPENAPI_CONTRACT)
         .expect("checked-in OpenAPI contract must be valid YAML");
+    let mut openapi_v1 = serde_yaml_ng::from_str::<serde_json::Value>(OPENAPI_V1_CONTRACT)
+        .expect("checked-in OpenAPI v1 contract must be valid YAML");
+    let bearer_token_required = state.bearer_token.is_some();
+    configure_openapi_transport_security(&mut openapi, bearer_token_required);
+    configure_openapi_transport_security(&mut openapi_v1, bearer_token_required);
     let allowed_origins = AllowOrigin::list([
         HeaderValue::from_static("http://127.0.0.1:5173"),
         HeaderValue::from_static("http://localhost:5173"),
@@ -261,6 +393,7 @@ pub fn router(state: ApiState) -> Router {
         HeaderValue::from_static("tauri://localhost"),
     ]);
     let authentication_state = state.clone();
+    let upload_authentication_state = state.clone();
 
     let application = Router::new()
         .route("/health/live", get(live))
@@ -268,9 +401,45 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/node", get(node))
         .route(
             "/api/v1/operations",
-            get(operation_changes).post(submit_operation),
+            get(operation_v1_obsolete).post(operation_v1_obsolete),
         )
-        .route("/api/v1/entities/{entity_id}", get(entity_state))
+        .route("/api/v1/entities/{entity_id}", get(operation_v1_obsolete))
+        .route(
+            "/api/v2/spaces/{space_id}/operations",
+            post(submit_operation_v2).layer(DefaultBodyLimit::max(MAX_SIGNED_OPERATION_JSON_BYTES)),
+        )
+        .route(
+            "/api/v2/spaces/{space_id}/operations/{operation_id}",
+            get(operation_v2),
+        )
+        .route(
+            "/api/v2/spaces/{space_id}/entities/{entity_id}",
+            get(entity_state_v2),
+        )
+        .route(
+            "/api/v2/spaces/{space_id}/changes",
+            get(operation_changes_v2),
+        )
+        .route(
+            "/api/v2/peer/spaces/{space_id}/changes",
+            post(peer_operation_changes_v2).layer(DefaultBodyLimit::max(MAX_PEER_JSON_BYTES)),
+        )
+        .route(
+            "/api/v2/pairing/invitations",
+            post(create_pairing_invitation).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
+        )
+        .route(
+            "/api/v2/pairing/invitations/{invitation_id}",
+            get(pairing_invitation).delete(cancel_pairing_invitation),
+        )
+        .route(
+            "/api/v2/pairing/handshake",
+            post(pairing_handshake).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
+        )
+        .route(
+            "/api/v2/pairing/invitations/{invitation_id}/confirm",
+            post(confirm_pairing_invitation).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
+        )
         .route("/api/v1/uploads", post(create_upload))
         .route(
             "/api/v1/uploads/{upload_id}",
@@ -288,7 +457,18 @@ pub fn router(state: ApiState) -> Router {
             "/api/v1/saros/series/{saros}/eclipses/{sequence}/path",
             get(saros_path),
         )
-        .merge(SwaggerUi::new("/api/docs").external_url_unchecked("/api/openapi.json", openapi))
+        .merge(
+            SwaggerUi::new("/api/docs").external_urls_from_iter_unchecked([
+                (
+                    Url::with_primary("Signed operations v2", "/api/openapi.json", true),
+                    openapi,
+                ),
+                (
+                    Url::new("Temporal, glyph and content v1", "/api/openapi-v1.json"),
+                    openapi_v1,
+                ),
+            ]),
+        )
         .layer(middleware::from_fn_with_state(
             authentication_state,
             authenticate,
@@ -302,12 +482,12 @@ pub fn router(state: ApiState) -> Router {
                     Method::OPTIONS,
                     Method::PATCH,
                     Method::POST,
+                    Method::DELETE,
                 ])
                 .allow_headers([
                     header::ACCEPT,
                     header::AUTHORIZATION,
                     header::CONTENT_TYPE,
-                    HeaderName::from_static("idempotency-key"),
                     HeaderName::from_static("range"),
                     HeaderName::from_static("tus-resumable"),
                     HeaderName::from_static("upload-checksum"),
@@ -352,9 +532,24 @@ pub fn router(state: ApiState) -> Router {
     // capability handler rather than receiving an empty generic CORS reply.
     let upload_options = Router::new()
         .route("/api/v1/uploads", options(upload_capabilities))
+        .layer(middleware::from_fn_with_state(
+            upload_authentication_state,
+            authenticate,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     application.merge(upload_options)
+}
+
+fn configure_openapi_transport_security(
+    contract: &mut serde_json::Value,
+    bearer_token_required: bool,
+) {
+    contract["security"] = if bearer_token_required {
+        serde_json::json!([{ "bootstrapBearer": [] }])
+    } else {
+        serde_json::json!([{}])
+    };
 }
 
 #[derive(Debug, Serialize)]
@@ -383,6 +578,10 @@ pub struct StorageReady {
 #[serde(rename_all = "camelCase")]
 pub struct NodeResponse {
     pub installation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<NodeId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spaces: Option<Vec<SpaceDescriptor>>,
     pub profile: &'static str,
     pub display_name: String,
     pub version: String,
@@ -392,12 +591,29 @@ pub struct NodeResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OperationChangesQuery {
     #[serde(default)]
-    after: u64,
+    after: i64,
     #[serde(default = "default_change_limit")]
     limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeerReadChangesBody {
+    protocol_version: u8,
+    session_id: String,
+    node_id: String,
+    actor_id: String,
+    grant_operation_id: String,
+    after: u64,
+    limit: u16,
+    issued_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+    nonce: String,
+    node_signature: String,
+    actor_signature: String,
 }
 
 const fn default_change_limit() -> usize {
@@ -407,6 +623,7 @@ const fn default_change_limit() -> usize {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntityStateResponse {
+    pub space_id: SpaceId,
     pub entity_id: EntityId,
     pub schema: EntitySchema,
     pub operation_count: u64,
@@ -418,6 +635,7 @@ impl From<EntityState> for EntityStateResponse {
     fn from(value: EntityState) -> Self {
         let conflicted = value.is_conflicted();
         Self {
+            space_id: value.space_id,
             entity_id: value.entity_id,
             schema: value.schema,
             operation_count: value.operation_count,
@@ -728,6 +946,26 @@ impl ApiError {
         )
     }
 
+    fn profile_unavailable() -> Self {
+        Self::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "https://fractonica.com/problems/profile-unavailable",
+            "profile_unavailable",
+            "Profile unavailable",
+            "The stateless Saros profile does not provide signed operation storage.",
+        )
+    }
+
+    fn storage_unavailable() -> Self {
+        Self::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "https://fractonica.com/problems/storage-unavailable",
+            "storage_unavailable",
+            "Storage unavailable",
+            "The signed operation repository is temporarily unavailable.",
+        )
+    }
+
     fn unauthorized() -> Self {
         Self::status(
             StatusCode::UNAUTHORIZED,
@@ -736,6 +974,34 @@ impl ApiError {
             "Authentication required",
             "Supply the bearer token issued by the local node supervisor.",
         )
+    }
+
+    fn transport_unauthorized() -> Self {
+        Self::status(
+            StatusCode::UNAUTHORIZED,
+            "https://fractonica.com/problems/transport-unauthorized",
+            "transport_unauthorized",
+            "Transport authentication required",
+            "Supply the bearer token configured by the local node operator.",
+        )
+    }
+
+    fn forbidden(
+        problem_type: &'static str,
+        code: &'static str,
+        title: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::status(StatusCode::FORBIDDEN, problem_type, code, title, detail)
+    }
+
+    fn gone(
+        problem_type: &'static str,
+        code: &'static str,
+        title: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::status(StatusCode::GONE, problem_type, code, title, detail)
     }
 
     fn unprocessable(
@@ -800,10 +1066,16 @@ impl IntoResponse for ApiError {
 }
 
 async fn authenticate(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+    if request.uri().path() == "/api/v2/pairing/handshake"
+        || request.uri().path().starts_with("/api/v2/peer/")
+    {
+        return next.run(request).await;
+    }
     let Some(expected) = state.bearer_token.as_deref() else {
         return next.run(request).await;
     };
 
+    let uses_v2_contract = request.uri().path().starts_with("/api/v2/");
     let supplied = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -816,8 +1088,252 @@ async fn authenticate(State(state): State<ApiState>, request: Request, next: Nex
 
     if valid {
         next.run(request).await
+    } else if uses_v2_contract {
+        ApiError::transport_unauthorized().into_response()
     } else {
         ApiError::unauthorized().into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingCreateRequest {
+    space_id: SpaceId,
+    expires_in_ms: i64,
+    #[serde(default)]
+    endpoint_hints: Vec<String>,
+    capability: CapabilityGrantTemplate,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingHandshakeRequest {
+    invitation_id: String,
+    frame_base64url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingConfirmRequest {
+    confirmation_octal: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingInvitationResponse {
+    qr: String,
+    session: PairingSessionResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingHandshakeResponse {
+    response_frame_base64url: String,
+    receipt_frame_base64url: String,
+    session: PairingSessionResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingSessionResponse {
+    invitation_id: String,
+    space_id: SpaceId,
+    state: PairingState,
+    expires_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    joiner_node_id: Option<NodeId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_actor_id: Option<fractonica_trust::ActorId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmation_octal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_operation_id: Option<OperationId>,
+}
+
+impl From<PairingSessionView> for PairingSessionResponse {
+    fn from(value: PairingSessionView) -> Self {
+        Self {
+            invitation_id: value.invitation_id.to_string(),
+            space_id: value.space_id,
+            state: value.state,
+            expires_at_unix_ms: value.expires_at_unix_ms,
+            joiner_node_id: value.joiner_node_id,
+            subject_actor_id: value.subject_actor_id,
+            confirmation_octal: value.confirmation_octal,
+            grant_operation_id: value.grant_operation_id,
+        }
+    }
+}
+
+async fn create_pairing_invitation(
+    State(state): State<ApiState>,
+    payload: Result<Json<PairingCreateRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<PairingInvitationResponse>), ApiError> {
+    let Json(request) = payload.map_err(pairing_json_error)?;
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let created = tokio::task::spawn_blocking(move || {
+        control.create_invitation(
+            PairingCreateCommand {
+                space_id: request.space_id,
+                expires_in_ms: request.expires_in_ms,
+                endpoint_hints: request.endpoint_hints,
+                capability: request.capability,
+            },
+            now,
+        )
+    })
+    .await
+    .map_err(|_| ApiError::storage_unavailable())?
+    .map_err(pairing_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PairingInvitationResponse {
+            qr: created.qr,
+            session: created.session.into(),
+        }),
+    ))
+}
+
+async fn pairing_invitation(
+    State(state): State<ApiState>,
+    Path(invitation_id): Path<String>,
+) -> Result<Json<PairingSessionResponse>, ApiError> {
+    let id = parse_invitation_id(&invitation_id)?;
+    let control = pairing_control(&state)?;
+    let session = tokio::task::spawn_blocking(move || control.invitation(id))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(pairing_error)?
+        .ok_or_else(pairing_not_found)?;
+    Ok(Json(session.into()))
+}
+
+async fn pairing_handshake(
+    State(state): State<ApiState>,
+    payload: Result<Json<PairingHandshakeRequest>, JsonRejection>,
+) -> Result<Json<PairingHandshakeResponse>, ApiError> {
+    let Json(request) = payload.map_err(pairing_json_error)?;
+    let id = parse_invitation_id(&request.invitation_id)?;
+    let frame = URL_SAFE_NO_PAD
+        .decode(request.frame_base64url)
+        .map_err(|_| pairing_malformed())?;
+    if frame.len() > fractonica_pairing::MAX_NOISE_FRAME_BYTES {
+        return Err(pairing_malformed());
+    }
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let result = tokio::task::spawn_blocking(move || control.handshake(id, &frame, now))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(pairing_error)?;
+    Ok(Json(PairingHandshakeResponse {
+        response_frame_base64url: URL_SAFE_NO_PAD.encode(result.response_frame),
+        receipt_frame_base64url: URL_SAFE_NO_PAD.encode(result.receipt_frame),
+        session: result.session.into(),
+    }))
+}
+
+async fn confirm_pairing_invitation(
+    State(state): State<ApiState>,
+    Path(invitation_id): Path<String>,
+    payload: Result<Json<PairingConfirmRequest>, JsonRejection>,
+) -> Result<Json<PairingSessionResponse>, ApiError> {
+    let id = parse_invitation_id(&invitation_id)?;
+    let Json(request) = payload.map_err(pairing_json_error)?;
+    if request.confirmation_octal.len() != 10
+        || !request
+            .confirmation_octal
+            .bytes()
+            .all(|byte| (b'0'..=b'7').contains(&byte))
+    {
+        return Err(pairing_malformed());
+    }
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let session =
+        tokio::task::spawn_blocking(move || control.confirm(id, &request.confirmation_octal, now))
+            .await
+            .map_err(|_| ApiError::storage_unavailable())?
+            .map_err(pairing_error)?;
+    Ok(Json(session.into()))
+}
+
+async fn cancel_pairing_invitation(
+    State(state): State<ApiState>,
+    Path(invitation_id): Path<String>,
+) -> Result<Json<PairingSessionResponse>, ApiError> {
+    let id = parse_invitation_id(&invitation_id)?;
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let session = tokio::task::spawn_blocking(move || control.cancel(id, now))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(pairing_error)?;
+    Ok(Json(session.into()))
+}
+
+fn pairing_control(state: &ApiState) -> Result<Arc<dyn PairingControl>, ApiError> {
+    state
+        .pairing
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(ApiError::profile_unavailable)
+}
+
+fn parse_invitation_id(value: &str) -> Result<InvitationId, ApiError> {
+    InvitationId::parse_hex(value).map_err(|_| invalid_identifier())
+}
+
+fn pairing_json_error(error: JsonRejection) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "https://fractonica.com/problems/pairing-message-too-large",
+            "pairing_message_too_large",
+            "Pairing message too large",
+            "The pairing JSON message exceeds the 16 KiB transport limit.",
+        );
+    }
+    pairing_malformed()
+}
+
+fn pairing_malformed() -> ApiError {
+    ApiError::bad_request(
+        "https://fractonica.com/problems/malformed-pairing-message",
+        "malformed_pairing_message",
+        "Malformed pairing message",
+        "The pairing message does not match the strict version 1 contract.",
+    )
+}
+
+fn pairing_not_found() -> ApiError {
+    ApiError::not_found(
+        "https://fractonica.com/problems/pairing-not-found",
+        "pairing_not_found",
+        "Pairing invitation not found",
+        "The pairing invitation does not exist.",
+    )
+}
+
+fn pairing_error(error: PairingControlError) -> ApiError {
+    match error {
+        PairingControlError::ProfileUnavailable => ApiError::profile_unavailable(),
+        PairingControlError::NotFound => pairing_not_found(),
+        PairingControlError::Unavailable => ApiError::gone(
+            "https://fractonica.com/problems/pairing-unavailable",
+            "pairing_unavailable",
+            "Pairing invitation unavailable",
+            "The invitation is expired, cancelled, or already consumed.",
+        ),
+        PairingControlError::Invalid(_) => pairing_malformed(),
+        PairingControlError::ConfirmationMismatch => ApiError::forbidden(
+            "https://fractonica.com/problems/pairing-confirmation-mismatch",
+            "pairing_confirmation_mismatch",
+            "Pairing confirmation mismatch",
+            "The complete ten-digit confirmation does not match this session.",
+        ),
+        PairingControlError::Storage => ApiError::storage_unavailable(),
     }
 }
 
@@ -854,68 +1370,72 @@ async fn ready(State(state): State<ApiState>) -> Result<Json<ReadyResponse>, Api
 }
 
 async fn node(State(state): State<ApiState>) -> Result<Json<NodeResponse>, ApiError> {
-    let installation_id = match &state.application {
+    let (installation_id, spaces) = match &state.application {
         Some(application) => {
             let application = Arc::clone(application);
-            tokio::task::spawn_blocking(move || application.installation())
-                .await
-                .map_err(|error| ApiError::unavailable(format!("database task failed: {error}")))?
-                .map_err(|error| ApiError::unavailable(error.to_string()))?
-                .installation_id
-                .to_string()
+            let (installation, spaces) = tokio::task::spawn_blocking(move || {
+                Ok::<_, ApplicationError>((application.installation()?, application.spaces()?))
+            })
+            .await
+            .map_err(|error| ApiError::unavailable(format!("database task failed: {error}")))?
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            (installation.installation_id.to_string(), Some(spaces))
         }
-        None => SAROS_PROFILE_INSTALLATION_ID.to_owned(),
+        None => (SAROS_PROFILE_INSTALLATION_ID.to_owned(), None),
     };
-    let capabilities = match state.profile {
+    let mut capabilities = match state.profile {
         NodeProfile::Full if state.blob_store.is_some() => FULL_NODE_CONTENT_CAPABILITIES,
         NodeProfile::Full => FULL_NODE_CAPABILITIES,
         NodeProfile::Saros => SAROS_CAPABILITIES,
-    };
+    }
+    .to_vec();
+    if state.pairing.is_some() {
+        capabilities.push("noise-pairing-v1");
+    }
 
     Ok(Json(NodeResponse {
         installation_id,
+        node_id: state.node_id,
+        spaces,
         profile: state.profile.wire_id(),
         display_name: state.display_name.to_string(),
         version: state.version.to_string(),
         started_at: state.started_at.to_string(),
         uptime_seconds: state.started_instant.elapsed().as_secs(),
-        capabilities: capabilities.to_vec(),
+        capabilities,
     }))
 }
 
-async fn submit_operation(
+async fn operation_v1_obsolete() -> ApiError {
+    ApiError::gone(
+        "https://fractonica.com/problems/operation-v1-obsolete",
+        "operation_v1_obsolete",
+        "Operation API v1 is obsolete",
+        "Use the signed, space-scoped operation API under /api/v2/spaces/{spaceId}.",
+    )
+}
+
+async fn submit_operation_v2(
     State(state): State<ApiState>,
-    headers: HeaderMap,
-    payload: Result<Json<SubmitOperationCommand>, JsonRejection>,
+    Path(space_id): Path<String>,
+    payload: Result<Json<OperationEnvelope>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let application = full_application(&state)?;
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .ok_or_else(|| {
-            ApiError::unprocessable(
-                "https://fractonica.com/problems/invalid-idempotency-key",
-                "invalid_idempotency_key",
-                "Invalid idempotency key",
-                "Supply the Idempotency-Key header for every operation submission.",
-            )
-        })?
-        .to_str()
-        .map_err(|_| {
-            ApiError::unprocessable(
-                "https://fractonica.com/problems/invalid-idempotency-key",
-                "invalid_idempotency_key",
-                "Invalid idempotency key",
-                "The Idempotency-Key header must contain visible ASCII characters.",
-            )
-        })?
-        .to_owned();
-    let Json(command) = payload.map_err(operation_json_error)?;
+    let space_id = parse_space_id(&space_id)?;
+    let application = signed_operation_application(&state)?;
+    let Json(operation) = payload.map_err(signed_operation_json_error)?;
+    let received_at_unix_ms = unix_time_millis().map_err(|_| ApiError::storage_unavailable())?;
 
     let result = tokio::task::spawn_blocking(move || {
-        application.submit_operation(command, &idempotency_key)
+        application.submit_operation(
+            space_id,
+            SubmitOperationRequest {
+                operation,
+                received_at_unix_ms,
+            },
+        )
     })
     .await
-    .map_err(|error| ApiError::unavailable(format!("operation task failed: {error}")))?
+    .map_err(|_| ApiError::storage_unavailable())?
     .map_err(application_error)?;
     let status = if result.replayed {
         StatusCode::OK
@@ -925,52 +1445,161 @@ async fn submit_operation(
     Ok((status, Json(result.operation)).into_response())
 }
 
-async fn operation_changes(
+async fn operation_v2(
     State(state): State<ApiState>,
+    Path((space_id, operation_id)): Path<(String, String)>,
+) -> Result<Json<StoredOperation>, ApiError> {
+    let space_id = parse_space_id(&space_id)?;
+    let operation_id = parse_operation_id(&operation_id)?;
+    let application = signed_operation_application(&state)?;
+    let operation =
+        tokio::task::spawn_blocking(move || application.operation(space_id, operation_id))
+            .await
+            .map_err(|_| ApiError::storage_unavailable())?
+            .map_err(application_read_error)?
+            .ok_or_else(operation_not_found)?;
+    Ok(Json(operation))
+}
+
+async fn operation_changes_v2(
+    State(state): State<ApiState>,
+    Path(space_id): Path<String>,
     query: Result<Query<OperationChangesQuery>, QueryRejection>,
 ) -> Result<Json<OperationChangePage>, ApiError> {
-    let application = full_application(&state)?;
-    let Query(query) = query.map_err(operation_query_error)?;
-    let page =
-        tokio::task::spawn_blocking(move || application.changes_after(query.after, query.limit))
-            .await
-            .map_err(|error| ApiError::unavailable(format!("operation task failed: {error}")))?
-            .map_err(application_error)?;
+    let space_id = parse_space_id(&space_id)?;
+    let application = signed_operation_application(&state)?;
+    let Query(query) = query.map_err(signed_operation_query_error)?;
+    let after =
+        u64::try_from(query.after).map_err(|_| signed_operation_query_error_placeholder())?;
+    let page = tokio::task::spawn_blocking(move || {
+        application.changes_after(space_id, after, query.limit)
+    })
+    .await
+    .map_err(|_| ApiError::storage_unavailable())?
+    .map_err(application_read_error)?;
+    if page.next_after > i64::MAX as u64
+        || page
+            .operations
+            .iter()
+            .any(|operation| operation.local_sequence > i64::MAX as u64)
+    {
+        return Err(ApiError::storage_unavailable());
+    }
     Ok(Json(page))
 }
 
-async fn entity_state(
+async fn peer_operation_changes_v2(
     State(state): State<ApiState>,
-    Path(entity_id): Path<String>,
-) -> Result<Json<EntityStateResponse>, ApiError> {
-    let application = full_application(&state)?;
-    let entity_id = EntityId::parse(&entity_id).map_err(|error| {
-        ApiError::unprocessable(
-            "https://fractonica.com/problems/invalid-entity-id",
-            "invalid_entity_id",
-            "Invalid entity ID",
-            error.to_string(),
+    Path(space_id): Path<String>,
+    payload: Result<Json<PeerReadChangesBody>, JsonRejection>,
+) -> Result<Json<OperationChangePage>, ApiError> {
+    let space_id = parse_space_id(&space_id).map_err(|_| peer_malformed())?;
+    let application = signed_operation_application(&state)?;
+    let Json(body) = payload.map_err(peer_json_error)?;
+    let proof = PeerReadChangesProof {
+        protocol_version: body.protocol_version,
+        session_id: body.session_id.parse().map_err(|_| peer_malformed())?,
+        space_id,
+        node_id: NodeId::parse(&body.node_id).map_err(|_| peer_malformed())?,
+        actor_id: ActorId::parse(&body.actor_id).map_err(|_| peer_malformed())?,
+        grant_operation_id: OperationId::parse(&body.grant_operation_id)
+            .map_err(|_| peer_malformed())?,
+        after: body.after,
+        limit: body.limit,
+        issued_at_unix_ms: body.issued_at_unix_ms,
+        expires_at_unix_ms: body.expires_at_unix_ms,
+        nonce: body.nonce.parse().map_err(|_| peer_malformed())?,
+        node_signature: PeerReadChangesProof::parse_signature_hex(&body.node_signature)
+            .map_err(|_| peer_malformed())?,
+        actor_signature: PeerReadChangesProof::parse_signature_hex(&body.actor_signature)
+            .map_err(|_| peer_malformed())?,
+    };
+    let received_at_unix_ms = unix_time_millis().map_err(|_| ApiError::storage_unavailable())?;
+    let page = tokio::task::spawn_blocking(move || {
+        application.peer_changes(
+            space_id,
+            PeerReadChangesRequest {
+                proof,
+                received_at_unix_ms,
+            },
         )
-    })?;
-    let entity = tokio::task::spawn_blocking(move || application.entity_state(entity_id))
+    })
+    .await
+    .map_err(|_| ApiError::storage_unavailable())?
+    .map_err(peer_application_error)?;
+    Ok(Json(page))
+}
+
+async fn entity_state_v2(
+    State(state): State<ApiState>,
+    Path((space_id, entity_id)): Path<(String, String)>,
+) -> Result<Json<EntityStateResponse>, ApiError> {
+    let space_id = parse_space_id(&space_id)?;
+    let entity_id = parse_entity_id(&entity_id)?;
+    let application = signed_operation_application(&state)?;
+    let entity = tokio::task::spawn_blocking(move || application.entity_state(space_id, entity_id))
         .await
-        .map_err(|error| ApiError::unavailable(format!("operation task failed: {error}")))?
-        .map_err(application_error)?
-        .ok_or_else(|| {
-            ApiError::not_found(
-                "https://fractonica.com/problems/entity-not-found",
-                "entity_not_found",
-                "Entity not found",
-                format!("Entity {entity_id} does not exist on this node."),
-            )
-        })?;
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(application_read_error)?
+        .ok_or_else(entity_not_found)?;
     Ok(Json(entity.into()))
 }
 
-fn full_application(state: &ApiState) -> Result<Arc<ApplicationService>, ApiError> {
-    state.application.as_ref().map(Arc::clone).ok_or_else(|| {
-        ApiError::unavailable("The stateless Saros profile does not have an operation repository.")
-    })
+fn signed_operation_application(state: &ApiState) -> Result<Arc<ApplicationService>, ApiError> {
+    state
+        .application
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(ApiError::profile_unavailable)
+}
+
+fn parse_space_id(value: &str) -> Result<SpaceId, ApiError> {
+    let space_id = SpaceId::parse(value).map_err(|_| invalid_identifier())?;
+    if space_id.as_bytes() == &[0; 32] {
+        Err(invalid_identifier())
+    } else {
+        Ok(space_id)
+    }
+}
+
+fn parse_operation_id(value: &str) -> Result<OperationId, ApiError> {
+    OperationId::parse(value).map_err(|_| invalid_identifier())
+}
+
+fn parse_entity_id(value: &str) -> Result<EntityId, ApiError> {
+    let entity_id = EntityId::parse(value).map_err(|_| invalid_identifier())?;
+    if entity_id.as_uuid().is_nil() || entity_id.to_string() != value {
+        Err(invalid_identifier())
+    } else {
+        Ok(entity_id)
+    }
+}
+
+fn invalid_identifier() -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/invalid-identifier",
+        "invalid_identifier",
+        "Invalid identifier",
+        "A path identifier is not in its canonical Fractonica wire format.",
+    )
+}
+
+fn operation_not_found() -> ApiError {
+    ApiError::not_found(
+        "https://fractonica.com/problems/operation-not-found",
+        "operation_not_found",
+        "Operation not found",
+        "The selected space does not contain that admitted operation.",
+    )
+}
+
+fn entity_not_found() -> ApiError {
+    ApiError::not_found(
+        "https://fractonica.com/problems/entity-not-found",
+        "entity_not_found",
+        "Entity not found",
+        "The selected space does not contain that entity.",
+    )
 }
 
 fn full_blob_store(state: &ApiState) -> Result<Arc<BlobStore>, ApiError> {
@@ -1887,64 +2516,286 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> Re
     Ok(())
 }
 
-fn operation_json_error(error: JsonRejection) -> ApiError {
-    ApiError::unprocessable(
-        "https://fractonica.com/problems/invalid-operation",
-        "invalid_operation",
-        "Invalid operation",
-        error.body_text(),
+fn signed_operation_json_error(error: JsonRejection) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "https://fractonica.com/problems/signed-operation-too-large",
+            "signed_operation_too_large",
+            "Signed operation too large",
+            "The signed operation JSON projection exceeds the 8 MiB transport limit.",
+        );
+    }
+    ApiError::bad_request(
+        "https://fractonica.com/problems/malformed-signed-operation",
+        "malformed_signed_operation",
+        "Malformed signed operation",
+        "The request body is not the strict JSON projection of a signed operation.",
     )
 }
 
-fn operation_query_error(error: QueryRejection) -> ApiError {
+fn peer_json_error(error: JsonRejection) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "https://fractonica.com/problems/peer-request-too-large",
+            "peer_request_too_large",
+            "Peer request too large",
+            "The peer request JSON projection exceeds the 16 KiB transport limit.",
+        );
+    }
+    peer_malformed()
+}
+
+fn peer_malformed() -> ApiError {
+    ApiError::bad_request(
+        "https://fractonica.com/problems/malformed-peer-request",
+        "malformed_peer_request",
+        "Malformed peer request",
+        "The request is not the strict JSON projection of a Fractonica peer proof.",
+    )
+}
+
+fn peer_unauthorized() -> ApiError {
+    ApiError::forbidden(
+        "https://fractonica.com/problems/peer-unauthorized",
+        "peer_unauthorized",
+        "Peer request not authorized",
+        "The signed peer proof, completed pairing, capability, or replay state is not valid.",
+    )
+}
+
+fn peer_application_error(error: ApplicationError) -> ApiError {
+    match error {
+        ApplicationError::InvalidPeerProof(_)
+        | ApplicationError::PeerSpacePathMismatch { .. }
+        | ApplicationError::Repository(RepositoryError::PeerUnauthorized)
+        | ApplicationError::Repository(RepositoryError::PeerReplay) => peer_unauthorized(),
+        ApplicationError::InvalidReceivedAt(_) => ApiError::storage_unavailable(),
+        ApplicationError::Repository(RepositoryError::Unavailable(_)) => {
+            ApiError::storage_unavailable()
+        }
+        _ => peer_unauthorized(),
+    }
+}
+
+fn signed_operation_query_error(_error: QueryRejection) -> ApiError {
     ApiError::unprocessable(
-        "https://fractonica.com/problems/invalid-operation-query",
-        "invalid_operation_query",
-        "Invalid operation query",
-        error.body_text(),
+        "https://fractonica.com/problems/invalid-identifier",
+        "invalid_identifier",
+        "Invalid change cursor",
+        "The change cursor or page limit is outside the documented integer bounds.",
     )
 }
 
 fn application_error(error: ApplicationError) -> ApiError {
     match error {
-        ApplicationError::InvalidOperation(error) => ApiError::unprocessable(
-            "https://fractonica.com/problems/invalid-operation",
-            "invalid_operation",
-            "Invalid operation",
-            error.to_string(),
-        ),
-        ApplicationError::InvalidIdempotencyKey => ApiError::unprocessable(
-            "https://fractonica.com/problems/invalid-idempotency-key",
-            "invalid_idempotency_key",
-            "Invalid idempotency key",
-            "Idempotency-Key must satisfy the documented ASCII length and character bounds.",
-        ),
-        ApplicationError::InvalidChangeLimit => ApiError::unprocessable(
-            "https://fractonica.com/problems/invalid-operation-query",
-            "invalid_operation_query",
-            "Invalid operation query",
-            "The requested change-page limit is outside the supported range.",
-        ),
-        ApplicationError::SemanticEncoding(error) => {
-            ApiError::unavailable(format!("failed to encode canonical operation: {error}"))
+        ApplicationError::InvalidOperation(error) => data_model_error(error),
+        ApplicationError::SpacePathMismatch { .. } => space_id_mismatch(),
+        ApplicationError::GenericGenesisForbidden
+        | ApplicationError::InvalidTrustedBootstrap(_) => operation_admission_conflict(),
+        ApplicationError::InvalidReceivedAt(_) => ApiError::storage_unavailable(),
+        ApplicationError::InvalidChangeLimit => signed_operation_query_error_placeholder(),
+        ApplicationError::InvalidPeerProof(_) | ApplicationError::PeerSpacePathMismatch { .. } => {
+            peer_unauthorized()
         }
-        ApplicationError::Repository(repository_error) => match repository_error {
-            conflict @ (RepositoryError::MissingParent(_)
-            | RepositoryError::ParentMismatch { .. }
-            | RepositoryError::EntityAlreadyExists(_)
-            | RepositoryError::InvalidTopology(_)
-            | RepositoryError::OperationConflict(_)
-            | RepositoryError::IdempotencyConflict) => ApiError::conflict(
-                "https://fractonica.com/problems/operation-conflict",
-                "operation_conflict",
-                "Operation conflict",
-                conflict.to_string(),
-            ),
-            unavailable @ (RepositoryError::Corrupt(_) | RepositoryError::Unavailable(_)) => {
-                ApiError::unavailable(unavailable.to_string())
-            }
-        },
+        ApplicationError::Repository(error) => repository_error(error),
     }
+}
+
+fn application_read_error(error: ApplicationError) -> ApiError {
+    match error {
+        ApplicationError::Repository(
+            RepositoryError::MissingAuthorization(_)
+            | RepositoryError::CrossSpaceAuthorization(_)
+            | RepositoryError::Authorization(_),
+        ) => ApiError::storage_unavailable(),
+        error => application_error(error),
+    }
+}
+
+fn data_model_error(error: DataModelError) -> ApiError {
+    match error {
+        DataModelError::UnsupportedProtocolVersion { .. }
+        | DataModelError::Trust(TrustError::UnsupportedOperationVersion)
+        | DataModelError::Trust(TrustError::WrongOperationDomain) => ApiError::bad_request(
+            "https://fractonica.com/problems/unsupported-protocol-version",
+            "unsupported_protocol_version",
+            "Unsupported protocol version",
+            "The signed operation does not use the supported Fractonica protocol version.",
+        ),
+        DataModelError::ProjectionMismatch {
+            field: "operationId",
+        } => operation_id_mismatch(),
+        DataModelError::ProjectionMismatch { field: "actorId" } => actor_id_mismatch(),
+        DataModelError::ProjectionMismatch { field: "spaceId" } => space_id_mismatch(),
+        DataModelError::ProjectionMismatch { .. } => ApiError::bad_request(
+            "https://fractonica.com/problems/signed-projection-mismatch",
+            "signed_projection_mismatch",
+            "Signed projection mismatch",
+            "One or more JSON fields do not match the embedded signed payload.",
+        ),
+        DataModelError::NonCanonicalCoseProjection
+        | DataModelError::Trust(TrustError::CanonicalCbor(_)) => ApiError::bad_request(
+            "https://fractonica.com/problems/noncanonical-operation",
+            "noncanonical_operation",
+            "Non-canonical signed operation",
+            "The signed bytes are not in the required deterministic canonical form.",
+        ),
+        DataModelError::Trust(TrustError::InvalidCoseSign1)
+        | DataModelError::Trust(TrustError::WrongCoseProtectedHeader)
+        | DataModelError::Trust(TrustError::NonEmptyCoseUnprotectedHeader)
+        | DataModelError::Trust(TrustError::InvalidCoseSignatureLength)
+        | DataModelError::Trust(TrustError::InvalidOperationPayload(_)) => {
+            signed_operation_json_error_placeholder()
+        }
+        DataModelError::Trust(TrustError::OperationIdMismatch) => operation_id_mismatch(),
+        DataModelError::Trust(TrustError::SignatureVerificationFailed) => ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-signature",
+            "invalid_signature",
+            "Invalid signature",
+            "The Ed25519 signature could not be verified for the signed payload.",
+        ),
+        DataModelError::Trust(TrustError::SigningActorMismatch { .. })
+        | DataModelError::Trust(TrustError::UnexpectedActor { .. }) => actor_id_mismatch(),
+        _ => ApiError::unprocessable(
+            "https://fractonica.com/problems/invalid-operation-semantics",
+            "invalid_operation_semantics",
+            "Invalid operation semantics",
+            "The verified operation violates the bounded schema or causal rules.",
+        ),
+    }
+}
+
+fn operation_id_mismatch() -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/operation-id-mismatch",
+        "operation_id_mismatch",
+        "Operation ID mismatch",
+        "The operation ID does not match the canonical signed payload digest.",
+    )
+}
+
+fn actor_id_mismatch() -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/actor-id-mismatch",
+        "actor_id_mismatch",
+        "Actor ID mismatch",
+        "The projected actor ID does not match the operation signing key.",
+    )
+}
+
+fn space_id_mismatch() -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/space-id-mismatch",
+        "space_id_mismatch",
+        "Space ID mismatch",
+        "The selected or projected space ID does not match the signed payload.",
+    )
+}
+
+fn repository_error(error: RepositoryError) -> ApiError {
+    match error {
+        RepositoryError::PeerUnauthorized | RepositoryError::PeerReplay => peer_unauthorized(),
+        RepositoryError::SpaceNotFound(_) => ApiError::not_found(
+            "https://fractonica.com/problems/space-not-found",
+            "space_not_found",
+            "Space not found",
+            "The selected space is not trusted on this node.",
+        ),
+        RepositoryError::MissingAuthorization(_)
+        | RepositoryError::Authorization(AuthorizationError::Missing(_)) => ApiError::not_found(
+            "https://fractonica.com/problems/authorization-missing",
+            "authorization_missing",
+            "Authorization operation not found",
+            "A referenced authorization operation is not available in the selected space.",
+        ),
+        RepositoryError::MissingParent(_) => ApiError::conflict(
+            "https://fractonica.com/problems/causal-parent-missing",
+            "causal_parent_missing",
+            "Causal parent missing",
+            "A signed causal parent has not been admitted to the selected space.",
+        ),
+        RepositoryError::CrossSpaceParent(_)
+        | RepositoryError::CrossSpaceAuthorization(_)
+        | RepositoryError::Authorization(AuthorizationError::CrossSpaceReference { .. }) => {
+            ApiError::conflict(
+                "https://fractonica.com/problems/cross-space-reference",
+                "cross_space_reference",
+                "Cross-space reference",
+                "Causal and authorization references must remain inside one space.",
+            )
+        }
+        RepositoryError::Authorization(AuthorizationError::Required) => ApiError::forbidden(
+            "https://fractonica.com/problems/authorization-required",
+            "authorization_required",
+            "Authorization required",
+            "This operation requires at least one effective capability reference.",
+        ),
+        RepositoryError::Authorization(AuthorizationError::Revoked(_)) => ApiError::forbidden(
+            "https://fractonica.com/problems/authorization-revoked",
+            "authorization_revoked",
+            "Authorization revoked",
+            "The capability authorizing this operation has been revoked.",
+        ),
+        RepositoryError::Authorization(
+            AuthorizationError::NotCapability(_)
+            | AuthorizationError::UntrustedGenesis(_)
+            | AuthorizationError::SubjectMismatch { .. }
+            | AuthorizationError::OutsideAdmissionWindow { .. }
+            | AuthorizationError::Denied
+            | AuthorizationError::Cycle(_)
+            | AuthorizationError::GraphTooLarge,
+        ) => ApiError::forbidden(
+            "https://fractonica.com/problems/authorization-denied",
+            "authorization_denied",
+            "Authorization denied",
+            "No effective capability chain authorizes this operation.",
+        ),
+        RepositoryError::GenesisConflict(_) => ApiError::conflict(
+            "https://fractonica.com/problems/conflicting-space-genesis",
+            "conflicting_space_genesis",
+            "Conflicting space genesis",
+            "The selected space is already anchored to different genesis material.",
+        ),
+        RepositoryError::ParentMismatch { .. }
+        | RepositoryError::EntityAlreadyExists(_)
+        | RepositoryError::InvalidTopology(_)
+        | RepositoryError::OperationConflict(_) => operation_admission_conflict(),
+        RepositoryError::Authorization(
+            AuthorizationError::InvalidStoredOperation { .. } | AuthorizationError::View(_),
+        )
+        | RepositoryError::LegacyMigrationRequired
+        | RepositoryError::Corrupt(_)
+        | RepositoryError::Unavailable(_) => ApiError::storage_unavailable(),
+    }
+}
+
+fn operation_admission_conflict() -> ApiError {
+    ApiError::conflict(
+        "https://fractonica.com/problems/operation-admission-conflict",
+        "operation_admission_conflict",
+        "Operation admission conflict",
+        "The signed operation conflicts with the admitted causal history.",
+    )
+}
+
+fn signed_operation_json_error_placeholder() -> ApiError {
+    ApiError::bad_request(
+        "https://fractonica.com/problems/malformed-signed-operation",
+        "malformed_signed_operation",
+        "Malformed signed operation",
+        "The COSE Sign1 envelope does not match the required signed-operation profile.",
+    )
+}
+
+fn signed_operation_query_error_placeholder() -> ApiError {
+    ApiError::unprocessable(
+        "https://fractonica.com/problems/invalid-identifier",
+        "invalid_identifier",
+        "Invalid change cursor",
+        "The change-page limit must be between 1 and 200.",
+    )
 }
 
 async fn saros_metadata(State(state): State<ApiState>) -> Json<SarosMetadataResponse> {
@@ -2465,28 +3316,110 @@ fn glyph_string(digits: &[u8]) -> String {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
-    use fractonica_data_model::ActorId;
+    use fractonica_application::{
+        OperationRepository, RepositoryReadiness, SpaceDescriptor, SubmitOperationResult,
+        TrustedSpaceBootstrapRequest, TrustedSpaceBootstrapResult,
+    };
+    use fractonica_core::{InstallationId, InstallationMetadata};
+    use fractonica_data_model::{
+        OperationBody, OperationNonce, RecordDocument, RecordVisibility, SigningKey,
+    };
     use fractonica_store_sqlite::SqliteStore;
     use http_body_util::BodyExt;
     use serde_json::Value;
-    use std::collections::HashSet;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
     use tempfile::TempDir;
     use tower::ServiceExt;
 
     fn test_app() -> Router {
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
-        let state =
-            ApiState::new(test_application(store), "Test Node", "0.1.0").expect("API state");
+        let state = ApiState::new(
+            test_application(store),
+            fixture_node_id(),
+            "Test Node",
+            "0.1.0",
+        )
+        .expect("API state");
         router(state)
     }
 
     fn authenticated_test_app() -> Router {
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
-        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
-            .expect("API state")
-            .with_bearer_token("0123456789abcdef0123456789abcdef")
-            .expect("bearer token");
+        let state = ApiState::new(
+            test_application(store),
+            fixture_node_id(),
+            "Test Node",
+            "0.1.0",
+        )
+        .expect("API state")
+        .with_bearer_token("0123456789abcdef0123456789abcdef")
+        .expect("bearer token");
         router(state)
+    }
+
+    struct UnavailablePairing;
+
+    impl PairingControl for UnavailablePairing {
+        fn create_invitation(
+            &self,
+            _: PairingCreateCommand,
+            _: i64,
+        ) -> Result<PairingInvitationCreated, PairingControlError> {
+            Err(PairingControlError::Unavailable)
+        }
+        fn invitation(
+            &self,
+            _: InvitationId,
+        ) -> Result<Option<PairingSessionView>, PairingControlError> {
+            Err(PairingControlError::Unavailable)
+        }
+        fn handshake(
+            &self,
+            _: InvitationId,
+            _: &[u8],
+            _: i64,
+        ) -> Result<PairingHandshakeResult, PairingControlError> {
+            Err(PairingControlError::Unavailable)
+        }
+        fn confirm(
+            &self,
+            _: InvitationId,
+            _: &str,
+            _: i64,
+        ) -> Result<PairingSessionView, PairingControlError> {
+            Err(PairingControlError::Unavailable)
+        }
+        fn cancel(
+            &self,
+            _: InvitationId,
+            _: i64,
+        ) -> Result<PairingSessionView, PairingControlError> {
+            Err(PairingControlError::Unavailable)
+        }
+    }
+
+    fn authenticated_pairing_app() -> Router {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
+        router(
+            ApiState::new(
+                test_application(store),
+                fixture_node_id(),
+                "Test Node",
+                "0.1.0",
+            )
+            .expect("API state")
+            .with_pairing(Arc::new(UnavailablePairing))
+            .with_bearer_token("0123456789abcdef0123456789abcdef")
+            .expect("bearer token"),
+        )
     }
 
     fn content_test_app() -> (Router, TempDir) {
@@ -2496,9 +3429,14 @@ mod tests {
             BlobStore::open(temporary.path().join("content"), Arc::clone(&store))
                 .expect("blob store"),
         );
-        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
-            .expect("API state")
-            .with_blob_store(blob_store);
+        let state = ApiState::new(
+            test_application(store),
+            fixture_node_id(),
+            "Test Node",
+            "0.1.0",
+        )
+        .expect("API state")
+        .with_blob_store(blob_store);
         (router(state), temporary)
     }
 
@@ -2507,9 +3445,304 @@ mod tests {
     }
 
     fn test_application(store: Arc<SqliteStore>) -> Arc<ApplicationService> {
-        let installation = store.installation().expect("installation metadata");
-        let actor_id = ActorId::new(installation.installation_id.as_uuid());
-        Arc::new(ApplicationService::new(store, actor_id))
+        Arc::new(ApplicationService::new(store))
+    }
+
+    fn fixture_node_id() -> NodeId {
+        SigningKey::from_seed([0x61; 32]).node_id()
+    }
+
+    #[derive(Clone, Copy)]
+    enum StubAdmission {
+        Accept,
+        AuthorizationRequired,
+        AuthorizationMissing,
+        AuthorizationRevoked,
+        CausalParentMissing,
+        CrossSpaceReference,
+        AdmissionConflict,
+        SpaceNotFound,
+        StorageUnavailable,
+    }
+
+    struct SignedOperationStub {
+        space_id: SpaceId,
+        admission: StubAdmission,
+        operations: Mutex<Vec<StoredOperation>>,
+        repository_calls: AtomicUsize,
+    }
+
+    impl SignedOperationStub {
+        fn new(space_id: SpaceId, admission: StubAdmission) -> Self {
+            Self {
+                space_id,
+                admission,
+                operations: Mutex::new(Vec::new()),
+                repository_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.repository_calls.load(Ordering::Relaxed)
+        }
+
+        fn count_call(&self) {
+            self.repository_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn require_space(&self, space_id: SpaceId) -> Result<(), RepositoryError> {
+            if space_id == self.space_id {
+                Ok(())
+            } else {
+                Err(RepositoryError::SpaceNotFound(space_id))
+            }
+        }
+    }
+
+    impl OperationRepository for SignedOperationStub {
+        fn readiness(&self) -> Result<RepositoryReadiness, RepositoryError> {
+            self.count_call();
+            Ok(RepositoryReadiness { schema_version: 4 })
+        }
+
+        fn installation(&self) -> Result<InstallationMetadata, RepositoryError> {
+            self.count_call();
+            Ok(InstallationMetadata {
+                installation_id: InstallationId::parse("019f75cd-77cf-76b1-b7c9-ad88db284f8e")
+                    .expect("fixture installation ID"),
+                created_at_unix_ms: 1_784_390_400_000,
+            })
+        }
+
+        fn space(&self, space_id: SpaceId) -> Result<Option<SpaceDescriptor>, RepositoryError> {
+            self.count_call();
+            Ok((space_id == self.space_id).then(fixture_space_descriptor))
+        }
+
+        fn spaces(&self) -> Result<Vec<SpaceDescriptor>, RepositoryError> {
+            self.count_call();
+            Ok(vec![fixture_space_descriptor()])
+        }
+
+        fn bootstrap_trusted_space(
+            &self,
+            _request: &TrustedSpaceBootstrapRequest,
+        ) -> Result<TrustedSpaceBootstrapResult, RepositoryError> {
+            self.count_call();
+            Err(RepositoryError::Unavailable(
+                "bootstrap is intentionally absent from the HTTP stub".to_owned(),
+            ))
+        }
+
+        fn submit_operation(
+            &self,
+            space_id: SpaceId,
+            request: &SubmitOperationRequest,
+        ) -> Result<SubmitOperationResult, RepositoryError> {
+            self.count_call();
+            self.require_space(space_id)?;
+            match self.admission {
+                StubAdmission::Accept => {}
+                StubAdmission::AuthorizationRequired => {
+                    return Err(RepositoryError::Authorization(AuthorizationError::Required));
+                }
+                StubAdmission::AuthorizationMissing => {
+                    return Err(RepositoryError::MissingAuthorization(
+                        request.operation.authorization[0],
+                    ));
+                }
+                StubAdmission::AuthorizationRevoked => {
+                    return Err(RepositoryError::Authorization(AuthorizationError::Revoked(
+                        request.operation.authorization[0],
+                    )));
+                }
+                StubAdmission::CausalParentMissing => {
+                    return Err(RepositoryError::MissingParent(OperationId::from_bytes(
+                        [0x71; 32],
+                    )));
+                }
+                StubAdmission::CrossSpaceReference => {
+                    return Err(RepositoryError::CrossSpaceParent(OperationId::from_bytes(
+                        [0x72; 32],
+                    )));
+                }
+                StubAdmission::AdmissionConflict => {
+                    return Err(RepositoryError::OperationConflict(
+                        request.operation.operation_id,
+                    ));
+                }
+                StubAdmission::SpaceNotFound => {
+                    return Err(RepositoryError::SpaceNotFound(space_id));
+                }
+                StubAdmission::StorageUnavailable => {
+                    return Err(RepositoryError::Unavailable("stub outage".to_owned()));
+                }
+            }
+
+            let mut operations = self.operations.lock().expect("operation stub lock");
+            if let Some(existing) = operations
+                .iter()
+                .find(|stored| stored.operation.operation_id == request.operation.operation_id)
+            {
+                if existing.operation != request.operation {
+                    return Err(RepositoryError::OperationConflict(
+                        request.operation.operation_id,
+                    ));
+                }
+                return Ok(SubmitOperationResult {
+                    operation: existing.clone(),
+                    replayed: true,
+                });
+            }
+            let operation = StoredOperation {
+                local_sequence: operations.len() as u64 + 1,
+                received_at_unix_ms: request.received_at_unix_ms,
+                operation: request.operation.clone(),
+            };
+            operations.push(operation.clone());
+            Ok(SubmitOperationResult {
+                operation,
+                replayed: false,
+            })
+        }
+
+        fn operation(
+            &self,
+            space_id: SpaceId,
+            operation_id: OperationId,
+        ) -> Result<Option<StoredOperation>, RepositoryError> {
+            self.count_call();
+            self.require_space(space_id)?;
+            Ok(self
+                .operations
+                .lock()
+                .expect("operation stub lock")
+                .iter()
+                .find(|stored| stored.operation.operation_id == operation_id)
+                .cloned())
+        }
+
+        fn entity_state(
+            &self,
+            space_id: SpaceId,
+            entity_id: EntityId,
+        ) -> Result<Option<EntityState>, RepositoryError> {
+            self.count_call();
+            self.require_space(space_id)?;
+            let operations = self.operations.lock().expect("operation stub lock");
+            let matching: Vec<StoredOperation> = operations
+                .iter()
+                .filter(|stored| stored.operation.entity_id == entity_id)
+                .cloned()
+                .collect();
+            let Some(first) = matching.first() else {
+                return Ok(None);
+            };
+            let heads = matching
+                .iter()
+                .filter(|candidate| {
+                    !matching.iter().any(|operation| {
+                        operation
+                            .operation
+                            .causal_parents
+                            .contains(&candidate.operation.operation_id)
+                    })
+                })
+                .cloned()
+                .collect();
+            Ok(Some(EntityState {
+                space_id,
+                entity_id,
+                schema: first.operation.schema,
+                operation_count: matching.len() as u64,
+                heads,
+            }))
+        }
+
+        fn changes_after(
+            &self,
+            space_id: SpaceId,
+            after_local_sequence: u64,
+            limit: usize,
+        ) -> Result<OperationChangePage, RepositoryError> {
+            self.count_call();
+            self.require_space(space_id)?;
+            let operations = self.operations.lock().expect("operation stub lock");
+            let available: Vec<StoredOperation> = operations
+                .iter()
+                .filter(|stored| stored.local_sequence > after_local_sequence)
+                .cloned()
+                .collect();
+            let has_more = available.len() > limit;
+            let page: Vec<StoredOperation> = available.into_iter().take(limit).collect();
+            let next_after = page
+                .last()
+                .map_or(after_local_sequence, |operation| operation.local_sequence);
+            Ok(OperationChangePage {
+                space_id,
+                operations: page,
+                next_after,
+                has_more,
+            })
+        }
+    }
+
+    fn fixture_space() -> SpaceId {
+        SpaceId::from_bytes([0x31; 32])
+    }
+
+    fn fixture_space_descriptor() -> SpaceDescriptor {
+        SpaceDescriptor {
+            space_id: fixture_space(),
+            display_name: "Fixture space".to_owned(),
+            genesis_operation_id: OperationId::from_bytes([0x32; 32]),
+            initial_grant_operation_id: OperationId::from_bytes([0x33; 32]),
+            controller_actor_id: SigningKey::from_seed([0x34; 32]).actor_id(),
+            local_writer_actor_id: SigningKey::from_seed([0x35; 32]).actor_id(),
+            created_at_unix_ms: 1_784_390_400_000,
+        }
+    }
+
+    fn fixture_signed_record(
+        space_id: SpaceId,
+        entity_id: &str,
+        seed: u8,
+        nonce: u8,
+    ) -> OperationEnvelope {
+        OperationEnvelope::sign(
+            space_id,
+            EntityId::parse(entity_id).expect("fixture entity ID"),
+            EntitySchema::RecordV1,
+            Vec::new(),
+            vec![OperationId::from_bytes([0x51; 32])],
+            1_784_390_400_000,
+            OperationNonce::from_bytes([nonce; 16]),
+            OperationBody::Put {
+                document: RecordDocument {
+                    start_at_unix_ms: 1_784_390_400_000,
+                    end_at_unix_ms: None,
+                    visibility: RecordVisibility::Private,
+                    emoji: Some("🌀".to_owned()),
+                    text: Some("signed API fixture".to_owned()),
+                    metadata: BTreeMap::new(),
+                    resources: Vec::new(),
+                },
+            },
+            &SigningKey::from_seed([seed; 32]),
+        )
+        .expect("signed record fixture")
+    }
+
+    fn signed_operation_stub_app(admission: StubAdmission) -> (Router, Arc<SignedOperationStub>) {
+        let repository = Arc::new(SignedOperationStub::new(fixture_space(), admission));
+        let state = ApiState::new(
+            Arc::new(ApplicationService::new(Arc::clone(&repository))),
+            fixture_node_id(),
+            "Signed operation test node",
+            "0.1.0",
+        )
+        .expect("API state");
+        (router(state), repository)
     }
 
     #[test]
@@ -2517,23 +3750,42 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
         let application = test_application(Arc::clone(&store));
         assert!(matches!(
-            ApiState::new(Arc::clone(&application), "", "0.1.0"),
+            ApiState::new(
+                Arc::clone(&application),
+                NodeId::from_bytes([0; 32]),
+                "Test Node",
+                "0.1.0",
+            ),
+            Err(ApiStateError::InvalidNodeId)
+        ));
+        assert!(matches!(
+            ApiState::new(Arc::clone(&application), fixture_node_id(), "", "0.1.0"),
             Err(ApiStateError::InvalidDisplayName)
         ));
         assert!(matches!(
-            ApiState::new(Arc::clone(&application), "x".repeat(129), "0.1.0"),
+            ApiState::new(
+                Arc::clone(&application),
+                fixture_node_id(),
+                "x".repeat(129),
+                "0.1.0",
+            ),
             Err(ApiStateError::InvalidDisplayName)
         ));
         assert!(matches!(
-            ApiState::new(application, "Test Node", ""),
+            ApiState::new(application, fixture_node_id(), "Test Node", ""),
             Err(ApiStateError::InvalidVersion)
         ));
 
         let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
         assert!(matches!(
-            ApiState::new(test_application(store), "Test Node", "0.1.0")
-                .expect("API state")
-                .with_bearer_token("too-short"),
+            ApiState::new(
+                test_application(store),
+                fixture_node_id(),
+                "Test Node",
+                "0.1.0",
+            )
+            .expect("API state")
+            .with_bearer_token("too-short"),
             Err(ApiStateError::InvalidBearerToken)
         ));
     }
@@ -2567,6 +3819,117 @@ mod tests {
             .expect("response");
         assert_eq!(authorized.status(), StatusCode::OK);
         assert_contract_schema("LiveStatus", &json(authorized).await);
+
+        let v2_unauthorized = authenticated_test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v2/spaces/{}/changes", fixture_space()))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(v2_unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let v2_unauthorized = json(v2_unauthorized).await;
+        assert_v2_contract_schema("Problem", &v2_unauthorized);
+        assert_eq!(v2_unauthorized["code"], "transport_unauthorized");
+
+        let upload_discovery_unauthorized = authenticated_test_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/v1/uploads")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            upload_discovery_unauthorized.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            json(upload_discovery_unauthorized).await["code"],
+            "invalid_bootstrap_token"
+        );
+
+        let upload_discovery_authorized = authenticated_test_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/v1/uploads")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer 0123456789abcdef0123456789abcdef",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            upload_discovery_authorized.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            json(upload_discovery_authorized).await["code"],
+            "node_not_ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_handshake_uses_cryptographic_auth_while_admin_routes_require_bearer() {
+        let admin = authenticated_pairing_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v2/pairing/invitations/04040404040404040404040404040404")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(admin.status(), StatusCode::UNAUTHORIZED);
+
+        let handshake = authenticated_pairing_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v2/pairing/handshake")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "invitationId": "04040404040404040404040404040404",
+                            "frameBase64url": "AA"
+                        }))
+                        .unwrap(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(handshake.status(), StatusCode::GONE);
+        let problem = json(handshake).await;
+        assert_eq!(problem["code"], "pairing_unavailable");
+        assert_v2_contract_schema("Problem", &problem);
+
+        let peer = authenticated_pairing_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v2/peer/spaces/{}/changes",
+                        SpaceId::from_bytes([9; 32])
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(peer.status(), StatusCode::BAD_REQUEST);
+        let problem = json(peer).await;
+        assert_eq!(problem["code"], "malformed_peer_request");
+        assert_v2_contract_schema("Problem", &problem);
     }
 
     async fn json(response: Response) -> Value {
@@ -2581,10 +3944,19 @@ mod tests {
 
     fn assert_contract_schema(schema_name: &str, value: &Value) {
         let contract: Value =
-            serde_yaml_ng::from_str(OPENAPI_CONTRACT).expect("valid OpenAPI contract");
+            serde_yaml_ng::from_str(OPENAPI_V1_CONTRACT).expect("valid OpenAPI contract");
         let schema = contract
             .pointer(&format!("/components/schemas/{schema_name}"))
             .expect("named OpenAPI schema");
+        assert_schema(value, schema, &contract);
+    }
+
+    fn assert_v2_contract_schema(schema_name: &str, value: &Value) {
+        let contract: Value =
+            serde_yaml_ng::from_str(OPENAPI_CONTRACT).expect("valid v2 OpenAPI contract");
+        let schema = contract
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .expect("named v2 OpenAPI schema");
         assert_schema(value, schema, &contract);
     }
 
@@ -2818,38 +4190,132 @@ mod tests {
         assert_contract_schema("NodeInfo", &second);
         assert_eq!(first["installationId"], second["installationId"]);
         assert_eq!(first["profile"], "node");
+        assert_eq!(first["nodeId"], fixture_node_id().to_string());
+        assert_eq!(first["spaces"], serde_json::json!([]));
         assert_eq!(first["displayName"], "Test Node");
         assert_eq!(first["version"], "0.1.0");
+        assert!(
+            first["capabilities"]
+                .as_array()
+                .expect("capabilities")
+                .iter()
+                .any(|capability| capability == "signed-operation-log-v2")
+        );
+        assert!(
+            !first["capabilities"]
+                .as_array()
+                .expect("capabilities")
+                .iter()
+                .any(|capability| capability == "causal-operation-log")
+        );
     }
 
     #[tokio::test]
-    async fn appends_replays_pages_and_materializes_operations() {
-        let app = test_app();
-        let operation_id = "019f6f11-8e23-7b81-b923-71773bbd5132";
-        let entity_id = "019f6f11-a1d7-72b1-8db1-6fa9e9c45b89";
-        let operation = serde_json::json!({
-            "protocolVersion": 1,
-            "operationId": operation_id,
-            "entityId": entity_id,
-            "schema": "record.v1",
-            "causalParents": [],
-            "occurredAtUnixMs": 1_784_390_400_000_i64,
-            "body": {
-                "kind": "put",
-                "document": {
-                    "startAtUnixMs": 1_784_390_400_000_i64,
-                    "visibility": "private",
-                    "emoji": "🌀",
-                    "metadata": {"source": "API test"}
-                }
-            }
-        });
-        let append_request = || {
+    async fn returns_only_public_node_identity_and_space_descriptors() {
+        let (app, _repository) = signed_operation_stub_app(StubAdmission::Accept);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/node")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let node = json(response).await;
+        assert_contract_schema("NodeInfo", &node);
+        assert_eq!(node["nodeId"], fixture_node_id().to_string());
+        assert_eq!(node["spaces"].as_array().expect("spaces").len(), 1);
+        assert_eq!(node["spaces"][0]["spaceId"], fixture_space().to_string());
+        assert_eq!(
+            node["spaces"][0]["genesisOperationId"],
+            OperationId::from_bytes([0x32; 32]).to_string()
+        );
+        let serialized = node.to_string().to_ascii_lowercase();
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("seed"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn operation_v1_is_gone_without_touching_storage() {
+        let (app, repository) = signed_operation_stub_app(StubAdmission::Accept);
+        for request in [
+            Request::builder()
+                .uri("/api/v1/operations")
+                .body(Body::empty())
+                .expect("GET v1 operations"),
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/operations")
                 .header(header::CONTENT_TYPE, "application/json")
-                .header("idempotency-key", "operation-create-0001")
+                .body(Body::from("{}"))
+                .expect("POST v1 operation"),
+            Request::builder()
+                .uri("/api/v1/entities/019f6f11-a1d7-72b1-8db1-6fa9e9c45b89")
+                .body(Body::empty())
+                .expect("GET v1 entity"),
+        ] {
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::GONE);
+            let problem = json(response).await;
+            assert_eq!(problem["code"], "operation_v1_obsolete");
+        }
+        assert_eq!(repository.calls(), 0, "v1 must never reach the repository");
+
+        let saros = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/operations")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(saros.status(), StatusCode::GONE);
+        assert_eq!(json(saros).await["code"], "operation_v1_obsolete");
+    }
+
+    #[tokio::test]
+    async fn signed_v2_cors_does_not_advertise_an_idempotency_key() {
+        let response = signed_operation_stub_app(StubAdmission::Accept)
+            .0
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri(format!("/api/v2/spaces/{}/operations", fixture_space()))
+                    .header(header::ORIGIN, "http://127.0.0.1:5173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .expect("preflight request"),
+            )
+            .await
+            .expect("preflight response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let allowed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .expect("allowed headers")
+            .to_str()
+            .expect("ASCII allowed headers");
+        assert!(allowed.contains("content-type"));
+        assert!(!allowed.contains("idempotency-key"));
+    }
+
+    #[tokio::test]
+    async fn signed_v2_admits_replays_reads_pages_and_materializes() {
+        let (app, _repository) = signed_operation_stub_app(StubAdmission::Accept);
+        let space_id = fixture_space();
+        let entity_id = "019f6f11-a1d7-72b1-8db1-6fa9e9c45b89";
+        let operation = fixture_signed_record(space_id, entity_id, 0x41, 0x21);
+        let operations_uri = format!("/api/v2/spaces/{space_id}/operations");
+        let append_request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri(&operations_uri)
+                .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&operation).expect("operation JSON"),
                 ))
@@ -2863,10 +4329,13 @@ mod tests {
             .expect("response");
         assert_eq!(accepted.status(), StatusCode::CREATED);
         let accepted = json(accepted).await;
-        assert_contract_schema("StoredOperation", &accepted);
+        assert_v2_contract_schema("StoredSignedOperationV2", &accepted);
         assert_eq!(accepted["localSequence"], 1);
-        assert_eq!(accepted["operation"]["operationId"], operation_id);
-        assert!(accepted["operation"]["actorId"].is_string());
+        assert_eq!(
+            accepted["operation"]["operationId"],
+            operation.operation_id.to_string()
+        );
+        assert_eq!(accepted["operation"]["spaceId"], space_id.to_string());
 
         let replayed = app
             .clone()
@@ -2876,11 +4345,27 @@ mod tests {
         assert_eq!(replayed.status(), StatusCode::OK);
         assert_eq!(json(replayed).await, accepted);
 
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v2/spaces/{space_id}/operations/{}",
+                        operation.operation_id
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(json(read).await, accepted);
+
         let changes = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/operations?after=0&limit=1")
+                    .uri(format!("/api/v2/spaces/{space_id}/changes?after=0&limit=1"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -2888,18 +4373,15 @@ mod tests {
             .expect("response");
         assert_eq!(changes.status(), StatusCode::OK);
         let changes = json(changes).await;
-        assert_contract_schema("OperationPage", &changes);
-        assert_eq!(
-            changes["operations"].as_array().expect("operations").len(),
-            1
-        );
+        assert_v2_contract_schema("OperationPageV2", &changes);
+        assert_eq!(changes["operations"][0], accepted);
         assert_eq!(changes["nextAfter"], 1);
         assert_eq!(changes["hasMore"], false);
 
         let entity = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v1/entities/{entity_id}"))
+                    .uri(format!("/api/v2/spaces/{space_id}/entities/{entity_id}"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -2907,7 +4389,8 @@ mod tests {
             .expect("response");
         assert_eq!(entity.status(), StatusCode::OK);
         let entity = json(entity).await;
-        assert_contract_schema("EntityState", &entity);
+        assert_v2_contract_schema("EntityStateV2", &entity);
+        assert_eq!(entity["spaceId"], space_id.to_string());
         assert_eq!(entity["entityId"], entity_id);
         assert_eq!(entity["operationCount"], 1);
         assert_eq!(entity["conflicted"], false);
@@ -2915,79 +4398,340 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_missing_parents_and_stateful_routes_in_saros_profile() {
-        let operation = serde_json::json!({
-            "protocolVersion": 1,
-            "operationId": "019f6f12-2bf9-72b2-ac3f-8659537a2220",
-            "entityId": "019f6f12-38ca-7f80-b4dd-cea4b2fa7f4b",
-            "schema": "record.v1",
-            "causalParents": ["019f6f12-45c1-7f40-a09c-622cf6bdba2b"],
-            "occurredAtUnixMs": 1_784_390_400_000_i64,
-            "body": {
-                "kind": "put",
-                "document": {
-                    "startAtUnixMs": 1_784_390_400_000_i64,
-                    "visibility": "public"
-                }
-            }
-        });
-        let request = || {
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/operations")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("idempotency-key", "missing-parent-0001")
-                .body(Body::from(
-                    serde_json::to_vec(&operation).expect("operation JSON"),
-                ))
-                .expect("request")
-        };
+    async fn signed_v2_scopes_empty_reads_and_not_found_responses_to_the_space() {
+        let (app, _repository) = signed_operation_stub_app(StubAdmission::Accept);
+        let space_id = fixture_space();
+        let missing_operation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v2/spaces/{space_id}/operations/{}",
+                        OperationId::from_bytes([0x73; 32])
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_operation.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(missing_operation).await["code"], "operation_not_found");
 
-        let conflict = test_app().oneshot(request()).await.expect("response");
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-        let conflict = json(conflict).await;
-        assert_contract_schema("Problem", &conflict);
-        assert_eq!(conflict["code"], "operation_conflict");
+        let missing_entity = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v2/spaces/{space_id}/entities/019f6f12-89df-7bd1-a4be-d45790945e12"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_entity.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(missing_entity).await["code"], "entity_not_found");
 
-        let unavailable = saros_only_app().oneshot(request()).await.expect("response");
-        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let unavailable = json(unavailable).await;
-        assert_contract_schema("Problem", &unavailable);
-        assert_eq!(unavailable["code"], "node_not_ready");
+        let changes = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v2/spaces/{space_id}/changes"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(changes.status(), StatusCode::OK);
+        let changes = json(changes).await;
+        assert_v2_contract_schema("OperationPageV2", &changes);
+        assert_eq!(changes["spaceId"], space_id.to_string());
+        assert_eq!(changes["operations"], serde_json::json!([]));
+        assert_eq!(changes["nextAfter"], 0);
+    }
 
-        let spoofed_actor = serde_json::json!({
-            "protocolVersion": 1,
-            "operationId": "019f6f12-6b24-76e3-b720-c51853671102",
-            "entityId": "019f6f12-7553-7c10-991f-cb7d8ff7628f",
-            "actorId": "019f6f12-7f3f-7801-b0cc-34311f8f370f",
-            "schema": "record.v1",
-            "causalParents": [],
-            "occurredAtUnixMs": 1_784_390_400_000_i64,
-            "body": {
-                "kind": "put",
-                "document": {
-                    "startAtUnixMs": 1_784_390_400_000_i64,
-                    "visibility": "public"
-                }
-            }
-        });
-        let spoofed = test_app()
+    #[tokio::test]
+    async fn signed_v2_maps_validation_authorization_and_storage_failures() {
+        let space_id = fixture_space();
+        let entity_id = "019f6f12-38ca-7f80-b4dd-cea4b2fa7f4b";
+        let operation = fixture_signed_record(space_id, entity_id, 0x42, 0x22);
+        let uri = format!("/api/v2/spaces/{space_id}/operations");
+
+        let malformed = signed_operation_stub_app(StubAdmission::Accept)
+            .0
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/operations")
+                    .uri(&uri)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("idempotency-key", "spoofed-actor-0001")
+                    .body(Body::from(r#"{"protocolVersion":2}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let malformed = json(malformed).await;
+        assert_v2_contract_schema("Problem", &malformed);
+        assert_eq!(malformed["code"], "malformed_signed_operation");
+
+        let oversized = signed_operation_stub_app(StubAdmission::Accept)
+            .0
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b' '; MAX_SIGNED_OPERATION_JSON_BYTES + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let oversized = json(oversized).await;
+        assert_v2_contract_schema("Problem", &oversized);
+        assert_eq!(oversized["code"], "signed_operation_too_large");
+
+        let other_space = SpaceId::from_bytes([0x32; 32]);
+        let mismatch = signed_operation_stub_app(StubAdmission::Accept)
+            .0
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v2/spaces/{other_space}/operations"))
+                    .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        serde_json::to_vec(&spoofed_actor).expect("operation JSON"),
+                        serde_json::to_vec(&operation).expect("operation JSON"),
                     ))
                     .expect("request"),
             )
             .await
             .expect("response");
-        assert_eq!(spoofed.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let spoofed = json(spoofed).await;
-        assert_eq!(spoofed["code"], "invalid_operation");
+        assert_eq!(mismatch.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json(mismatch).await["code"], "space_id_mismatch");
+
+        let mut invalid_signature = operation.clone();
+        let final_byte = invalid_signature
+            .cose_sign1
+            .last_mut()
+            .expect("COSE signature byte");
+        *final_byte ^= 0x01;
+        let invalid_signature_response = signed_operation_stub_app(StubAdmission::Accept)
+            .0
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&invalid_signature).expect("operation JSON"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            invalid_signature_response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            json(invalid_signature_response).await["code"],
+            "invalid_signature"
+        );
+
+        let mut invalid_operation_id = operation.clone();
+        invalid_operation_id.operation_id = OperationId::from_bytes([0x77; 32]);
+        let invalid_operation_id = signed_operation_stub_app(StubAdmission::Accept)
+            .0
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&invalid_operation_id).expect("operation JSON"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            invalid_operation_id.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            json(invalid_operation_id).await["code"],
+            "operation_id_mismatch"
+        );
+
+        let mut invalid_actor_id = operation.clone();
+        invalid_actor_id.actor_id = SigningKey::from_seed([0x78; 32]).actor_id();
+        let invalid_actor_id = signed_operation_stub_app(StubAdmission::Accept)
+            .0
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&invalid_actor_id).expect("operation JSON"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(invalid_actor_id.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json(invalid_actor_id).await["code"], "actor_id_mismatch");
+
+        for (admission, status, code) in [
+            (
+                StubAdmission::AuthorizationRequired,
+                StatusCode::FORBIDDEN,
+                "authorization_required",
+            ),
+            (
+                StubAdmission::AuthorizationMissing,
+                StatusCode::NOT_FOUND,
+                "authorization_missing",
+            ),
+            (
+                StubAdmission::AuthorizationRevoked,
+                StatusCode::FORBIDDEN,
+                "authorization_revoked",
+            ),
+            (
+                StubAdmission::CausalParentMissing,
+                StatusCode::CONFLICT,
+                "causal_parent_missing",
+            ),
+            (
+                StubAdmission::CrossSpaceReference,
+                StatusCode::CONFLICT,
+                "cross_space_reference",
+            ),
+            (
+                StubAdmission::AdmissionConflict,
+                StatusCode::CONFLICT,
+                "operation_admission_conflict",
+            ),
+            (
+                StubAdmission::SpaceNotFound,
+                StatusCode::NOT_FOUND,
+                "space_not_found",
+            ),
+            (
+                StubAdmission::StorageUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+        ] {
+            let response = signed_operation_stub_app(admission)
+                .0
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(&uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&operation).expect("operation JSON"),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), status);
+            let problem = json(response).await;
+            assert_v2_contract_schema("Problem", &problem);
+            assert_eq!(problem["code"], code);
+            assert!(
+                !problem["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("stub")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_v2_rejects_invalid_ids_and_is_unavailable_in_saros_profile() {
+        let invalid = signed_operation_stub_app(StubAdmission::Accept)
+            .0
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v2/spaces/space:0000000000000000000000000000000000000000000000000000000000000000/changes")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json(invalid).await["code"], "invalid_identifier");
+
+        for after in ["-1", "9223372036854775808"] {
+            let invalid_cursor = signed_operation_stub_app(StubAdmission::Accept)
+                .0
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v2/spaces/{}/changes?after={after}",
+                            fixture_space()
+                        ))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(invalid_cursor.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(json(invalid_cursor).await["code"], "invalid_identifier");
+        }
+
+        let operation = fixture_signed_record(
+            fixture_space(),
+            "019f6f12-7553-7c10-991f-cb7d8ff7628f",
+            0x43,
+            0x23,
+        );
+        let unavailable = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v2/spaces/{}/operations", fixture_space()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&operation).expect("operation JSON"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let unavailable = json(unavailable).await;
+        assert_v2_contract_schema("Problem", &unavailable);
+        assert_eq!(unavailable["code"], "profile_unavailable");
+
+        for uri in [
+            format!(
+                "/api/v2/spaces/{}/operations/{}",
+                fixture_space(),
+                operation.operation_id
+            ),
+            format!(
+                "/api/v2/spaces/{}/entities/{}",
+                fixture_space(),
+                operation.entity_id
+            ),
+            format!("/api/v2/spaces/{}/changes", fixture_space()),
+        ] {
+            let unavailable = saros_only_app()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(json(unavailable).await["code"], "profile_unavailable");
+        }
     }
 
     #[tokio::test]
@@ -3023,6 +4767,8 @@ mod tests {
         assert_contract_schema("NodeInfo", &node);
         assert_eq!(node["installationId"], SAROS_PROFILE_INSTALLATION_ID);
         assert_eq!(node["profile"], "saros");
+        assert!(node.get("nodeId").is_none());
+        assert!(node.get("spaces").is_none());
         assert!(
             !node["capabilities"]
                 .as_array()
@@ -3605,14 +5351,22 @@ mod tests {
     #[tokio::test]
     async fn rejected_empty_upload_digest_does_not_poison_a_restart() {
         let temporary = TempDir::new().expect("temporary node directory");
+        #[cfg(unix)]
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private temporary node directory");
         let database_path = temporary.path().join("node.sqlite3");
         let content_root = temporary.path().join("content");
         let store = Arc::new(SqliteStore::open(&database_path).expect("database"));
         let blob_store =
             Arc::new(BlobStore::open(&content_root, Arc::clone(&store)).expect("content storage"));
-        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
-            .expect("API state")
-            .with_blob_store(blob_store);
+        let state = ApiState::new(
+            test_application(store),
+            fixture_node_id(),
+            "Test Node",
+            "0.1.0",
+        )
+        .expect("API state")
+        .with_blob_store(blob_store);
         let app = router(state);
         let wrong_content_id = fractonica_content::hash_bytes(b"not empty");
         let metadata = format!(
@@ -3673,9 +5427,14 @@ mod tests {
             .expect("blob")
             .path;
         std::fs::write(blob_path, b"evil").expect("same-length corruption");
-        let state = ApiState::new(test_application(store), "Test Node", "0.1.0")
-            .expect("API state")
-            .with_blob_store(blob_store);
+        let state = ApiState::new(
+            test_application(store),
+            fixture_node_id(),
+            "Test Node",
+            "0.1.0",
+        )
+        .expect("API state")
+        .with_blob_store(blob_store);
         let app = router(state);
 
         let blob = app
@@ -3710,8 +5469,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_openapi() {
-        let response = test_app()
+    async fn serves_both_openapi_contracts_with_v2_as_the_operation_boundary() {
+        let docs = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/docs/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(docs.status(), StatusCode::OK);
+        let selector = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/docs/swagger-initializer.js")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(selector.status(), StatusCode::OK);
+        let selector = selector
+            .into_body()
+            .collect()
+            .await
+            .expect("Swagger initializer body")
+            .to_bytes();
+        let selector = std::str::from_utf8(&selector).expect("Swagger initializer UTF-8");
+        assert!(selector.contains("/api/openapi.json"));
+        assert!(selector.contains("/api/openapi-v1.json"));
+
+        let response = saros_only_app()
             .oneshot(
                 Request::builder()
                     .uri("/api/openapi.json")
@@ -3724,6 +5513,186 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json(response).await;
         assert_eq!(body["info"]["title"], "Fractonica Node API");
-        assert_eq!(body["info"]["version"], "1.0.0");
+        assert_eq!(body["info"]["version"], "2.0.0");
+        assert_eq!(body["security"], serde_json::json!([{}]));
+        let paths: HashSet<&str> = body["paths"]
+            .as_object()
+            .expect("v2 paths")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            paths,
+            HashSet::from([
+                "/api/v2/spaces/{spaceId}/operations",
+                "/api/v2/spaces/{spaceId}/operations/{operationId}",
+                "/api/v2/spaces/{spaceId}/entities/{entityId}",
+                "/api/v2/spaces/{spaceId}/changes",
+                "/api/v2/peer/spaces/{spaceId}/changes",
+                "/api/v2/pairing/invitations",
+                "/api/v2/pairing/invitations/{invitationId}",
+                "/api/v2/pairing/invitations/{invitationId}/confirm",
+                "/api/v2/pairing/handshake",
+            ])
+        );
+        assert_eq!(
+            body.pointer("/paths/~1api~1v2~1pairing~1handshake/post/security"),
+            Some(&serde_json::json!([]))
+        );
+        assert_eq!(
+            body.pointer("/paths/~1api~1v2~1peer~1spaces~1{spaceId}~1changes/post/security"),
+            Some(&serde_json::json!([]))
+        );
+        assert_eq!(
+            body.pointer("/components/schemas/CoseSign1/maxLength"),
+            Some(&serde_json::json!(2_796_544))
+        );
+        assert_eq!(
+            body.pointer("/components/schemas/CanonicalBodyProjection/oneOf")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            body.pointer(
+                "/paths/~1api~1v2~1spaces~1{spaceId}~1operations/post/requestBody/content/application~1json/schema/$ref"
+            ),
+            Some(&serde_json::json!(
+                "#/components/schemas/AdmissibleSignedOperationV2"
+            ))
+        );
+        assert_eq!(
+            body.pointer(
+                "/components/schemas/AdmissibleSignedOperationV2/allOf/1/not/properties/schema/const"
+            ),
+            Some(&serde_json::json!("space.genesis.v1"))
+        );
+        for schema in [
+            "RecordPutBodyV1",
+            "RecordTombstoneBodyV1",
+            "SpaceGenesisBodyV1",
+            "CapabilityGrantBodyV1",
+            "CapabilityRevokeBodyV1",
+            "RecordDocumentV1",
+            "ResourceRefV1",
+            "CapabilityGrantV1",
+            "CapabilityRevocationV1",
+        ] {
+            assert_eq!(
+                body.pointer(&format!(
+                    "/components/schemas/{schema}/additionalProperties"
+                )),
+                Some(&Value::Bool(false)),
+                "{schema} must remain a closed projection"
+            );
+        }
+        let entity_schemas = body
+            .pointer("/components/schemas/EntitySchema/enum")
+            .and_then(Value::as_array)
+            .expect("closed entity schema enum");
+        assert_eq!(entity_schemas.len(), 4);
+        for path in [
+            "/paths/~1api~1v2~1spaces~1{spaceId}~1operations~1{operationId}/get/responses/403",
+            "/paths/~1api~1v2~1spaces~1{spaceId}~1entities~1{entityId}/get/responses/403",
+            "/paths/~1api~1v2~1spaces~1{spaceId}~1changes/get/responses/403",
+        ] {
+            assert!(
+                body.pointer(path).is_none(),
+                "local control-plane reads must not claim peer capability authorization"
+            );
+        }
+        assert_local_openapi_references_resolve(&body, &body);
+
+        let v1 = saros_only_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi-v1.json")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(v1.status(), StatusCode::OK);
+        let v1 = json(v1).await;
+        assert_eq!(v1["info"]["version"], "1.0.0");
+        assert_eq!(v1["security"], serde_json::json!([{}]));
+        assert!(v1["paths"].get("/api/v1/saros/pulse").is_some());
+        for pointer in [
+            "/paths/~1api~1v1~1operations/post/responses",
+            "/paths/~1api~1v1~1operations/get/responses",
+            "/paths/~1api~1v1~1entities~1{entityId}/get/responses",
+        ] {
+            let responses = v1
+                .pointer(pointer)
+                .and_then(Value::as_object)
+                .expect("obsolete v1 response map");
+            assert_eq!(
+                responses.keys().map(String::as_str).collect::<HashSet<_>>(),
+                HashSet::from(["401", "410"])
+            );
+        }
+        assert_local_openapi_references_resolve(&v1, &v1);
+
+        let protected_contract = authenticated_test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi.json")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer 0123456789abcdef0123456789abcdef",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(protected_contract.status(), StatusCode::OK);
+        assert_eq!(
+            json(protected_contract).await["security"],
+            serde_json::json!([{ "bootstrapBearer": [] }])
+        );
+
+        for uri in [
+            "/api/v2/sign",
+            "/api/v2/pairing",
+            "/api/v2/spaces/space:3131313131313131313131313131313131313131313131313131313131313131/sign",
+        ] {
+            let response = saros_only_app()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    fn assert_local_openapi_references_resolve(value: &Value, root: &Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                    let pointer = reference
+                        .strip_prefix('#')
+                        .expect("OpenAPI references must remain local");
+                    assert!(
+                        root.pointer(pointer).is_some(),
+                        "unresolved OpenAPI reference {reference}"
+                    );
+                }
+                for child in object.values() {
+                    assert_local_openapi_references_resolve(child, root);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    assert_local_openapi_references_resolve(child, root);
+                }
+            }
+            _ => {}
+        }
     }
 }

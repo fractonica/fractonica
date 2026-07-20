@@ -94,6 +94,69 @@ test("dry run performs no destination requests", async () => {
   }
 });
 
+test("signed-v2 destination is rejected before source reads or destination writes", async () => {
+  let sourceRequests = 0;
+  let destinationWrites = 0;
+  const destinationRequests: string[] = [];
+  const source = createServer((request, response) => {
+    sourceRequests += 1;
+    sourceHandler(request, response);
+  });
+  const destination = createServer((request, response) => {
+    destinationRequests.push(`${request.method ?? "GET"} ${request.url ?? ""}`);
+    if (request.method !== "GET") destinationWrites += 1;
+    if (request.headers.authorization !== `Bearer ${DESTINATION_TOKEN}`) {
+      response.writeHead(401).end();
+      return;
+    }
+    if (request.method === "GET" && request.url?.startsWith("/api/v1/operations?") === true) {
+      json(response, 410, {
+        type: "about:blank",
+        title: "Gone",
+        status: 410,
+        code: "operation_v1_obsolete",
+        detail: "Unsigned operation protocol v1 is obsolete.",
+      });
+      return;
+    }
+    response.writeHead(500).end();
+  });
+  const directory = await mkdtemp(join(tmpdir(), "fractonica-import-v2-guard-"));
+  try {
+    const sourceUrl = await listen(source);
+    const destinationUrl = await listen(destination);
+    const checkpointPath = join(directory, "checkpoint.json");
+    await assert.rejects(
+      importExeligmos({
+        sourceBaseUrl: sourceUrl,
+        destinationBaseUrl: destinationUrl,
+        sourceToken: SOURCE_TOKEN,
+        destinationToken: DESTINATION_TOKEN,
+        checkpointPath,
+        dryRun: false,
+        verify: true,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.name, "LegacyV1CompatibilityError");
+        assert.match(error.message, /only emits unsigned Fractonica operation protocol v1/);
+        assert.match(error.message, /explicitly retired operation protocol v1 \(HTTP 410\)/);
+        assert.match(error.message, /client-side actor-key\/signing adapter/);
+        return true;
+      },
+    );
+    assert.equal(sourceRequests, 0);
+    assert.equal(destinationWrites, 0);
+    assert.deepEqual(destinationRequests, ["GET /api/v1/operations?after=0&limit=1"]);
+    await assert.rejects(readFile(checkpointPath), { code: "ENOENT" });
+  } finally {
+    source.close();
+    destination.close();
+    await Promise.all([once(source, "close"), once(destination, "close")]);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("source stream is cancelled when its consumer stops before EOF", async () => {
   let cancelled = false;
   const stream = new ReadableStream<Uint8Array>({

@@ -1,0 +1,1124 @@
+openapi: 3.1.0
+info:
+  title: Fractonica Node API
+  version: 2.0.0
+  license:
+    name: AGPL-3.0-or-later
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+  description: >-
+    Version 2 of the loopback Fractonica node API. Stateful operations are
+    immutable, digest-addressed, Ed25519-authored COSE Sign1 objects scoped to
+    one authorization space. JSON is a strict projection of the signed
+    deterministic-CBOR payload; it is never the signed representation. The
+    `saros` profile remains stateless and continues to use the v1 temporal and
+    glyph routes. Existing tus and blob-transfer routes also remain v1 until
+    space capability enforcement is implemented. This contract defines no
+    generic signing endpoint: clients retain their private keys and submit
+    complete signed operations.
+    When this contract is served by a running node, its top-level `security`
+    requirement is rewritten to match that process exactly: bearer-only when
+    `--bootstrap-token` is configured, anonymous loopback otherwise.
+servers:
+  - url: http://127.0.0.1:8789
+    description: Local node
+tags:
+  - name: Operations
+    description: Signed, space-scoped causal operation admission and reads.
+  - name: Pairing
+    description: Loopback device-pairing ceremony. Does not itself grant graph authority.
+  - name: Peer
+    description: Dual-signed, pairing-bound, capability-authorized peer reads.
+security:
+  - bootstrapBearer: []
+paths:
+  /api/v2/spaces/{spaceId}/operations:
+    post:
+      tags: [Operations]
+      summary: Admit a complete signed operation
+      description: >-
+        Validates the JSON projection against the embedded deterministic-CBOR
+        payload, recomputes the operation ID, verifies the exact COSE Sign1
+        profile and actor signature, evaluates every authorization reference,
+        and atomically admits the operation. The path and signed payload
+        `spaceId` values must be identical. Replaying the same valid operation
+        is idempotent without an Idempotency-Key. The server never signs on a
+        client's behalf.
+      operationId: admitSignedOperationV2
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdmissibleSignedOperationV2"
+      responses:
+        "201":
+          description: The signed operation was admitted for the first time.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredSignedOperationV2"
+        "200":
+          description: >-
+            The exact operation digest was already admitted; the original
+            node-local sequence and received time are returned unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredSignedOperationV2"
+        "400":
+          $ref: "#/components/responses/MalformedSignedOperation"
+        "413":
+          $ref: "#/components/responses/SignedOperationTooLarge"
+        "401":
+          $ref: "#/components/responses/TransportUnauthorized"
+        "403":
+          $ref: "#/components/responses/OperationAuthorizationDenied"
+        "404":
+          $ref: "#/components/responses/SpaceOrDependencyNotFound"
+        "409":
+          $ref: "#/components/responses/OperationAdmissionConflict"
+        "422":
+          $ref: "#/components/responses/UnverifiableSignedOperation"
+        "503":
+          $ref: "#/components/responses/ProfileUnavailable"
+  /api/v2/spaces/{spaceId}/operations/{operationId}:
+    get:
+      tags: [Operations]
+      summary: Read one admitted signed operation
+      description: >-
+        Local control-plane read, optionally protected by the node-wide
+        loopback bearer token. It does not evaluate `readSpace`; authenticated
+        peer/session reads are reserved for a later protocol.
+      operationId: getSignedOperationV2
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "200":
+          description: The admitted operation and node-local receipt metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredSignedOperationV2"
+        "401":
+          $ref: "#/components/responses/TransportUnauthorized"
+        "404":
+          $ref: "#/components/responses/SpaceOrOperationNotFound"
+        "422":
+          $ref: "#/components/responses/InvalidPathIdentifier"
+        "503":
+          $ref: "#/components/responses/ProfileUnavailable"
+  /api/v2/spaces/{spaceId}/entities/{entityId}:
+    get:
+      tags: [Operations]
+      summary: Resolve the current causal heads of one entity in one space
+      description: >-
+        Concurrent heads are retained rather than resolved by arrival order.
+        An entity identifier in another space is never consulted. This is a
+        local control-plane read, optionally protected by the node-wide
+        loopback bearer token; it is not peer capability authorization.
+      operationId: getSpaceEntityV2
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+        - $ref: "#/components/parameters/EntityId"
+      responses:
+        "200":
+          description: Current admitted heads in the selected space.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityStateV2"
+        "401":
+          $ref: "#/components/responses/TransportUnauthorized"
+        "404":
+          $ref: "#/components/responses/SpaceOrEntityNotFound"
+        "422":
+          $ref: "#/components/responses/InvalidPathIdentifier"
+        "503":
+          $ref: "#/components/responses/ProfileUnavailable"
+  /api/v2/spaces/{spaceId}/changes:
+    get:
+      tags: [Operations]
+      summary: Read an incremental page of admitted space operations
+      description: >-
+        Returns operations in ascending node-local sequence strictly after the
+        cursor. A cursor is meaningful only for this node and space; it is not
+        signed, causal, temporal, portable, or globally comparable. This is a
+        local control-plane read, optionally protected by the node-wide
+        loopback bearer token. Paired actors use the separate peer endpoint,
+        which evaluates `readSpace` and consumes a durable replay nonce.
+      operationId: listSpaceChangesV2
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+        - $ref: "#/components/parameters/ChangesAfter"
+        - $ref: "#/components/parameters/ChangesLimit"
+      responses:
+        "200":
+          description: A bounded incremental page of admitted operations.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationPageV2"
+        "401":
+          $ref: "#/components/responses/TransportUnauthorized"
+        "404":
+          $ref: "#/components/responses/SpaceNotFound"
+        "422":
+          $ref: "#/components/responses/InvalidPathIdentifier"
+        "503":
+          $ref: "#/components/responses/ProfileUnavailable"
+  /api/v2/peer/spaces/{spaceId}/changes:
+    post:
+      tags: [Peer]
+      summary: Read an incremental page using a paired actor proof
+      operationId: listPairedSpaceChangesV2
+      security: []
+      description: >-
+        Verifies node and actor signatures over one canonical request bound to
+        the completed pairing, exact space, exact grant, cursor, limit,
+        receiving-time window, and 128-bit nonce. The node re-evaluates the
+        referenced `readSpace` capability and consumes the nonce in the same
+        immediate SQLite transaction as the page read. Authentication does not
+        provide confidentiality; this route remains loopback-only until an
+        encrypted LAN transport is introduced.
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PeerReadChangesRequestV1" }
+      responses:
+        "200":
+          description: A bounded page read under the paired actor's current grant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OperationPageV2" }
+        "400": { $ref: "#/components/responses/MalformedPeerRequest" }
+        "403": { $ref: "#/components/responses/PeerUnauthorized" }
+        "413": { $ref: "#/components/responses/PeerRequestTooLarge" }
+        "503": { $ref: "#/components/responses/ProfileUnavailable" }
+  /api/v2/pairing/invitations:
+    post:
+      tags: [Pairing]
+      summary: Create a short-lived pairing invitation
+      operationId: createPairingInvitationV1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairingCreateRequest"
+      responses:
+        "201":
+          description: Protected secret and non-secret lifecycle state are durable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingInvitationResponse"
+        "400": { $ref: "#/components/responses/MalformedPairing" }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "413": { $ref: "#/components/responses/PairingTooLarge" }
+        "503": { $ref: "#/components/responses/ProfileUnavailable" }
+  /api/v2/pairing/invitations/{invitationId}:
+    parameters:
+      - $ref: "#/components/parameters/InvitationId"
+    get:
+      tags: [Pairing]
+      summary: Inspect non-secret pairing state
+      operationId: getPairingInvitationV1
+      responses:
+        "200":
+          description: Current durable lifecycle projection.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairingSession" }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/PairingNotFound" }
+        "422": { $ref: "#/components/responses/InvalidPathIdentifier" }
+    delete:
+      tags: [Pairing]
+      summary: Cancel an unconfirmed pairing invitation
+      operationId: cancelPairingInvitationV1
+      responses:
+        "200":
+          description: Invitation is durably cancelled before secret deletion.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairingSession" }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/PairingNotFound" }
+        "410": { $ref: "#/components/responses/PairingUnavailable" }
+  /api/v2/pairing/handshake:
+    post:
+      tags: [Pairing]
+      summary: Consume an invitation with the first Noise handshake frame
+      operationId: claimPairingInvitationV1
+      security: []
+      description: >-
+        This route intentionally bypasses the bootstrap bearer. Authentication
+        is provided by the signed QR descriptor, one-time PSK, pinned Noise
+        responder key, and dual-signed joiner claim. All public failures are
+        deliberately indistinguishable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PairingHandshakeRequest" }
+      responses:
+        "200":
+          description: The invitation was atomically claimed by this transcript.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairingHandshakeResponse" }
+        "400": { $ref: "#/components/responses/MalformedPairing" }
+        "410": { $ref: "#/components/responses/PairingUnavailable" }
+        "413": { $ref: "#/components/responses/PairingTooLarge" }
+        "503": { $ref: "#/components/responses/ProfileUnavailable" }
+  /api/v2/pairing/invitations/{invitationId}/confirm:
+    post:
+      tags: [Pairing]
+      summary: Confirm the transcript and issue the requested capability
+      operationId: confirmPairingInvitationV1
+      parameters:
+        - $ref: "#/components/parameters/InvitationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PairingConfirmRequest" }
+      responses:
+        "200":
+          description: The controller-signed capability grant was admitted and the session completed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairingSession" }
+        "400": { $ref: "#/components/responses/MalformedPairing" }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "403": { $ref: "#/components/responses/PairingConfirmationMismatch" }
+        "404": { $ref: "#/components/responses/PairingNotFound" }
+        "410": { $ref: "#/components/responses/PairingUnavailable" }
+components:
+  securitySchemes:
+    bootstrapBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-bootstrap-token
+      description: >-
+        Loopback transport gate configured by the node operator. The served
+        contract requires it exactly when the running process has a bootstrap
+        token. It is not an actor identity, capability grant, operation
+        signature, or replacement for signed-operation authorization.
+  parameters:
+    SpaceId:
+      name: spaceId
+      in: path
+      required: true
+      description: Canonical authorization and replication-space identifier.
+      schema:
+        $ref: "#/components/schemas/SpaceId"
+    OperationId:
+      name: operationId
+      in: path
+      required: true
+      description: Canonical SHA-256 identity of an unsigned operation payload.
+      schema:
+        $ref: "#/components/schemas/OperationId"
+    EntityId:
+      name: entityId
+      in: path
+      required: true
+      description: Canonical UUID of a logical entity within the selected space.
+      schema:
+        $ref: "#/components/schemas/EntityId"
+    ChangesAfter:
+      name: after
+      in: query
+      required: false
+      description: Exclusive node-local cursor. Defaults to zero.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        maximum: 9223372036854775807
+        default: 0
+    ChangesLimit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of operations returned in one page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 100
+    InvitationId:
+      name: invitationId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{32}$'
+  responses:
+    TransportUnauthorized:
+      description: Code is `transport_unauthorized`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    MalformedPeerRequest:
+      description: Code is `malformed_peer_request`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PeerRequestTooLarge:
+      description: Code is `peer_request_too_large`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PeerUnauthorized:
+      description: >-
+        Code is `peer_unauthorized`. Signature, pairing, capability, expiry,
+        revocation, mismatch, and replay failures are intentionally collapsed.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    MalformedPairing:
+      description: Code is `malformed_pairing_message`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PairingTooLarge:
+      description: Code is `pairing_message_too_large`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PairingNotFound:
+      description: Code is `pairing_not_found`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PairingUnavailable:
+      description: Code is `pairing_unavailable`; no lifecycle detail is disclosed.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    PairingConfirmationMismatch:
+      description: Code is `pairing_confirmation_mismatch`.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    MalformedSignedOperation:
+      description: >-
+        Code is `malformed_signed_operation`, `noncanonical_operation`,
+        `signed_projection_mismatch`, or `unsupported_protocol_version`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    SignedOperationTooLarge:
+      description: Code is `signed_operation_too_large`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    UnverifiableSignedOperation:
+      description: >-
+        Code is `invalid_identifier`, `operation_id_mismatch`, `invalid_signature`,
+        `actor_id_mismatch`, `space_id_mismatch`, or
+        `invalid_operation_semantics`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    OperationAuthorizationDenied:
+      description: >-
+        Code is `authorization_required`, `authorization_denied`, or
+        `authorization_revoked`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    SpaceNotFound:
+      description: Code is `space_not_found`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    SpaceOrDependencyNotFound:
+      description: Code is `space_not_found` or `authorization_missing`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    SpaceOrOperationNotFound:
+      description: Code is `space_not_found` or `operation_not_found`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    SpaceOrEntityNotFound:
+      description: Code is `space_not_found` or `entity_not_found`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    OperationAdmissionConflict:
+      description: >-
+        Code is `cross_space_reference`, `causal_parent_missing`,
+        `conflicting_space_genesis`, or `operation_admission_conflict`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    InvalidPathIdentifier:
+      description: Code is `invalid_identifier`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ProfileUnavailable:
+      description: Code is `profile_unavailable` or `storage_unavailable`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    SpaceId:
+      type: string
+      pattern: '^space:(?!0{64}$)[0-9a-f]{64}$'
+      description: >-
+        Canonical textual encoding of 32 unpredictable bytes. Knowledge of a
+        space ID grants no authority.
+    ActorId:
+      type: string
+      pattern: '^actor:ed25519:[0-9a-f]{64}$'
+      description: Self-certifying Ed25519 actor identity and public key.
+    NodeId:
+      type: string
+      pattern: '^node:ed25519:[0-9a-f]{64}$'
+      description: Self-certifying Ed25519 node transport identity and public key.
+    OperationId:
+      type: string
+      pattern: '^sha-256:[0-9a-f]{64}$'
+      description: SHA-256 of the exact deterministic unsigned payload bytes.
+    EntityId:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      not:
+        const: 00000000-0000-0000-0000-000000000000
+      description: Canonical non-nil UUID of one logical entity.
+    EntitySchema:
+      type: string
+      enum:
+        - record.v1
+        - space.genesis.v1
+        - capability.grant.v1
+        - capability.revoke.v1
+      pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
+      description: Exact bounded schema codec known to this protocol version.
+    OperationNonce:
+      type: string
+      pattern: '^[0-9a-f]{32}$'
+      description: >-
+        Lowercase hexadecimal projection of the signed 16-byte nonce. It
+        distinguishes intentional equal-content operations and is not secret.
+    CoseSign1:
+      type: string
+      minLength: 1
+      maxLength: 2796544
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: >-
+        Unpadded base64url encoding of the complete tagged COSE Sign1 bytes.
+        The protected header is exactly `{1: -8}`, the unprotected header is
+        empty, payload is embedded deterministic operation CBOR, signature is
+        64-byte Ed25519, and external AAD is empty.
+    SignedOperationV2:
+      type: object
+      additionalProperties: false
+      required:
+        - protocolVersion
+        - operationId
+        - spaceId
+        - actorId
+        - entityId
+        - schema
+        - causalParents
+        - authorization
+        - occurredAtUnixMs
+        - nonce
+        - body
+        - coseSign1
+      properties:
+        protocolVersion:
+          type: integer
+          const: 2
+        operationId:
+          $ref: "#/components/schemas/OperationId"
+        spaceId:
+          $ref: "#/components/schemas/SpaceId"
+        actorId:
+          $ref: "#/components/schemas/ActorId"
+        entityId:
+          $ref: "#/components/schemas/EntityId"
+        schema:
+          $ref: "#/components/schemas/EntitySchema"
+        causalParents:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: >-
+            Unique operation IDs sorted strictly by raw digest bytes. Ordering
+            is canonical and has no priority or chronology meaning.
+          items:
+            $ref: "#/components/schemas/OperationId"
+        authorization:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: >-
+            Grant-operation IDs sorted strictly by raw digest bytes. Empty is
+            valid only for the locally anchored `space.genesis.v1` bootstrap.
+          items:
+            $ref: "#/components/schemas/OperationId"
+        occurredAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Signer-claimed event time; it does not order or authorize admission.
+        nonce:
+          $ref: "#/components/schemas/OperationNonce"
+        body:
+          $ref: "#/components/schemas/CanonicalBodyProjection"
+        coseSign1:
+          $ref: "#/components/schemas/CoseSign1"
+      description: >-
+        Complete JSON projection of one signed operation. Every field other
+        than `operationId` and `coseSign1` is projected from the embedded
+        unsigned payload. The server rejects any projection/payload mismatch.
+    AdmissibleSignedOperationV2:
+      allOf:
+        - $ref: "#/components/schemas/SignedOperationV2"
+        - not:
+            required: [schema]
+            properties:
+              schema:
+                const: space.genesis.v1
+      description: >-
+        Signed operation accepted at the HTTP admission boundary. Space
+        genesis is excluded because a node creates and anchors it only during
+        its crash-safe local installation bootstrap; it cannot be introduced
+        by a remote or control-plane POST.
+    CanonicalBodyProjection:
+      oneOf:
+        - $ref: "#/components/schemas/RecordPutBodyV1"
+        - $ref: "#/components/schemas/RecordTombstoneBodyV1"
+        - $ref: "#/components/schemas/SpaceGenesisBodyV1"
+        - $ref: "#/components/schemas/CapabilityGrantBodyV1"
+        - $ref: "#/components/schemas/CapabilityRevokeBodyV1"
+      description: >-
+        Exact schema-defined JSON projection of canonical CBOR. The selected
+        body variant must agree with the outer `schema`; the server also
+        enforces canonical set ordering, metadata nesting and encoded-size
+        bounds which JSON Schema cannot fully express.
+    RecordPutBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind, document]
+      properties:
+        kind:
+          type: string
+          const: put
+        document:
+          $ref: "#/components/schemas/RecordDocumentV1"
+    RecordTombstoneBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          const: tombstone
+    SpaceGenesisBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind, controller]
+      properties:
+        kind:
+          type: string
+          const: spaceGenesis
+        controller:
+          $ref: "#/components/schemas/ActorId"
+    CapabilityGrantBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind, grant]
+      properties:
+        kind:
+          type: string
+          const: capabilityGrant
+        grant:
+          $ref: "#/components/schemas/CapabilityGrantV1"
+    CapabilityRevokeBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind, revocation]
+      properties:
+        kind:
+          type: string
+          const: capabilityRevoke
+        revocation:
+          $ref: "#/components/schemas/CapabilityRevocationV1"
+    RecordDocumentV1:
+      type: object
+      additionalProperties: false
+      required: [startAtUnixMs, visibility, metadata]
+      properties:
+        startAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+        endAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Must be greater than or equal to `startAtUnixMs`.
+        visibility:
+          $ref: "#/components/schemas/RecordVisibility"
+          description: >-
+            Fixed by the entity's initial put. Revisions must retain it and a
+            tombstone is authorized against the inherited visibility.
+        emoji:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Non-control Unicode label.
+        text:
+          type: string
+          maxLength: 262144
+        metadata:
+          type: object
+          maxProperties: 128
+          propertyNames:
+            $ref: "#/components/schemas/MetadataKeyV1"
+          additionalProperties:
+            $ref: "#/components/schemas/MetadataValueV1"
+          description: >-
+            JSON metadata bounded at runtime to 64 KiB encoded, 16 levels,
+            256 entries per nested container, 128-character non-control keys,
+            and 16,384-character strings. The depth and aggregate encoded-size
+            limits are additionally enforced after JSON decoding.
+        resources:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: Content IDs must also be unique across the array.
+          items:
+            $ref: "#/components/schemas/ResourceRefV1"
+    MetadataKeyV1:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[^\u0000-\u001f\u007f]+$'
+    MetadataValueV1:
+      oneOf:
+        - type: 'null'
+        - type: boolean
+        - type: number
+        - type: string
+          maxLength: 16384
+        - type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/MetadataValueV1"
+        - type: object
+          maxProperties: 256
+          propertyNames:
+            $ref: "#/components/schemas/MetadataKeyV1"
+          additionalProperties:
+            $ref: "#/components/schemas/MetadataValueV1"
+    RecordVisibility:
+      type: string
+      enum: [public, private]
+    ResourceRefV1:
+      type: object
+      additionalProperties: false
+      required: [contentId, byteLength, mediaType, role]
+      properties:
+        contentId:
+          type: string
+          pattern: '^sha-256:[0-9a-f]{64}$'
+        byteLength:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1099511627776
+        mediaType:
+          type: string
+          minLength: 3
+          maxLength: 127
+          pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+/[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
+        role:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z0-9._-]+$'
+        originalName:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Path-free, non-control label other than `.` or `..`.
+    CapabilityGrantV1:
+      type: object
+      additionalProperties: false
+      required:
+        - subject
+        - actions
+        - schemas
+        - recordVisibilities
+        - contentRoles
+        - delegationDepth
+        - label
+      properties:
+        subject:
+          $ref: "#/components/schemas/ActorId"
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 5
+          uniqueItems: true
+          description: Values must use canonical enum order.
+          items:
+            $ref: "#/components/schemas/CapabilityAction"
+        schemas:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          description: Values must be strictly sorted by wire schema name.
+          items:
+            $ref: "#/components/schemas/EntitySchema"
+        recordVisibilities:
+          type: array
+          maxItems: 2
+          uniqueItems: true
+          description: Values must use canonical enum order.
+          items:
+            $ref: "#/components/schemas/RecordVisibility"
+        contentRoles:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: Values must be strictly sorted.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[a-z0-9._-]+$'
+        maxResourceByteLength:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1099511627776
+        notBeforeUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+        expiresAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Must be greater than `notBeforeUnixMs` when both exist.
+        delegationDepth:
+          type: integer
+          minimum: 0
+          maximum: 16
+        label:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Non-control capability label.
+    CapabilityAction:
+      type: string
+      enum:
+        - appendOperation
+        - issueCapability
+        - revokeCapability
+        - readSpace
+        - writeContent
+    CapabilityRevocationV1:
+      type: object
+      additionalProperties: false
+      required: [grantId, reason]
+      properties:
+        grantId:
+          $ref: "#/components/schemas/OperationId"
+        reason:
+          $ref: "#/components/schemas/CapabilityRevocationReason"
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Non-control revocation detail.
+    CapabilityRevocationReason:
+      type: string
+      enum:
+        - keyCompromised
+        - deviceLost
+        - keyRotated
+        - scopeChanged
+        - administrative
+    StoredSignedOperationV2:
+      type: object
+      additionalProperties: false
+      required:
+        - localSequence
+        - receivedAtUnixMs
+        - operation
+      properties:
+        localSequence:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Node-local cursor excluded from the signed payload.
+        receivedAtUnixMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Node-local receipt time excluded from the signed payload.
+        operation:
+          $ref: "#/components/schemas/SignedOperationV2"
+    OperationPageV2:
+      type: object
+      additionalProperties: false
+      required: [spaceId, operations, nextAfter, hasMore]
+      properties:
+        spaceId:
+          $ref: "#/components/schemas/SpaceId"
+        operations:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/StoredSignedOperationV2"
+        nextAfter:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+        hasMore:
+          type: boolean
+    EntityStateV2:
+      type: object
+      additionalProperties: false
+      required:
+        - spaceId
+        - entityId
+        - schema
+        - operationCount
+        - conflicted
+        - heads
+      properties:
+        spaceId:
+          $ref: "#/components/schemas/SpaceId"
+        entityId:
+          $ref: "#/components/schemas/EntityId"
+        schema:
+          $ref: "#/components/schemas/EntitySchema"
+        operationCount:
+          type: integer
+          format: int64
+          minimum: 1
+        conflicted:
+          type: boolean
+        heads:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/StoredSignedOperationV2"
+    ProblemCode:
+      type: string
+      enum:
+        - malformed_signed_operation
+        - noncanonical_operation
+        - signed_projection_mismatch
+        - unsupported_protocol_version
+        - operation_id_mismatch
+        - invalid_signature
+        - actor_id_mismatch
+        - space_id_mismatch
+        - invalid_operation_semantics
+        - authorization_required
+        - authorization_missing
+        - authorization_denied
+        - authorization_revoked
+        - space_not_found
+        - operation_not_found
+        - entity_not_found
+        - causal_parent_missing
+        - cross_space_reference
+        - conflicting_space_genesis
+        - operation_admission_conflict
+        - invalid_identifier
+        - profile_unavailable
+        - storage_unavailable
+        - transport_unauthorized
+        - signed_operation_too_large
+        - malformed_pairing_message
+        - pairing_message_too_large
+        - pairing_not_found
+        - pairing_unavailable
+        - pairing_confirmation_mismatch
+        - malformed_peer_request
+        - peer_request_too_large
+        - peer_unauthorized
+    PeerReadChangesRequestV1:
+      type: object
+      additionalProperties: false
+      required:
+        - protocolVersion
+        - sessionId
+        - nodeId
+        - actorId
+        - grantOperationId
+        - after
+        - limit
+        - issuedAtUnixMs
+        - expiresAtUnixMs
+        - nonce
+        - nodeSignature
+        - actorSignature
+      properties:
+        protocolVersion: { type: integer, const: 1 }
+        sessionId: { type: string, pattern: '^[0-9a-f]{32}$' }
+        nodeId: { $ref: "#/components/schemas/NodeId" }
+        actorId: { $ref: "#/components/schemas/ActorId" }
+        grantOperationId: { $ref: "#/components/schemas/OperationId" }
+        after:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+        limit: { type: integer, minimum: 1, maximum: 200 }
+        issuedAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        expiresAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        nonce: { type: string, pattern: '^[0-9a-f]{32}$' }
+        nodeSignature: { type: string, pattern: '^[0-9a-f]{128}$' }
+        actorSignature: { type: string, pattern: '^[0-9a-f]{128}$' }
+    PairingCapabilityTemplate:
+      type: object
+      additionalProperties: false
+      required: [actions, schemas, recordVisibilities, contentRoles, delegationDepth, label]
+      properties:
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 5
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/CapabilityAction" }
+        schemas:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/EntitySchema" }
+        recordVisibilities:
+          type: array
+          maxItems: 2
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/RecordVisibility" }
+        contentRoles:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9._-]+$' }
+        maxResourceByteLength:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1099511627776
+        notBeforeUnixMs: { type: integer, format: int64, minimum: 0 }
+        expiresAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        delegationDepth: { type: integer, minimum: 0, maximum: 16 }
+        label: { type: string, minLength: 1, maxLength: 128 }
+    PairingCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [spaceId, expiresInMs, capability]
+      properties:
+        spaceId: { $ref: "#/components/schemas/SpaceId" }
+        expiresInMs: { type: integer, format: int64, minimum: 1000, maximum: 600000 }
+        endpointHints:
+          type: array
+          maxItems: 3
+          items: { type: string, minLength: 1, maxLength: 256 }
+        capability: { $ref: "#/components/schemas/PairingCapabilityTemplate" }
+    PairingConfirmRequest:
+      type: object
+      additionalProperties: false
+      required: [confirmationOctal]
+      properties:
+        confirmationOctal: { type: string, pattern: '^[0-7]{10}$' }
+    PairingHandshakeRequest:
+      type: object
+      additionalProperties: false
+      required: [invitationId, frameBase64url]
+      properties:
+        invitationId: { type: string, pattern: '^[0-9a-f]{32}$' }
+        frameBase64url: { type: string, minLength: 1, maxLength: 10924, pattern: '^[A-Za-z0-9_-]+$' }
+    PairingSession:
+      type: object
+      additionalProperties: false
+      required: [invitationId, spaceId, state, expiresAtUnixMs]
+      properties:
+        invitationId: { type: string, pattern: '^[0-9a-f]{32}$' }
+        spaceId: { $ref: "#/components/schemas/SpaceId" }
+        state:
+          type: string
+          enum: [created, claimed, confirmed, completed, cancelled, expired]
+        expiresAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        joinerNodeId: { $ref: "#/components/schemas/NodeId" }
+        subjectActorId: { $ref: "#/components/schemas/ActorId" }
+        confirmationOctal: { type: string, pattern: '^[0-7]{10}$' }
+        grantOperationId: { $ref: "#/components/schemas/OperationId" }
+    PairingInvitationResponse:
+      type: object
+      additionalProperties: false
+      required: [qr, session]
+      properties:
+        qr: { type: string, pattern: '^fractonica-pairing:v1:[A-Za-z0-9_-]+$' }
+        session: { $ref: "#/components/schemas/PairingSession" }
+    PairingHandshakeResponse:
+      type: object
+      additionalProperties: false
+      required: [responseFrameBase64url, receiptFrameBase64url, session]
+      properties:
+        responseFrameBase64url: { type: string, minLength: 1, maxLength: 10924, pattern: '^[A-Za-z0-9_-]+$' }
+        receiptFrameBase64url: { type: string, minLength: 1, maxLength: 10924, pattern: '^[A-Za-z0-9_-]+$' }
+        session: { $ref: "#/components/schemas/PairingSession" }
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: Stable problem type URI.
+        title:
+          type: string
+          minLength: 1
+          maxLength: 256
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        code:
+          $ref: "#/components/schemas/ProblemCode"
+        detail:
+          type: string
+          maxLength: 2048
+        instance:
+          type: string
+          format: uri-reference

@@ -1,25 +1,28 @@
 //! Fractonica application use cases and persistence ports.
 //!
-//! HTTP, SQLite, clocks, and replication transports are adapters around this
-//! boundary. The application service validates canonical operations before a
-//! repository is allowed to make them durable.
+//! HTTP, SQLite, clocks, key custody, and replication are adapters around this
+//! boundary. The application accepts already signed protocol-v2 operations;
+//! it never injects a local actor or signs on a remote caller's behalf.
+
+pub mod authorization;
 
 use std::{fmt, sync::Arc};
 
+use authorization::AuthorizationError;
 use fractonica_content::{ContentDescriptor, ContentId};
 use fractonica_core::InstallationMetadata;
 use fractonica_data_model::{
-    ActorId, DataModelError, EntityId, EntitySchema, OperationBody, OperationEnvelope, OperationId,
+    ActorId, CapabilityAction, DataModelError, EntityId, EntitySchema, OperationBody,
+    OperationEnvelope, OperationId, RecordVisibility, SpaceId,
 };
+use fractonica_peer::{PeerProofError, PeerReadChangesProof};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const MIN_IDEMPOTENCY_KEY_LENGTH: usize = 8;
-pub const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 200;
 pub const DEFAULT_CHANGE_LIMIT: usize = 100;
 pub const MAX_CHANGE_LIMIT: usize = 200;
+pub const MAX_SPACE_DISPLAY_NAME_CHARS: usize = 128;
 /// Hard bound that keeps entity materialization and all-head merges finite.
 pub const MAX_ENTITY_HEADS: usize = 64;
 pub const MAX_AVAILABILITY_CONTENT_IDS: usize = 256;
@@ -167,45 +170,83 @@ pub struct RepositoryReadiness {
     pub schema_version: u32,
 }
 
+/// One admitted operation plus node-local receipt metadata.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredOperation {
     pub local_sequence: u64,
+    pub received_at_unix_ms: i64,
     pub operation: OperationEnvelope,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IdempotencyContext {
-    pub key: String,
-    /// Hash of the validated semantic request used only for retry equality.
-    /// It is not a content ID and is not a cryptographic signing format.
-    pub semantic_request_hash: [u8; 32],
-}
-
+/// Request to admit an already signed operation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmitOperationRequest {
     pub operation: OperationEnvelope,
-    pub idempotency: IdempotencyContext,
+    /// Trusted receiving-node clock sampled before entering the repository.
+    pub received_at_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitOperationResult {
     pub operation: StoredOperation,
+    /// True when this exact operation digest was already admitted.
+    pub replayed: bool,
+}
+
+/// Node-local information about one explicitly trusted space.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceDescriptor {
+    pub space_id: SpaceId,
+    pub display_name: String,
+    pub genesis_operation_id: OperationId,
+    pub initial_grant_operation_id: OperationId,
+    pub controller_actor_id: ActorId,
+    pub local_writer_actor_id: ActorId,
+    pub created_at_unix_ms: i64,
+}
+
+/// Explicit in-process request for the only trusted genesis admission path.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TrustedSpaceBootstrapRequest {
+    pub display_name: String,
+    pub genesis: OperationEnvelope,
+    pub initial_grant: OperationEnvelope,
+    pub received_at_unix_ms: i64,
+}
+
+/// Atomic bootstrap result. An exact retry may be reported as replayed.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedSpaceBootstrapResult {
+    pub space: SpaceDescriptor,
+    pub genesis: StoredOperation,
+    pub initial_grant: StoredOperation,
     pub replayed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationChangePage {
+    pub space_id: SpaceId,
     pub operations: Vec<StoredOperation>,
     pub next_after: u64,
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct PeerReadChangesRequest {
+    pub proof: PeerReadChangesProof,
+    pub received_at_unix_ms: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntityState {
+    pub space_id: SpaceId,
     pub entity_id: EntityId,
     pub schema: EntitySchema,
     pub operation_count: u64,
@@ -219,25 +260,28 @@ impl EntityState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SubmitOperationCommand {
-    pub protocol_version: u16,
-    pub operation_id: OperationId,
-    pub entity_id: EntityId,
-    pub schema: EntitySchema,
-    pub causal_parents: Vec<OperationId>,
-    pub occurred_at_unix_ms: i64,
-    pub body: OperationBody,
-}
-
 #[derive(Debug, Error)]
 pub enum RepositoryError {
+    #[error("space {0} is not trusted on this node")]
+    SpaceNotFound(SpaceId),
+
     #[error("causal parent {0} does not exist on this node")]
     MissingParent(OperationId),
 
+    #[error("causal parent {0} belongs to another space")]
+    CrossSpaceParent(OperationId),
+
     #[error("causal parent {parent} belongs to another entity or schema")]
     ParentMismatch { parent: OperationId },
+
+    #[error("authorization operation {0} does not exist on this node")]
+    MissingAuthorization(OperationId),
+
+    #[error("authorization operation {0} belongs to another space")]
+    CrossSpaceAuthorization(OperationId),
+
+    #[error(transparent)]
+    Authorization(#[from] AuthorizationError),
 
     #[error("entity {0} already exists; a new operation must name a causal parent")]
     EntityAlreadyExists(EntityId),
@@ -248,34 +292,83 @@ pub enum RepositoryError {
     #[error("operation ID {0} is already bound to different canonical content")]
     OperationConflict(OperationId),
 
-    #[error("the idempotency key is already bound to another semantic request")]
-    IdempotencyConflict,
+    #[error("space {0} already has a different trusted genesis or initial grant")]
+    GenesisConflict(SpaceId),
+
+    #[error("the local unsigned operation store requires explicit version 2 migration")]
+    LegacyMigrationRequired,
 
     #[error("stored operation data is corrupt: {0}")]
     Corrupt(String),
 
     #[error("operation repository is unavailable: {0}")]
     Unavailable(String),
+
+    #[error("peer request is not authorized")]
+    PeerUnauthorized,
+
+    #[error("peer request nonce was already consumed")]
+    PeerReplay,
 }
 
 /// Persistence port implemented by the node's sole-writer storage adapter.
+///
+/// `bootstrap_trusted_space` and `submit_operation` are transaction boundaries.
+/// A submit implementation validates topology, resolves all parent and
+/// authorization references in the selected space, invokes
+/// [`authorization::authorize_operation`] against that same transaction view.
+/// For record revisions or tombstones it uses
+/// [`authorization::authorize_operation_for_record_visibility`] with the
+/// immutable visibility derived from admitted entity state. It then updates
+/// heads and inserts atomically. The operation digest is the only protocol
+/// idempotency identity.
 pub trait OperationRepository: Send + Sync {
     fn readiness(&self) -> Result<RepositoryReadiness, RepositoryError>;
 
     fn installation(&self) -> Result<InstallationMetadata, RepositoryError>;
 
+    fn space(&self, space_id: SpaceId) -> Result<Option<SpaceDescriptor>, RepositoryError>;
+
+    fn spaces(&self) -> Result<Vec<SpaceDescriptor>, RepositoryError>;
+
+    fn bootstrap_trusted_space(
+        &self,
+        request: &TrustedSpaceBootstrapRequest,
+    ) -> Result<TrustedSpaceBootstrapResult, RepositoryError>;
+
     fn submit_operation(
         &self,
+        space_id: SpaceId,
         request: &SubmitOperationRequest,
     ) -> Result<SubmitOperationResult, RepositoryError>;
 
-    fn entity_state(&self, entity_id: EntityId) -> Result<Option<EntityState>, RepositoryError>;
+    fn operation(
+        &self,
+        space_id: SpaceId,
+        operation_id: OperationId,
+    ) -> Result<Option<StoredOperation>, RepositoryError>;
+
+    fn entity_state(
+        &self,
+        space_id: SpaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<EntityState>, RepositoryError>;
 
     fn changes_after(
         &self,
+        space_id: SpaceId,
         after_local_sequence: u64,
         limit: usize,
     ) -> Result<OperationChangePage, RepositoryError>;
+
+    fn peer_changes(
+        &self,
+        _request: &PeerReadChangesRequest,
+    ) -> Result<OperationChangePage, RepositoryError> {
+        Err(RepositoryError::Unavailable(
+            "peer reads are not implemented by this repository".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -283,16 +376,26 @@ pub enum ApplicationError {
     #[error(transparent)]
     InvalidOperation(#[from] DataModelError),
 
-    #[error(
-        "idempotency key must be {MIN_IDEMPOTENCY_KEY_LENGTH}-{MAX_IDEMPOTENCY_KEY_LENGTH} visible ASCII characters"
-    )]
-    InvalidIdempotencyKey,
+    #[error("operation belongs to space {operation}, but request path selected {path}")]
+    SpacePathMismatch { path: SpaceId, operation: SpaceId },
+
+    #[error("space genesis is admitted only through explicit trusted bootstrap")]
+    GenericGenesisForbidden,
+
+    #[error("trusted bootstrap is invalid: {0}")]
+    InvalidTrustedBootstrap(&'static str),
+
+    #[error("node receipt time must be nonnegative, got {0}")]
+    InvalidReceivedAt(i64),
 
     #[error("change limit must be between 1 and {MAX_CHANGE_LIMIT}")]
     InvalidChangeLimit,
 
-    #[error("failed to encode the semantic operation: {0}")]
-    SemanticEncoding(#[from] serde_json::Error),
+    #[error("peer proof is invalid: {0}")]
+    InvalidPeerProof(#[from] PeerProofError),
+
+    #[error("peer proof belongs to space {proof}, but request path selected {path}")]
+    PeerSpacePathMismatch { path: SpaceId, proof: SpaceId },
 
     #[error(transparent)]
     Repository(#[from] RepositoryError),
@@ -301,24 +404,15 @@ pub enum ApplicationError {
 #[derive(Clone)]
 pub struct ApplicationService {
     repository: Arc<dyn OperationRepository>,
-    local_actor_id: ActorId,
 }
 
 impl ApplicationService {
     #[must_use]
-    pub fn new<R>(repository: Arc<R>, local_actor_id: ActorId) -> Self
+    pub fn new<R>(repository: Arc<R>) -> Self
     where
         R: OperationRepository + 'static,
     {
-        Self {
-            repository,
-            local_actor_id,
-        }
-    }
-
-    #[must_use]
-    pub const fn local_actor_id(&self) -> ActorId {
-        self.local_actor_id
+        Self { repository }
     }
 
     pub fn readiness(&self) -> Result<RepositoryReadiness, ApplicationError> {
@@ -329,46 +423,74 @@ impl ApplicationService {
         self.repository.installation().map_err(Into::into)
     }
 
+    pub fn space(&self, space_id: SpaceId) -> Result<Option<SpaceDescriptor>, ApplicationError> {
+        self.repository.space(space_id).map_err(Into::into)
+    }
+
+    pub fn spaces(&self) -> Result<Vec<SpaceDescriptor>, ApplicationError> {
+        self.repository.spaces().map_err(Into::into)
+    }
+
+    /// Explicit local trust-anchor creation. This must not be exposed as a
+    /// generic remote operation-ingestion route.
+    pub fn bootstrap_trusted_space(
+        &self,
+        request: TrustedSpaceBootstrapRequest,
+    ) -> Result<TrustedSpaceBootstrapResult, ApplicationError> {
+        validate_received_at(request.received_at_unix_ms)?;
+        request.genesis.verify()?;
+        request.initial_grant.verify()?;
+        validate_trusted_bootstrap(&request)?;
+        self.repository
+            .bootstrap_trusted_space(&request)
+            .map_err(Into::into)
+    }
+
+    /// Admits an externally signed operation. The service never signs it.
     pub fn submit_operation(
         &self,
-        command: SubmitOperationCommand,
-        idempotency_key: &str,
+        path_space_id: SpaceId,
+        request: SubmitOperationRequest,
     ) -> Result<SubmitOperationResult, ApplicationError> {
-        validate_idempotency_key(idempotency_key)?;
-        let operation = OperationEnvelope {
-            protocol_version: command.protocol_version,
-            operation_id: command.operation_id,
-            entity_id: command.entity_id,
-            schema: command.schema,
-            actor_id: self.local_actor_id,
-            causal_parents: command.causal_parents,
-            occurred_at_unix_ms: command.occurred_at_unix_ms,
-            body: command.body,
-        };
-        operation.validate()?;
-
-        let encoded = serde_json::to_vec(&operation)?;
-        let semantic_request_hash: [u8; 32] = Sha256::digest(encoded).into();
+        validate_received_at(request.received_at_unix_ms)?;
+        request.operation.verify()?;
+        if request.operation.space_id != path_space_id {
+            return Err(ApplicationError::SpacePathMismatch {
+                path: path_space_id,
+                operation: request.operation.space_id,
+            });
+        }
+        if request.operation.schema == EntitySchema::SpaceGenesisV1 {
+            return Err(ApplicationError::GenericGenesisForbidden);
+        }
         self.repository
-            .submit_operation(&SubmitOperationRequest {
-                operation,
-                idempotency: IdempotencyContext {
-                    key: idempotency_key.to_owned(),
-                    semantic_request_hash,
-                },
-            })
+            .submit_operation(path_space_id, &request)
+            .map_err(Into::into)
+    }
+
+    pub fn operation(
+        &self,
+        space_id: SpaceId,
+        operation_id: OperationId,
+    ) -> Result<Option<StoredOperation>, ApplicationError> {
+        self.repository
+            .operation(space_id, operation_id)
             .map_err(Into::into)
     }
 
     pub fn entity_state(
         &self,
+        space_id: SpaceId,
         entity_id: EntityId,
     ) -> Result<Option<EntityState>, ApplicationError> {
-        self.repository.entity_state(entity_id).map_err(Into::into)
+        self.repository
+            .entity_state(space_id, entity_id)
+            .map_err(Into::into)
     }
 
     pub fn changes_after(
         &self,
+        space_id: SpaceId,
         after_local_sequence: u64,
         limit: usize,
     ) -> Result<OperationChangePage, ApplicationError> {
@@ -376,38 +498,127 @@ impl ApplicationService {
             return Err(ApplicationError::InvalidChangeLimit);
         }
         self.repository
-            .changes_after(after_local_sequence, limit)
+            .changes_after(space_id, after_local_sequence, limit)
             .map_err(Into::into)
+    }
+
+    pub fn peer_changes(
+        &self,
+        path_space_id: SpaceId,
+        request: PeerReadChangesRequest,
+    ) -> Result<OperationChangePage, ApplicationError> {
+        validate_received_at(request.received_at_unix_ms)?;
+        request.proof.verify(request.received_at_unix_ms)?;
+        if request.proof.space_id != path_space_id {
+            return Err(ApplicationError::PeerSpacePathMismatch {
+                path: path_space_id,
+                proof: request.proof.space_id,
+            });
+        }
+        self.repository.peer_changes(&request).map_err(Into::into)
     }
 }
 
-fn validate_idempotency_key(value: &str) -> Result<(), ApplicationError> {
-    let length = value.len();
-    if !(MIN_IDEMPOTENCY_KEY_LENGTH..=MAX_IDEMPOTENCY_KEY_LENGTH).contains(&length)
-        || !value.is_ascii()
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+fn validate_received_at(received_at_unix_ms: i64) -> Result<(), ApplicationError> {
+    if received_at_unix_ms < 0 {
+        Err(ApplicationError::InvalidReceivedAt(received_at_unix_ms))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_trusted_bootstrap(
+    request: &TrustedSpaceBootstrapRequest,
+) -> Result<(), ApplicationError> {
+    let display_name_length = request.display_name.chars().count();
+    if display_name_length == 0
+        || display_name_length > MAX_SPACE_DISPLAY_NAME_CHARS
+        || request.display_name.chars().any(char::is_control)
     {
-        return Err(ApplicationError::InvalidIdempotencyKey);
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "display name must be a bounded non-control label",
+        ));
+    }
+    if request.genesis.schema != EntitySchema::SpaceGenesisV1 {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "genesis operation has the wrong schema",
+        ));
+    }
+    if request.initial_grant.schema != EntitySchema::CapabilityGrantV1 {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "initial grant operation has the wrong schema",
+        ));
+    }
+    if request.genesis.space_id != request.initial_grant.space_id {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "genesis and initial grant belong to different spaces",
+        ));
+    }
+    let OperationBody::SpaceGenesis { controller } = &request.genesis.body else {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "genesis body has the wrong kind",
+        ));
+    };
+    let OperationBody::CapabilityGrant { grant } = &request.initial_grant.body else {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "initial grant body has the wrong kind",
+        ));
+    };
+    if request.genesis.actor_id != *controller {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "genesis must be signed by the controller named in its body",
+        ));
+    }
+    if !request.genesis.causal_parents.is_empty() || !request.genesis.authorization.is_empty() {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "genesis cannot have causal parents or authorization references",
+        ));
+    }
+    if request.initial_grant.actor_id != *controller {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "initial grant must be signed by the genesis controller",
+        ));
+    }
+    if grant.subject == *controller {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "initial grant must target a distinct local writer actor",
+        ));
+    }
+    if grant.actions.as_slice()
+        != [
+            CapabilityAction::AppendOperation,
+            CapabilityAction::ReadSpace,
+        ]
+        || grant.schemas.as_slice() != [EntitySchema::RecordV1]
+        || grant.record_visibilities.as_slice()
+            != [RecordVisibility::Public, RecordVisibility::Private]
+        || !grant.content_roles.is_empty()
+        || grant.max_resource_byte_length.is_some()
+        || grant.not_before_unix_ms.is_some()
+        || grant.expires_at_unix_ms.is_some()
+        || grant.delegation_depth != 0
+    {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "initial writer grant must have the exact bounded local-writer scope",
+        ));
+    }
+    if request.initial_grant.authorization.as_slice() != [request.genesis.operation_id] {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "initial grant must rely only on the genesis operation",
+        ));
+    }
+    if !request.initial_grant.causal_parents.is_empty() {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "initial grant must start its entity history",
+        ));
+    }
+    if request.genesis.entity_id == request.initial_grant.entity_id {
+        return Err(ApplicationError::InvalidTrustedBootstrap(
+            "genesis and initial grant must use distinct entity IDs",
+        ));
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_idempotency_keys_and_change_limits_before_storage() {
-        assert!(matches!(
-            validate_idempotency_key("short"),
-            Err(ApplicationError::InvalidIdempotencyKey)
-        ));
-        assert!(matches!(
-            validate_idempotency_key("contains space"),
-            Err(ApplicationError::InvalidIdempotencyKey)
-        ));
-        assert!(validate_idempotency_key("record-create-001").is_ok());
-    }
-}
+mod tests;

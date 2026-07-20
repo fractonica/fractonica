@@ -1,110 +1,165 @@
-# Operation log
+# Signed causal operation log
 
-Fractonica's first storage kernel is an append-only causal operation log. A
-node stores immutable operations, assigns each one a local sequence cursor, and
-derives the current heads of each entity. It does not use arrival time as a
-conflict resolver and it does not physically delete history.
+Fractonica's authoritative storage kernel is an append-only Merkle operation
+graph. An operation has deterministic unsigned bytes, a SHA-256 identity, an
+Ed25519 author signature, direct parent digests, and an explicit space
+authorization chain. Mutable entity heads, search indexes, summaries, and
+other query structures are projections of accepted operations.
 
-The canonical HTTP contract is
-[`contracts/openapi/v1.yaml`](../contracts/openapi/v1.yaml). These routes are
-available only from the stateful `node` profile. The stateless `saros` profile
-returns `503` because it deliberately opens no storage.
+This document describes the implemented operation protocol version 2. The
+cryptographic contract is fixed by
+[ADR 0009](adr/0009-signed-operation-trust-kernel.md), while space admission is
+fixed by [ADR 0010](adr/0010-space-capabilities-and-pairing.md). The full node
+enforces capability admission for signed operation writes. Pairing,
+actor-authenticated remote reads, and non-loopback networking are not enabled;
+the obsolete unsigned version 1 operation routes are rejected rather than
+treated as authority.
 
 ## Operation envelope
 
-Clients submit `POST /api/v1/operations` with a required `Idempotency-Key`
-header and this strict envelope:
+The authoritative wire value is deterministic CBOR inside an exact COSE Sign1
+Ed25519 envelope. JSON is a human/API projection and is never signed. The
+unsigned payload commits to:
 
-- `protocolVersion`: currently exactly `1`;
-- `operationId`: canonical client-generated UUID;
-- `entityId`: canonical UUID of the affected entity;
-- `schema`: currently exactly `record.v1`;
-- `causalParents`: zero through 64 unique operation UUIDs;
-- `occurredAtUnixMs`: nonnegative client-declared event time;
-- `body`: either `put` with a document or `tombstone`.
+- the domain `org.fractonica.operation.v2` and protocol version `2`;
+- a random 256-bit `SpaceId`;
+- the author's Ed25519-public-key `ActorId`;
+- the affected entity UUID and versioned schema;
+- zero through 64 direct causal-parent operation digests;
+- zero through 64 capability-operation digests used for authorization;
+- a nonnegative actor-claimed Unix-millisecond occurrence time;
+- a 16-byte uniqueness nonce; and
+- the complete schema-defined deterministic-CBOR body.
 
-The request never contains `actorId`. The node resolves it from the trusted
-local application context and includes that UUID in the stored operation. In
-this first loopback-only slice the actor is the persistent installation ID; it
-is not yet a paired or cryptographic identity. A client therefore cannot
-attribute an operation to another actor by changing JSON.
+Parent and authorization digest arrays are encoded unique and strictly
+ascending by raw digest. That order is canonical, not temporal or semantic.
+The operation ID is `sha-256:<lowercase hex digest>` of the exact unsigned
+payload bytes; the signature is not part of the ID.
 
-`record.v1` documents require `startAtUnixMs` and `visibility`. They may include
-`endAtUnixMs`, `emoji`, `text`, and a JSON `metadata` object. When an end time is
-present, it must not precede the start time. Visibility is either `public` or
-`private`.
+An operation is admitted only after its deterministic encoding, derived ID,
+actor signature, schema body, parent graph, and capability chain all validate.
+A valid signature proves authorship but does not grant permission. An
+unavailable resource blob does not invalidate an otherwise admissible
+operation.
 
-## Idempotent append
+`occurredAtUnixMs` is a signed claim, not a trusted clock. It determines
+application time where the schema permits, but never causal ordering,
+revocation order, or operation priority.
 
-An accepted append returns `201` and the stored operation. Retrying the same
-canonical request with the same actor-scoped `Idempotency-Key` returns `200`
-and the original stored operation, including its original `localSequence`.
+## Actors, installations, and spaces
 
-Reusing an idempotency key for different content returns `409`. Malformed JSON
-or a domain-invalid document returns `422`. A causal reference that cannot be
-admitted to the log also returns `409`.
+`ActorId` contains the exact Ed25519 public key that verifies the operation.
+Actors may represent user-controlled devices, automation agents, sensors, or a
+node performing an explicitly granted system action. A node transport key has
+a distinct `NodeId`; it does not silently authorize operations.
 
-The stored shape is:
+`InstallationId` identifies one local database lifecycle. It is not included in
+the signed payload and has no authorship or authorization meaning. `SpaceId`
+scopes an operation and its capabilities; knowing a space ID is not authority.
 
-```json
-{
-  "localSequence": 1,
-  "operation": {
-    "protocolVersion": 1,
-    "operationId": "b7e117dd-d840-493b-9da6-6cbcd24d056e",
-    "entityId": "89891765-c47f-4422-8e0f-d254940490d1",
-    "actorId": "ea1f84d1-ed2a-4bda-8773-687108fecb5d",
-    "schema": "record.v1",
-    "causalParents": [],
-    "occurredAtUnixMs": 1784390400000,
-    "body": {
-      "kind": "put",
-      "document": {
-        "startAtUnixMs": 1784390400000,
-        "visibility": "private",
-        "emoji": "🌀",
-        "metadata": {}
-      }
-    }
-  }
-}
-```
+## Idempotent admission
+
+Submitting the same signed COSE bytes more than once is idempotent because the
+derived `OperationId` is unchanged. A receiver that already stores that exact
+ID and payload returns the stored operation rather than adding another graph
+node. The same ID paired with different payload bytes is a digest-integrity
+failure, not an update.
+
+HTTP idempotency keys, request IDs, upload IDs, receipt times, and retry counts
+remain local transport or storage metadata. They are neither signed operation
+fields nor replication identities. A new nonce creates a genuinely different
+operation even when the remaining logical fields are equal.
 
 ## Causal heads and merging
 
-An operation with no parents starts an entity history. Every causal parent must
-already exist, belong to the same canonical entity and schema, and differ from
-the new operation ID.
+Every named causal parent must already be available for admission, belong to
+the same space, entity, and schema history permitted by that schema, and differ
+from the new operation. Missing ancestors cause rejection or bounded
+quarantine; a node never invents a parent.
 
-When an operation is accepted, the named parents stop being heads and the new
-operation becomes a head. Existing heads that were not named remain current.
-This is how the node retains concurrent edits without inventing a winner from
-network arrival order.
+When an operation is accepted, its direct parents stop being entity heads and
+the new operation becomes a head. Existing heads not named by the operation
+remain current. Consequently:
 
-`GET /api/v1/entities/{entityId}` returns every current head as a full stored
-operation. `conflicted` is true when more than one head remains. A merge is a
-`put` whose `causalParents` includes every current head observed by the merging
-actor; after it is accepted, that put is the sole head unless another concurrent
-branch arrived.
+- an edit naming the current head advances one branch;
+- offline edits naming the same earlier head remain concurrent;
+- a merge naming every observed current head collapses those branches; and
+- a tombstone is a durable signed head that can conflict with another branch.
 
-A tombstone is a durable operation, not a SQL delete. It remains in history and
-can remain an entity head. Replication, compaction, and backup must preserve it.
-Any later operation that intentionally follows a tombstone names it as a causal
-parent.
+Arrival order, claimed occurrence time, actor identity, signature bytes, and
+digest lexical order do not pick a winner. An application resolves a conflict
+by authoring a new operation whose causal parents name every head it has
+considered.
 
-## Change cursor
+A parent digest proves the exact operation the signer named. It does not prove
+the signer knew every branch or that a peer has disclosed the complete graph.
 
-`GET /api/v1/operations?after=0&limit=100` returns stored operations in ascending
-`localSequence` order together with `nextAfter` and `hasMore`. `after` is an
-exclusive cursor and `limit` is capped at 200.
+## Capability admission
 
-`localSequence` is assigned by one node solely for incremental reads. It is not
-an operation ID, event timestamp, causal clock, replication identity, or global
-ordering primitive. A cursor from one node has no meaning on another node.
+Except for the explicitly trusted `space.genesis.v1` bootstrap, every operation
+names the immutable capability grants on which its actor relies. The receiver
+verifies the complete issuer chain, subject, action, schema, restrictions,
+delegation depth, and accepted revocations before applying the operation.
 
-## Identifier rule
+Authorization references are conjunctive, not alternatives whose permissions
+are unioned. Every top-level reference must independently authorize the
+requested operation, and every reference in each issuer chain must authorize
+the delegated grant. The effective authority is therefore the intersection of
+all referenced restrictions: adding a reference can only preserve or narrow
+authority, never broaden it.
 
-Canonical operation and entity identifiers are UUIDs throughout storage,
-causality, and replication. A short human-facing identifier may be introduced
-as an alias, but it never replaces the canonical UUID and must not appear in a
-causal parent list.
+Grant windows use the receiver's durable admission-clock high-water mark, not
+`occurredAtUnixMs` and not a wall-clock sample in isolation. Before capability
+evaluation, the node commits `max(previousHighWater, sampledUnixMs)` and uses
+that value for inclusive `notBeforeUnixMs` and exclusive `expiresAtUnixMs`
+checks. The high-water mark advances even when a structurally valid request is
+later denied, so moving the system clock backwards cannot reopen a window the
+node has already observed as closed. This is local admission policy, not proof
+of global time or a distributed revocation order.
+
+A cryptographically valid operation with missing or insufficient capability
+state may be retained only as untrusted quarantine. It MUST NOT become a head,
+alter a projection, authorize a content upload, or issue another grant.
+Revocation is append-only and does not invalidate historical signatures. The
+future replication protocol must specify operations concurrent with a
+revocation before distributed authorization is enabled.
+
+## Record bodies and resources
+
+`record.v1` bodies remain complete document puts or tombstones. A record put
+defines its temporal fields, visibility, optional emoji/text/metadata, and up
+to 64 ordered immutable resource references. Resource bytes are addressed
+separately by content digest; their local availability is not part of operation
+validity. See [content-addressed storage](content-storage.md).
+
+The first put fixes one record entity's visibility domain. Every later put must
+retain that visibility, and a tombstone is authorized against the inherited
+entity visibility even though its body carries no document. This prevents a
+public-only writer from rewriting or erasing a private record by naming one of
+its heads. Missing or contradictory materialized visibility is storage
+corruption and fails closed.
+
+Each application schema must define one bounded semantic-to-CBOR body mapping.
+Serializing a JSON object, retaining map insertion order, or signing HTTP bytes
+is not a canonical mapping.
+
+## Node-local change cursor
+
+A stateful node assigns each admitted operation a monotonically increasing
+local sequence for incremental reads. The cursor orders that node's admission
+events only. It is not signed, not replicated, and is not an operation ID,
+causal clock, event time, capability order, or global sequence. A cursor from
+one node has no meaning on another node. The HTTP cursor is a nonnegative
+signed 64-bit integer, matching the SQLite sequence domain.
+
+## Version 1 migration
+
+Unsigned UUID-based version 1 operations are not valid version 2 operations.
+Version 2 receivers reject them and do not provide dual interpretation. A
+migration re-encodes logical documents into deterministic CBOR, assigns a
+space and actor, maps UUID parent references to operation digests, and signs
+the resulting operations. Legacy UUIDs may be retained as application
+provenance, but a new signature does not prove the legacy author's identity.
+
+This intentional pre-release break prevents installation UUID attribution and
+unsigned causal identifiers from becoming a permanent compatibility burden.
