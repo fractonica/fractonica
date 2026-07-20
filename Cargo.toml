@@ -4,6 +4,10 @@ members = [
     "crates/fractonica-api",
     "crates/fractonica-application",
     "crates/fractonica-blob-store",
+    "crates/fractonica-client",
+    "crates/fractonica-client-sqlite",
+    "crates/fractonica-client-content",
+    "crates/fractonica-sync",
     "crates/fractonica-content",
     "crates/fractonica-core",
     "crates/fractonica-data-model",
@@ -36,6 +40,10 @@ directories = "6.0.0"
 fractonica-api = { path = "crates/fractonica-api" }
 fractonica-application = { path = "crates/fractonica-application" }
 fractonica-blob-store = { path = "crates/fractonica-blob-store" }
+fractonica-client = { path = "crates/fractonica-client" }
+fractonica-client-sqlite = { path = "crates/fractonica-client-sqlite" }
+fractonica-client-content = { path = "crates/fractonica-client-content" }
+fractonica-sync = { path = "crates/fractonica-sync" }
 fractonica-content = { path = "crates/fractonica-content" }
 fractonica-core = { path = "crates/fractonica-core" }
 fractonica-data-model = { path = "crates/fractonica-data-model" }
@@ -50,11 +58,13 @@ fractonica-temporal-core = { path = "crates/fractonica-temporal-core" }
 fractonica-trust = { path = "crates/fractonica-trust" }
 fs4 = "1.1.0"
 getrandom = "0.4.3"
+async-trait = "0.1.89"
 http-body-util = "0.1.4"
 httpdate = "1.0.3"
 libc = "0.2.186"
 libm = "0.2.16"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -69,7 +79,7 @@ tauri-build = "2.6.3"
 tauri-plugin-shell = "2.3.5"
 thiserror = "2.0.18"
 time = { version = "0.3.53", features = ["formatting", "parsing"] }
-tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 tower = "0.5.3"
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }

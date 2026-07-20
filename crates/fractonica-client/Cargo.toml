@@ -1,0 +1,15 @@
+[package]
+name = "fractonica-client"
+description = "Platform-neutral offline authoring core for Fractonica clients and agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fractonica-data-model.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+

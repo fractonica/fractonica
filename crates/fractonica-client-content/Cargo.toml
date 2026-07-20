@@ -1,0 +1,18 @@
+[package]
+name = "fractonica-client-content"
+description = "Crash-safe local content-addressed media storage for Fractonica clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fractonica-content.workspace = true
+libc.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

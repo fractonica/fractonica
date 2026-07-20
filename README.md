@@ -32,6 +32,16 @@ The initial vertical slice provides:
 - dual-signed, pairing-bound `readSpace` change pages with durable replay
   protection;
 - a thin Tauri desktop shell that owns the node process lifecycle;
+- a platform-neutral Rust client authoring core with explicit native key
+  custody and causal create, edit, delete, and profile operations;
+- an independent client SQLite store with atomic offline commits, rebuildable
+  heads/projections, and crash-recoverable per-peer delivery leases;
+- a supervised native sync worker with bounded signed delivery, durable
+  incremental cursors, capped retry backoff, cancellation, and compact status;
+- a private crash-safe client blob store plus bounded availability, tus upload,
+  and resumable range-download transport primitives;
+- a strict TypeScript node client for projection paging, statistics, immutable
+  operation reads, and delivery of already-signed operations;
 - protected Unix filesystem identity bootstrap with an explicit installation
   binding that persists the exact signed default-space bootstrap before the
   database is allowed to commit it;
@@ -73,6 +83,10 @@ names every current head, tombstones remain in immutable history, and
 `localSequence` is only a cursor for the node that assigned it. See
 [operation-log semantics](docs/operation-log.md) and the
 [signed HTTP API](docs/signed-operation-api.md).
+
+Native clients must commit authored operations to their local store before
+network delivery. The node is never the success boundary for a local write.
+See the [client core and local-first write path](docs/client-core.md).
 
 Record resources are ordered references to immutable IDs of the form
 `sha-256:<64 lowercase hex>`. Missing local blobs do not invalidate operations;

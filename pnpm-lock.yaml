@@ -69,6 +69,15 @@ importers:
         specifier: ^2.11.4
         version: 2.11.4
 
+  packages/client:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(jsdom@26.1.0)
+
   packages/glyph-core:
     devDependencies:
       typescript:
