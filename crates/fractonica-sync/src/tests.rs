@@ -88,6 +88,39 @@ fn record(
     .unwrap()
 }
 
+fn record_with_resource(
+    signing_key: &SigningKey,
+    id: EntityId,
+    authorization: OperationId,
+    nonce: u8,
+    resource: ResourceRef,
+) -> OperationEnvelope {
+    OperationEnvelope::sign(
+        space(),
+        id,
+        EntitySchema::Record,
+        Vec::new(),
+        vec![authorization],
+        10 + i64::from(nonce),
+        OperationNonce::from_bytes([nonce; 16]),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public {
+                document: RecordDocument {
+                    start_at_unix_ms: 100,
+                    end_at_unix_ms: None,
+                    emoji: Some("📎".into()),
+                    text: Some("content sync".into()),
+                    metadata: BTreeMap::new(),
+                    resources: vec![resource],
+                    references: Vec::new(),
+                },
+            },
+        },
+        signing_key,
+    )
+    .unwrap()
+}
+
 #[derive(Clone)]
 struct FixedClock(Arc<AtomicI64>);
 
@@ -140,6 +173,54 @@ impl SyncTransport for FakeTransport {
     }
 }
 
+#[async_trait]
+impl ContentSyncTransport for FakeTransport {
+    async fn content_availability(
+        &self,
+        _peer: &PeerConfig,
+        _content_ids: &[ContentId],
+    ) -> Result<BlobAvailability, TransportError> {
+        panic!("operation-only fixture unexpectedly received content work")
+    }
+
+    async fn create_content_upload(
+        &self,
+        _peer: &PeerConfig,
+        _resource: &ResourceRef,
+    ) -> Result<UploadChunkResult, TransportError> {
+        panic!("operation-only fixture unexpectedly created an upload")
+    }
+
+    async fn content_upload_status(
+        &self,
+        _peer: &PeerConfig,
+        _upload_url: Url,
+    ) -> Result<UploadChunkResult, TransportError> {
+        panic!("operation-only fixture unexpectedly resumed an upload")
+    }
+
+    async fn upload_content_chunk(
+        &self,
+        _peer: &PeerConfig,
+        _content: &ClientContentStore,
+        _descriptor: ContentDescriptor,
+        _upload: RemoteUpload,
+        _maximum_chunk_bytes: usize,
+    ) -> Result<UploadChunkResult, TransportError> {
+        panic!("operation-only fixture unexpectedly uploaded content")
+    }
+
+    async fn download_content_chunk(
+        &self,
+        _peer: &PeerConfig,
+        _content: &ClientContentStore,
+        _descriptor: ContentDescriptor,
+        _maximum_chunk_bytes: usize,
+    ) -> Result<fractonica_client_content::AppendResult, TransportError> {
+        panic!("operation-only fixture unexpectedly downloaded content")
+    }
+}
+
 fn config() -> SyncConfig {
     SyncConfig {
         push_batch_size: 10,
@@ -151,6 +232,9 @@ fn config() -> SyncConfig {
         request_lifetime: Duration::from_secs(1),
         initial_backoff: Duration::from_secs(1),
         maximum_backoff: Duration::from_secs(8),
+        resource_scan_size: 10,
+        resource_transfers_per_cycle: 10,
+        content_chunk_bytes: 4,
     }
 }
 
@@ -181,8 +265,10 @@ async fn worker_retries_then_acknowledges_without_blocking_the_async_executor() 
         .push_back(Err(TransportError::retryable("offline")));
     transport.pushes.lock().unwrap().push_back(Ok(()));
     let clock = FixedClock::new(10);
+    let content_directory = tempfile::tempdir().unwrap();
+    let content = ClientContentStore::open(content_directory.path()).unwrap();
     let (worker, _) =
-        SyncWorker::with_clock(store.clone(), transport, clock.clone(), config()).unwrap();
+        SyncWorker::with_clock(store.clone(), content, transport, clock.clone(), config()).unwrap();
 
     assert_eq!(worker.run_cycle().await.unwrap().retried, 1);
     assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 1);
@@ -217,7 +303,10 @@ async fn worker_commits_a_complete_pull_before_advancing_the_durable_cursor() {
         has_more: false,
     }));
     let clock = FixedClock::new(10);
-    let (worker, _) = SyncWorker::with_clock(store.clone(), transport, clock, config()).unwrap();
+    let content_directory = tempfile::tempdir().unwrap();
+    let content = ClientContentStore::open(content_directory.path()).unwrap();
+    let (worker, _) =
+        SyncWorker::with_clock(store.clone(), content, transport, clock, config()).unwrap();
 
     assert_eq!(worker.run_cycle().await.unwrap().pulled, 1);
     assert_eq!(
@@ -333,8 +422,11 @@ async fn http_transport_uses_signed_admission_and_paired_read_contracts() {
 #[tokio::test]
 async fn supervisor_publishes_stopped_status_when_cancelled() {
     let store = ClientSqliteStore::open_in_memory().unwrap();
+    let content_directory = tempfile::tempdir().unwrap();
+    let content = ClientContentStore::open(content_directory.path()).unwrap();
     let (worker, mut status) = SyncWorker::with_clock(
         store,
+        content,
         FakeTransport::default(),
         FixedClock::new(1),
         config(),
@@ -361,6 +453,24 @@ async fn content_availability_handler(State(state): State<ContentHttpState>) -> 
         "available": [state.descriptor],
         "missing": []
     }))
+}
+
+async fn upload_availability_handler(State(state): State<ContentHttpState>) -> Json<Value> {
+    if state.uploaded.lock().unwrap().len() as u64 == state.descriptor.byte_length {
+        Json(serde_json::json!({
+            "available": [state.descriptor],
+            "missing": []
+        }))
+    } else {
+        Json(serde_json::json!({
+            "available": [],
+            "missing": [state.descriptor.content_id]
+        }))
+    }
+}
+
+async fn accept_operation() -> AxumStatus {
+    AxumStatus::CREATED
 }
 
 async fn create_content_upload_handler() -> Response {
@@ -524,5 +634,256 @@ async fn content_transport_checks_availability_and_moves_bounded_resumable_chunk
         download_store.read_range(descriptor, 0, 100).unwrap(),
         *bytes
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn supervisor_discovers_and_completes_a_bounded_resumable_upload() {
+    let bytes = Arc::new(b"abcdefghij".to_vec());
+    let descriptor = ContentDescriptor {
+        content_id: hash_bytes(&bytes),
+        byte_length: bytes.len() as u64,
+    };
+    let state = ContentHttpState {
+        uploaded: Arc::new(Mutex::new(Vec::new())),
+        source: bytes.clone(),
+        descriptor,
+    };
+    let observed_upload = state.uploaded.clone();
+    let app = Router::new()
+        .route("/api/spaces/{space}/operations", post(accept_operation))
+        .route("/api/blobs/availability", post(upload_availability_handler))
+        .route("/api/uploads", post(create_content_upload_handler))
+        .route(
+            "/api/uploads/test-upload",
+            head(content_upload_status_handler).patch(append_content_handler),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let store = ClientSqliteStore::open_in_memory().unwrap();
+    let signing_key = key(40);
+    let genesis = genesis(&signing_key);
+    store.commit_remote(&genesis, 1).unwrap();
+    let peer = peer(format!("http://{address}"), 41);
+    store.upsert_peer(&peer).unwrap();
+    let resource = ResourceRef {
+        content_id: descriptor.content_id,
+        byte_length: descriptor.byte_length,
+        media_type: "application/octet-stream".into(),
+        role: "attachment".into(),
+        original_name: Some("fixture.bin".into()),
+    };
+    let operation =
+        record_with_resource(&signing_key, entity(40), genesis.operation_id, 40, resource);
+    store.commit_local(&operation, 2).unwrap();
+    let content_directory = tempfile::tempdir().unwrap();
+    let content = ClientContentStore::open(content_directory.path()).unwrap();
+    content
+        .import(descriptor, std::io::Cursor::new(bytes.as_slice()))
+        .unwrap();
+    let transport = NodeHttpTransport::new(
+        SoftwarePeerProofCustody::new(key(42), signing_key),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let (worker, _) = SyncWorker::with_clock(
+        store.clone(),
+        content,
+        transport,
+        FixedClock::new(10),
+        config(),
+    )
+    .unwrap();
+
+    let first = worker.run_cycle().await.unwrap();
+    assert_eq!(first.resource_upload_bytes, 4);
+    assert_eq!(first.resource_uploads_completed, 0);
+    let second = worker.run_cycle().await.unwrap();
+    assert_eq!(second.resource_upload_bytes, 4);
+    let third = worker.run_cycle().await.unwrap();
+    assert_eq!(third.resource_upload_bytes, 2);
+    assert_eq!(third.resource_uploads_completed, 1);
+    assert_eq!(*observed_upload.lock().unwrap(), *bytes);
+    assert_eq!(
+        store.sync_counts(10).unwrap().resources.completed_transfers,
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn supervisor_resumes_a_peer_download_after_store_and_worker_reopen() {
+    let bytes = Arc::new(b"abcdefghij".to_vec());
+    let descriptor = ContentDescriptor {
+        content_id: hash_bytes(&bytes),
+        byte_length: bytes.len() as u64,
+    };
+    let state = ContentHttpState {
+        uploaded: Arc::new(Mutex::new(Vec::new())),
+        source: bytes.clone(),
+        descriptor,
+    };
+    let app = Router::new()
+        .route(
+            "/api/blobs/availability",
+            post(content_availability_handler),
+        )
+        .route("/api/blobs/{content}", get(download_content_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("client.sqlite3");
+    let content_path = directory.path().join("content");
+    let signing_key = key(50);
+    let genesis = genesis(&signing_key);
+    let source_peer = peer(format!("http://{address}"), 51);
+    let resource = ResourceRef {
+        content_id: descriptor.content_id,
+        byte_length: descriptor.byte_length,
+        media_type: "application/octet-stream".into(),
+        role: "attachment".into(),
+        original_name: Some("fixture.bin".into()),
+    };
+    let operation =
+        record_with_resource(&signing_key, entity(50), genesis.operation_id, 50, resource);
+    let store = ClientSqliteStore::open(&database_path).unwrap();
+    store.commit_remote(&genesis, 1).unwrap();
+    store.upsert_peer(&source_peer).unwrap();
+    store
+        .commit_from_peer(&operation, 2, source_peer.peer_id)
+        .unwrap();
+    let content = ClientContentStore::open(&content_path).unwrap();
+    let transport = NodeHttpTransport::new(
+        SoftwarePeerProofCustody::new(key(52), key(50)),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let (worker, _) = SyncWorker::with_clock(
+        store.clone(),
+        content,
+        transport,
+        FixedClock::new(10),
+        config(),
+    )
+    .unwrap();
+    let first = worker.run_cycle().await.unwrap();
+    assert_eq!(first.resource_download_bytes, 4);
+    assert_eq!(first.resource_downloads_completed, 0);
+    drop(worker);
+    drop(store);
+
+    let reopened = ClientSqliteStore::open(&database_path).unwrap();
+    let reopened_content = ClientContentStore::open(&content_path).unwrap();
+    assert_eq!(reopened_content.partial_offset(descriptor).unwrap(), 4);
+    let transport = NodeHttpTransport::new(
+        SoftwarePeerProofCustody::new(key(52), signing_key),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let (worker, _) = SyncWorker::with_clock(
+        reopened.clone(),
+        reopened_content.clone(),
+        transport,
+        FixedClock::new(10),
+        config(),
+    )
+    .unwrap();
+    assert_eq!(worker.run_cycle().await.unwrap().resource_download_bytes, 4);
+    let final_cycle = worker.run_cycle().await.unwrap();
+    assert_eq!(final_cycle.resource_download_bytes, 2);
+    assert_eq!(final_cycle.resource_downloads_completed, 1);
+    assert_eq!(
+        reopened_content.read_range(descriptor, 0, 100).unwrap(),
+        *bytes
+    );
+    assert_eq!(
+        reopened
+            .sync_counts(10)
+            .unwrap()
+            .resources
+            .completed_transfers,
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn missing_peer_content_retries_without_blocking_operation_convergence() {
+    let bytes = Arc::new(b"not available yet".to_vec());
+    let descriptor = ContentDescriptor {
+        content_id: hash_bytes(&bytes),
+        byte_length: bytes.len() as u64,
+    };
+    let state = ContentHttpState {
+        uploaded: Arc::new(Mutex::new(Vec::new())),
+        source: bytes,
+        descriptor,
+    };
+    let app = Router::new()
+        .route("/api/blobs/availability", post(upload_availability_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let store = ClientSqliteStore::open_in_memory().unwrap();
+    let signing_key = key(60);
+    let genesis = genesis(&signing_key);
+    store.commit_remote(&genesis, 1).unwrap();
+    let source_peer = peer(format!("http://{address}"), 61);
+    store.upsert_peer(&source_peer).unwrap();
+    let operation = record_with_resource(
+        &signing_key,
+        entity(60),
+        genesis.operation_id,
+        60,
+        ResourceRef {
+            content_id: descriptor.content_id,
+            byte_length: descriptor.byte_length,
+            media_type: "application/octet-stream".into(),
+            role: "attachment".into(),
+            original_name: None,
+        },
+    );
+    store
+        .commit_from_peer(&operation, 2, source_peer.peer_id)
+        .unwrap();
+    assert_eq!(
+        store
+            .entity(space(), operation.entity_id)
+            .unwrap()
+            .unwrap()
+            .heads,
+        vec![operation]
+    );
+    let content_directory = tempfile::tempdir().unwrap();
+    let content = ClientContentStore::open(content_directory.path()).unwrap();
+    let transport = NodeHttpTransport::new(
+        SoftwarePeerProofCustody::new(key(62), signing_key),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let (worker, _) = SyncWorker::with_clock(
+        store.clone(),
+        content.clone(),
+        transport,
+        FixedClock::new(10),
+        config(),
+    )
+    .unwrap();
+
+    let report = worker.run_cycle().await.unwrap();
+    assert_eq!(report.resource_retried, 1);
+    assert_eq!(
+        store.sync_counts(10).unwrap().resources.pending_downloads,
+        1
+    );
+    assert_eq!(content.partial_offset(descriptor).unwrap(), 0);
     server.abort();
 }

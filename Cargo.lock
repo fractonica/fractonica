@@ -1402,6 +1402,7 @@ name = "fractonica-client-sqlite"
 version = "0.1.0"
 dependencies = [
  "fractonica-client",
+ "fractonica-content",
  "fractonica-data-model",
  "fractonica-peer",
  "rusqlite",

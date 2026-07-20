@@ -11,8 +11,8 @@ The first client stack has four deliberately separate layers:
 | --- | --- | --- |
 | UI | drafts, navigation, rendering, progress | private keys, canonical signing, synchronous network saves |
 | Native client core | document validation, actor identity boundary, canonical signed operations | HTTP policy, UI state |
-| Local store and outbox | durable operations, entity heads, projections, retry state | rewriting signed envelopes |
-| Node transport | projection reads, immutable operation delivery, later resource transfer | deciding whether local creation succeeded |
+| Local store and outbox | durable operations, entity heads, projections, operation/resource retry state | rewriting signed envelopes, storing blob bytes |
+| Node transport | projection reads, immutable operation delivery, bounded resource transfer | deciding whether local creation succeeded |
 
 Rust's `fractonica-client` implements the native authoring boundary.
 `fractonica-client-sqlite` atomically persists immutable operations, current
@@ -78,7 +78,11 @@ The client SQLite adapter provides:
 - backfill when a new peer is configured;
 - forwarding of operations learned from one peer to other enabled peers;
 - bounded expiring delivery leases with acknowledgement, retry, and terminal
-  rejection states.
+  rejection states;
+- immutable operation-to-resource indexes and independent per-peer transfer
+  queues;
+- durable tus upload URLs, byte progress, expiring resource leases, and
+  aggregate content progress.
 
 Its methods are synchronous and bounded. Tauri and iOS bridges must execute
 them on native blocking pools and return small results to the UI.
@@ -99,11 +103,17 @@ explicit cancellation. HTTP and proof custody are injected boundaries, which
 keeps deterministic tests independent of networking and lets desktop/iOS
 provide reviewed native key custody.
 
-The content layer now includes a private crash-safe local blob store and
-bounded HTTP primitives for availability, tus creation/resume/checksummed
-chunks, and resumable range downloads. Operation convergence still does not
-wait for media availability. Durable automatic resource discovery and transfer
-queueing is not wired into the supervisor yet.
+The content layer includes a private crash-safe local blob store and bounded
+HTTP primitives for availability, tus creation/resume/checksummed chunks, and
+resumable range downloads. The supervisor now discovers resources from every
+committed operation, reconciles locally authored blobs, and advances durable
+per-peer upload/download queues one bounded chunk at a time. A completed
+download is verified before it unlocks fan-out to other peers. Operation
+convergence still does not wait for media availability.
+
+The status snapshot reports waiting, pending, leased, completed, and rejected
+resource work plus aggregate synchronized and total bytes. Platform UIs can
+render progress without scanning operations or touching the filesystem.
 
 The current peer route is still loopback-only and unauthenticated transport is
 not safe to expose on a LAN. Encrypted session transport and platform command

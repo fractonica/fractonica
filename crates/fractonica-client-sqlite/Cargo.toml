@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fractonica-content.workspace = true
 fractonica-data-model.workspace = true
 fractonica-peer.workspace = true
 rusqlite.workspace = true

@@ -15,8 +15,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use fractonica_application::{OperationChangePage, StoredOperation};
 use fractonica_client_content::{ClientContentError, ClientContentStore, MAX_DOWNLOAD_CHUNK_BYTES};
 use fractonica_client_sqlite::{
-    ClientSqliteStore, ClientStoreError, DeliveryLeaseId, MAX_ERROR_BYTES, PeerConfig, SyncCounts,
-    SyncTarget,
+    ClientSqliteStore, ClientStoreError, DeliveryLeaseId, MAX_ERROR_BYTES,
+    MAX_RESOURCE_TRANSFER_BATCH, PeerConfig, ResourceTransferDirection, ResourceTransferItem,
+    ResourceTransferLeaseId, SyncCounts, SyncTarget,
 };
 use fractonica_content::{ContentDescriptor, ContentId, ResourceRef};
 use fractonica_data_model::{NodeId, OperationEnvelope};
@@ -42,6 +43,9 @@ pub struct SyncConfig {
     pub request_lifetime: Duration,
     pub initial_backoff: Duration,
     pub maximum_backoff: Duration,
+    pub resource_scan_size: usize,
+    pub resource_transfers_per_cycle: usize,
+    pub content_chunk_bytes: usize,
 }
 
 impl Default for SyncConfig {
@@ -56,6 +60,9 @@ impl Default for SyncConfig {
             request_lifetime: Duration::from_secs(10),
             initial_backoff: Duration::from_secs(1),
             maximum_backoff: Duration::from_secs(5 * 60),
+            resource_scan_size: 100,
+            resource_transfers_per_cycle: 8,
+            content_chunk_bytes: 256 * 1_024,
         }
     }
 }
@@ -72,6 +79,10 @@ impl SyncConfig {
             || self.maximum_backoff < self.initial_backoff
             || self.request_lifetime.as_millis() > MAX_REQUEST_LIFETIME_MS as u128
             || self.request_lifetime.as_millis() < 1_000
+            || !(1..=MAX_RESOURCE_TRANSFER_BATCH).contains(&self.resource_scan_size)
+            || !(1..=MAX_RESOURCE_TRANSFER_BATCH).contains(&self.resource_transfers_per_cycle)
+            || self.content_chunk_bytes == 0
+            || self.content_chunk_bytes > MAX_DOWNLOAD_CHUNK_BYTES
         {
             return Err(SyncError::InvalidConfiguration);
         }
@@ -86,6 +97,13 @@ pub struct CycleReport {
     pub retried: u64,
     pub rejected: u64,
     pub pull_failures: u64,
+    pub resource_upload_bytes: u64,
+    pub resource_download_bytes: u64,
+    pub resource_uploads_completed: u64,
+    pub resource_downloads_completed: u64,
+    pub resource_retried: u64,
+    pub resource_rejected: u64,
+    pub resource_waiting_local: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -102,6 +120,7 @@ pub struct SyncStatus {
 pub enum TransportFailureKind {
     Retryable,
     Permanent,
+    LocalContentUnavailable,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -124,6 +143,14 @@ impl TransportError {
     pub fn permanent(detail: impl Into<String>) -> Self {
         Self {
             kind: TransportFailureKind::Permanent,
+            detail: detail.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn local_content_unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TransportFailureKind::LocalContentUnavailable,
             detail: detail.into(),
         }
     }
@@ -151,6 +178,44 @@ pub trait SyncTransport: Send + Sync + 'static {
         now_unix_ms: i64,
         request_lifetime: Duration,
     ) -> Result<PulledPage, TransportError>;
+}
+
+#[async_trait]
+pub trait ContentSyncTransport: Send + Sync + 'static {
+    async fn content_availability(
+        &self,
+        peer: &PeerConfig,
+        content_ids: &[ContentId],
+    ) -> Result<BlobAvailability, TransportError>;
+
+    async fn create_content_upload(
+        &self,
+        peer: &PeerConfig,
+        resource: &ResourceRef,
+    ) -> Result<UploadChunkResult, TransportError>;
+
+    async fn content_upload_status(
+        &self,
+        peer: &PeerConfig,
+        upload_url: Url,
+    ) -> Result<UploadChunkResult, TransportError>;
+
+    async fn upload_content_chunk(
+        &self,
+        peer: &PeerConfig,
+        content: &ClientContentStore,
+        descriptor: ContentDescriptor,
+        upload: RemoteUpload,
+        maximum_chunk_bytes: usize,
+    ) -> Result<UploadChunkResult, TransportError>;
+
+    async fn download_content_chunk(
+        &self,
+        peer: &PeerConfig,
+        content: &ClientContentStore,
+        descriptor: ContentDescriptor,
+        maximum_chunk_bytes: usize,
+    ) -> Result<fractonica_client_content::AppendResult, TransportError>;
 }
 
 pub trait SyncClock: Send + Sync + 'static {
@@ -184,6 +249,7 @@ pub enum SyncError {
 
 pub struct SyncWorker<T, C = SystemSyncClock> {
     store: ClientSqliteStore,
+    content: ClientContentStore,
     transport: Arc<T>,
     clock: C,
     config: SyncConfig,
@@ -192,24 +258,26 @@ pub struct SyncWorker<T, C = SystemSyncClock> {
 
 impl<T> SyncWorker<T, SystemSyncClock>
 where
-    T: SyncTransport,
+    T: SyncTransport + ContentSyncTransport,
 {
     pub fn new(
         store: ClientSqliteStore,
+        content: ClientContentStore,
         transport: T,
         config: SyncConfig,
     ) -> Result<(Self, watch::Receiver<SyncStatus>), SyncError> {
-        Self::with_clock(store, transport, SystemSyncClock, config)
+        Self::with_clock(store, content, transport, SystemSyncClock, config)
     }
 }
 
 impl<T, C> SyncWorker<T, C>
 where
-    T: SyncTransport,
+    T: SyncTransport + ContentSyncTransport,
     C: SyncClock,
 {
     pub fn with_clock(
         store: ClientSqliteStore,
+        content: ClientContentStore,
         transport: T,
         clock: C,
         config: SyncConfig,
@@ -219,6 +287,7 @@ where
         Ok((
             Self {
                 store,
+                content,
                 transport: Arc::new(transport),
                 clock,
                 config,
@@ -368,7 +437,343 @@ where
                 }
             }
         }
+
+        let candidates = blocking({
+            let store = self.store.clone();
+            let limit = self.config.resource_scan_size;
+            move || store.resource_scan_candidates(limit)
+        })
+        .await?;
+        for descriptor in candidates {
+            let content = self.content.clone();
+            let verified = tokio::task::spawn_blocking(move || content.blob(descriptor))
+                .await
+                .map_err(|error| SyncError::Join(error.to_string()))?;
+            match verified {
+                Ok(Some(_)) => {
+                    let verified_at = self.clock.now_unix_ms()?;
+                    blocking({
+                        let store = self.store.clone();
+                        move || store.mark_resource_local(descriptor, verified_at)
+                    })
+                    .await?;
+                }
+                Ok(None) | Err(_) => {
+                    report.resource_waiting_local = report.resource_waiting_local.saturating_add(1);
+                }
+            }
+        }
+
+        let resource_lease = ResourceTransferLeaseId::new();
+        let resource_lease_time = self.clock.now_unix_ms()?;
+        let transfers = blocking({
+            let store = self.store.clone();
+            let duration = self.config.lease_duration;
+            let limit = self.config.resource_transfers_per_cycle;
+            move || store.lease_due_resources(resource_lease_time, duration, limit, resource_lease)
+        })
+        .await?;
+        for transfer in transfers {
+            match self
+                .advance_resource_transfer(transfer, resource_lease)
+                .await?
+            {
+                ResourceStep::Progress { direction, bytes } => match direction {
+                    ResourceTransferDirection::Upload => {
+                        report.resource_upload_bytes =
+                            report.resource_upload_bytes.saturating_add(bytes);
+                    }
+                    ResourceTransferDirection::Download => {
+                        report.resource_download_bytes =
+                            report.resource_download_bytes.saturating_add(bytes);
+                    }
+                },
+                ResourceStep::Complete { direction, bytes } => match direction {
+                    ResourceTransferDirection::Upload => {
+                        report.resource_upload_bytes =
+                            report.resource_upload_bytes.saturating_add(bytes);
+                        report.resource_uploads_completed =
+                            report.resource_uploads_completed.saturating_add(1);
+                    }
+                    ResourceTransferDirection::Download => {
+                        report.resource_download_bytes =
+                            report.resource_download_bytes.saturating_add(bytes);
+                        report.resource_downloads_completed =
+                            report.resource_downloads_completed.saturating_add(1);
+                    }
+                },
+                ResourceStep::Retried => {
+                    report.resource_retried = report.resource_retried.saturating_add(1);
+                }
+                ResourceStep::Rejected => {
+                    report.resource_rejected = report.resource_rejected.saturating_add(1);
+                }
+                ResourceStep::WaitingLocal => {
+                    report.resource_waiting_local = report.resource_waiting_local.saturating_add(1);
+                }
+            }
+        }
         Ok(report)
+    }
+
+    async fn advance_resource_transfer(
+        &self,
+        transfer: ResourceTransferItem,
+        lease_id: ResourceTransferLeaseId,
+    ) -> Result<ResourceStep, SyncError> {
+        match self.execute_resource_transfer(&transfer, lease_id).await {
+            Ok(step) => Ok(step),
+            Err(ResourceExecutionError::Sync(error)) => Err(error),
+            Err(ResourceExecutionError::Transport(error)) => {
+                let failed_at = self.clock.now_unix_ms()?;
+                let detail = bounded_detail(error.detail);
+                match error.kind {
+                    TransportFailureKind::LocalContentUnavailable
+                        if transfer.direction == ResourceTransferDirection::Upload =>
+                    {
+                        blocking({
+                            let store = self.store.clone();
+                            let peer_id = transfer.peer.peer_id;
+                            let content_id = transfer.resource.content_id;
+                            let next =
+                                add_duration(failed_at, self.backoff(transfer.attempt_count))?;
+                            move || {
+                                store.wait_for_local_resource(
+                                    peer_id, content_id, lease_id, next, &detail,
+                                )
+                            }
+                        })
+                        .await?;
+                        Ok(ResourceStep::WaitingLocal)
+                    }
+                    TransportFailureKind::Retryable
+                    | TransportFailureKind::LocalContentUnavailable => {
+                        let next = add_duration(failed_at, self.backoff(transfer.attempt_count))?;
+                        blocking({
+                            let store = self.store.clone();
+                            let peer_id = transfer.peer.peer_id;
+                            let content_id = transfer.resource.content_id;
+                            let direction = transfer.direction;
+                            move || {
+                                store.retry_resource_transfer(
+                                    peer_id, content_id, direction, lease_id, next, &detail,
+                                )
+                            }
+                        })
+                        .await?;
+                        Ok(ResourceStep::Retried)
+                    }
+                    TransportFailureKind::Permanent => {
+                        blocking({
+                            let store = self.store.clone();
+                            let peer_id = transfer.peer.peer_id;
+                            let content_id = transfer.resource.content_id;
+                            let direction = transfer.direction;
+                            move || {
+                                store.reject_resource_transfer(
+                                    peer_id, content_id, direction, lease_id, failed_at, &detail,
+                                )
+                            }
+                        })
+                        .await?;
+                        Ok(ResourceStep::Rejected)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn execute_resource_transfer(
+        &self,
+        transfer: &ResourceTransferItem,
+        lease_id: ResourceTransferLeaseId,
+    ) -> Result<ResourceStep, ResourceExecutionError> {
+        let descriptor = transfer.resource.descriptor();
+        let availability = self
+            .transport
+            .content_availability(&transfer.peer, &[descriptor.content_id])
+            .await?;
+        let remote = availability_descriptor(&availability, descriptor.content_id)?;
+        match transfer.direction {
+            ResourceTransferDirection::Upload => {
+                if let Some(remote) = remote {
+                    if remote != descriptor {
+                        return Err(TransportError::permanent(
+                            "peer content length conflicts with the referenced descriptor",
+                        )
+                        .into());
+                    }
+                    self.complete_transfer(transfer, lease_id).await?;
+                    return Ok(ResourceStep::Complete {
+                        direction: transfer.direction,
+                        bytes: 0,
+                    });
+                }
+                let upload = if let Some(url) = &transfer.remote_upload_url {
+                    let url = Url::parse(url).map_err(|error| {
+                        TransportError::permanent(format!("stored upload URL is invalid: {error}"))
+                    })?;
+                    self.transport
+                        .content_upload_status(&transfer.peer, url)
+                        .await?
+                } else {
+                    self.transport
+                        .create_content_upload(&transfer.peer, &transfer.resource)
+                        .await?
+                };
+                if upload.upload.length != descriptor.byte_length {
+                    return Err(TransportError::permanent(
+                        "peer upload length conflicts with the referenced descriptor",
+                    )
+                    .into());
+                }
+                self.persist_transfer_progress(
+                    transfer,
+                    lease_id,
+                    upload.upload.offset,
+                    Some(upload.upload.url.as_str()),
+                )
+                .await?;
+                if upload.complete {
+                    self.complete_transfer(transfer, lease_id).await?;
+                    return Ok(ResourceStep::Complete {
+                        direction: transfer.direction,
+                        bytes: 0,
+                    });
+                }
+                let before = upload.upload.offset;
+                let uploaded = self
+                    .transport
+                    .upload_content_chunk(
+                        &transfer.peer,
+                        &self.content,
+                        descriptor,
+                        upload.upload,
+                        self.config.content_chunk_bytes,
+                    )
+                    .await?;
+                self.persist_transfer_progress(
+                    transfer,
+                    lease_id,
+                    uploaded.upload.offset,
+                    Some(uploaded.upload.url.as_str()),
+                )
+                .await?;
+                let bytes = uploaded.upload.offset.saturating_sub(before);
+                if uploaded.complete {
+                    self.complete_transfer(transfer, lease_id).await?;
+                    Ok(ResourceStep::Complete {
+                        direction: transfer.direction,
+                        bytes,
+                    })
+                } else {
+                    self.release_transfer_for_next_chunk(transfer, lease_id)
+                        .await?;
+                    Ok(ResourceStep::Progress {
+                        direction: transfer.direction,
+                        bytes,
+                    })
+                }
+            }
+            ResourceTransferDirection::Download => {
+                let Some(remote) = remote else {
+                    return Err(TransportError::retryable(
+                        "the selected peer does not currently have this content",
+                    )
+                    .into());
+                };
+                if remote != descriptor {
+                    return Err(TransportError::permanent(
+                        "peer content length conflicts with the referenced descriptor",
+                    )
+                    .into());
+                }
+                let before = transfer.transferred_bytes;
+                let downloaded = self
+                    .transport
+                    .download_content_chunk(
+                        &transfer.peer,
+                        &self.content,
+                        descriptor,
+                        self.config.content_chunk_bytes,
+                    )
+                    .await?;
+                self.persist_transfer_progress(transfer, lease_id, downloaded.offset, None)
+                    .await?;
+                let bytes = downloaded.offset.saturating_sub(before);
+                if downloaded.complete {
+                    self.complete_transfer(transfer, lease_id).await?;
+                    Ok(ResourceStep::Complete {
+                        direction: transfer.direction,
+                        bytes,
+                    })
+                } else {
+                    self.release_transfer_for_next_chunk(transfer, lease_id)
+                        .await?;
+                    Ok(ResourceStep::Progress {
+                        direction: transfer.direction,
+                        bytes,
+                    })
+                }
+            }
+        }
+    }
+
+    async fn persist_transfer_progress(
+        &self,
+        transfer: &ResourceTransferItem,
+        lease_id: ResourceTransferLeaseId,
+        offset: u64,
+        upload_url: Option<&str>,
+    ) -> Result<(), SyncError> {
+        let store = self.store.clone();
+        let peer_id = transfer.peer.peer_id;
+        let content_id = transfer.resource.content_id;
+        let direction = transfer.direction;
+        let upload_url = upload_url.map(ToOwned::to_owned);
+        blocking(move || {
+            store.record_resource_progress(
+                peer_id,
+                content_id,
+                direction,
+                lease_id,
+                offset,
+                upload_url.as_deref(),
+            )
+        })
+        .await
+    }
+
+    async fn complete_transfer(
+        &self,
+        transfer: &ResourceTransferItem,
+        lease_id: ResourceTransferLeaseId,
+    ) -> Result<(), SyncError> {
+        let completed_at = self.clock.now_unix_ms()?;
+        let store = self.store.clone();
+        let peer_id = transfer.peer.peer_id;
+        let content_id = transfer.resource.content_id;
+        let direction = transfer.direction;
+        blocking(move || {
+            store.complete_resource_transfer(peer_id, content_id, direction, lease_id, completed_at)
+        })
+        .await
+    }
+
+    async fn release_transfer_for_next_chunk(
+        &self,
+        transfer: &ResourceTransferItem,
+        lease_id: ResourceTransferLeaseId,
+    ) -> Result<(), SyncError> {
+        let next = self.clock.now_unix_ms()?;
+        let store = self.store.clone();
+        let peer_id = transfer.peer.peer_id;
+        let content_id = transfer.resource.content_id;
+        let direction = transfer.direction;
+        blocking(move || {
+            store.continue_resource_transfer(peer_id, content_id, direction, lease_id, next)
+        })
+        .await
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
@@ -419,6 +824,62 @@ where
             .initial_backoff
             .saturating_mul(1_u32 << shift)
             .min(self.config.maximum_backoff)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceStep {
+    Progress {
+        direction: ResourceTransferDirection,
+        bytes: u64,
+    },
+    Complete {
+        direction: ResourceTransferDirection,
+        bytes: u64,
+    },
+    Retried,
+    Rejected,
+    WaitingLocal,
+}
+
+enum ResourceExecutionError {
+    Transport(TransportError),
+    Sync(SyncError),
+}
+
+impl From<TransportError> for ResourceExecutionError {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl From<SyncError> for ResourceExecutionError {
+    fn from(error: SyncError) -> Self {
+        Self::Sync(error)
+    }
+}
+
+fn availability_descriptor(
+    availability: &BlobAvailability,
+    content_id: ContentId,
+) -> Result<Option<ContentDescriptor>, TransportError> {
+    let available = availability
+        .available
+        .iter()
+        .filter(|value| value.content_id == content_id)
+        .copied()
+        .collect::<Vec<_>>();
+    let missing = availability
+        .missing
+        .iter()
+        .filter(|value| **value == content_id)
+        .count();
+    match (available.as_slice(), missing) {
+        ([descriptor], 0) => Ok(Some(*descriptor)),
+        ([], 1) => Ok(None),
+        _ => Err(TransportError::permanent(
+            "availability response did not partition the requested content ID exactly once",
+        )),
     }
 }
 
@@ -570,6 +1031,33 @@ impl<C> NodeHttpTransport<C> {
             .json()
             .await
             .map_err(|error| TransportError::retryable(format!("invalid availability: {error}")))?;
+        let mut observed = BTreeMap::new();
+        for descriptor in &response.available {
+            descriptor.validate().map_err(|error| {
+                TransportError::permanent(format!("invalid available descriptor: {error}"))
+            })?;
+            if unique.binary_search(&descriptor.content_id).is_err()
+                || observed.insert(descriptor.content_id, ()).is_some()
+            {
+                return Err(TransportError::permanent(
+                    "availability returned an unknown or duplicate content ID",
+                ));
+            }
+        }
+        for content_id in &response.missing {
+            if unique.binary_search(content_id).is_err()
+                || observed.insert(*content_id, ()).is_some()
+            {
+                return Err(TransportError::permanent(
+                    "availability returned an unknown or duplicate content ID",
+                ));
+            }
+        }
+        if observed.len() != unique.len() {
+            return Err(TransportError::permanent(
+                "availability omitted a requested content ID",
+            ));
+        }
         Ok(BlobAvailability {
             available: response.available,
             missing: response.missing,
@@ -681,7 +1169,7 @@ impl<C> NodeHttpTransport<C> {
             .await
             .map_err(|error| TransportError::retryable(format!("content task failed: {error}")))?
             .map_err(content_error)?
-            .ok_or_else(|| TransportError::permanent("local content is missing"))?;
+            .ok_or_else(|| TransportError::local_content_unavailable("local content is missing"))?;
         let remaining = upload.length - upload.offset;
         let length = usize::try_from(remaining.min(maximum_chunk_bytes as u64))
             .map_err(|_| TransportError::permanent("content chunk length overflows"))?;
@@ -890,6 +1378,72 @@ where
             next_after: page.next_after,
             has_more: page.has_more,
         })
+    }
+}
+
+#[async_trait]
+impl<C> ContentSyncTransport for NodeHttpTransport<C>
+where
+    C: PeerProofCustody,
+{
+    async fn content_availability(
+        &self,
+        peer: &PeerConfig,
+        content_ids: &[ContentId],
+    ) -> Result<BlobAvailability, TransportError> {
+        NodeHttpTransport::content_availability(self, peer, content_ids).await
+    }
+
+    async fn create_content_upload(
+        &self,
+        peer: &PeerConfig,
+        resource: &ResourceRef,
+    ) -> Result<UploadChunkResult, TransportError> {
+        NodeHttpTransport::create_content_upload(self, peer, resource).await
+    }
+
+    async fn content_upload_status(
+        &self,
+        peer: &PeerConfig,
+        upload_url: Url,
+    ) -> Result<UploadChunkResult, TransportError> {
+        NodeHttpTransport::content_upload_status(self, peer, upload_url).await
+    }
+
+    async fn upload_content_chunk(
+        &self,
+        peer: &PeerConfig,
+        content: &ClientContentStore,
+        descriptor: ContentDescriptor,
+        upload: RemoteUpload,
+        maximum_chunk_bytes: usize,
+    ) -> Result<UploadChunkResult, TransportError> {
+        NodeHttpTransport::upload_content_chunk(
+            self,
+            peer,
+            content,
+            descriptor,
+            upload,
+            maximum_chunk_bytes,
+        )
+        .await
+    }
+
+    async fn download_content_chunk(
+        &self,
+        peer: &PeerConfig,
+        content: &ClientContentStore,
+        descriptor: ContentDescriptor,
+        maximum_chunk_bytes: usize,
+    ) -> Result<fractonica_client_content::AppendResult, TransportError> {
+        NodeHttpTransport::download_content_chunk(
+            self,
+            peer,
+            content,
+            descriptor,
+            maximum_chunk_bytes,
+        )
+        .await
     }
 }
 

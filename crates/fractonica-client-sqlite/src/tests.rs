@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, time::Duration};
 
+use fractonica_content::{ResourceRef, hash_bytes};
 use fractonica_data_model::{OperationNonce, RecordDocument, SigningKey};
 
 use super::*;
@@ -68,6 +69,39 @@ fn record(
     .unwrap()
 }
 
+fn record_with_resource(
+    signing_key: &SigningKey,
+    entity_id: EntityId,
+    authorization: OperationId,
+    nonce: u8,
+    resource: ResourceRef,
+) -> OperationEnvelope {
+    OperationEnvelope::sign(
+        space(),
+        entity_id,
+        EntitySchema::Record,
+        Vec::new(),
+        vec![authorization],
+        10 + i64::from(nonce),
+        OperationNonce::from_bytes([nonce; 16]),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public {
+                document: RecordDocument {
+                    start_at_unix_ms: 100,
+                    end_at_unix_ms: None,
+                    emoji: Some("📎".into()),
+                    text: Some("resource".into()),
+                    metadata: BTreeMap::new(),
+                    resources: vec![resource],
+                    references: Vec::new(),
+                },
+            },
+        },
+        signing_key,
+    )
+    .unwrap()
+}
+
 fn seeded_store() -> (ClientSqliteStore, SigningKey, OperationEnvelope) {
     let store = ClientSqliteStore::open_in_memory().unwrap();
     let signing_key = key(7);
@@ -108,6 +142,174 @@ fn local_commit_is_atomic_replayable_and_materialized_before_delivery() {
     assert_eq!(summaries[0].start_at_unix_ms, Some(100));
     assert!(store.commit_local(&operation, 4).unwrap().replayed);
     assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 1);
+}
+
+#[test]
+fn local_resource_waits_for_verification_then_resumes_durable_upload_progress() {
+    let (store, signing_key, genesis) = seeded_store();
+    let peer = PeerConfig {
+        peer_id: key(31).node_id(),
+        endpoint: "https://media.example".into(),
+        enabled: true,
+        added_at_unix_ms: 2,
+    };
+    store.upsert_peer(&peer).unwrap();
+    let bytes = b"abcdefgh";
+    let resource = ResourceRef {
+        content_id: hash_bytes(bytes),
+        byte_length: bytes.len() as u64,
+        media_type: "application/octet-stream".into(),
+        role: "attachment".into(),
+        original_name: Some("fixture.bin".into()),
+    };
+    let operation = record_with_resource(
+        &signing_key,
+        entity(31),
+        genesis.operation_id,
+        31,
+        resource.clone(),
+    );
+    store.commit_local(&operation, 3).unwrap();
+
+    assert_eq!(
+        store.resource_scan_candidates(10).unwrap(),
+        vec![resource.descriptor()]
+    );
+    assert_eq!(store.sync_counts(3).unwrap().resources.waiting_uploads, 1);
+    assert!(
+        store
+            .lease_due_resources(
+                3,
+                Duration::from_secs(1),
+                10,
+                ResourceTransferLeaseId::new(),
+            )
+            .unwrap()
+            .is_empty()
+    );
+
+    store.mark_resource_local(resource.descriptor(), 4).unwrap();
+    let first_lease = ResourceTransferLeaseId::new();
+    let first = store
+        .lease_due_resources(4, Duration::from_secs(1), 10, first_lease)
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].direction, ResourceTransferDirection::Upload);
+    store
+        .record_resource_progress(
+            peer.peer_id,
+            resource.content_id,
+            ResourceTransferDirection::Upload,
+            first_lease,
+            4,
+            Some("https://media.example/api/uploads/resume"),
+        )
+        .unwrap();
+    store
+        .retry_resource_transfer(
+            peer.peer_id,
+            resource.content_id,
+            ResourceTransferDirection::Upload,
+            first_lease,
+            5,
+            "next chunk",
+        )
+        .unwrap();
+
+    let second_lease = ResourceTransferLeaseId::new();
+    let resumed = store
+        .lease_due_resources(5, Duration::from_secs(1), 10, second_lease)
+        .unwrap();
+    assert_eq!(resumed[0].transferred_bytes, 4);
+    assert_eq!(
+        resumed[0].remote_upload_url.as_deref(),
+        Some("https://media.example/api/uploads/resume")
+    );
+    store
+        .complete_resource_transfer(
+            peer.peer_id,
+            resource.content_id,
+            ResourceTransferDirection::Upload,
+            second_lease,
+            6,
+        )
+        .unwrap();
+    let counts = store.sync_counts(6).unwrap().resources;
+    assert_eq!(counts.completed_transfers, 1);
+    assert_eq!(counts.transferred_bytes, bytes.len() as u64);
+}
+
+#[test]
+fn completed_peer_download_unlocks_fanout_without_duplicate_source_upload() {
+    let (store, signing_key, genesis) = seeded_store();
+    let source = PeerConfig {
+        peer_id: key(32).node_id(),
+        endpoint: "https://source.example".into(),
+        enabled: true,
+        added_at_unix_ms: 2,
+    };
+    let destination = PeerConfig {
+        peer_id: key(33).node_id(),
+        endpoint: "https://destination.example".into(),
+        enabled: true,
+        added_at_unix_ms: 2,
+    };
+    store.upsert_peer(&source).unwrap();
+    store.upsert_peer(&destination).unwrap();
+    let bytes = b"peer resource";
+    let resource = ResourceRef {
+        content_id: hash_bytes(bytes),
+        byte_length: bytes.len() as u64,
+        media_type: "image/jpeg".into(),
+        role: "photo".into(),
+        original_name: Some("photo.jpg".into()),
+    };
+    let operation = record_with_resource(
+        &signing_key,
+        entity(32),
+        genesis.operation_id,
+        32,
+        resource.clone(),
+    );
+    store
+        .commit_from_peer(&operation, 3, source.peer_id)
+        .unwrap();
+    let counts = store.sync_counts(3).unwrap().resources;
+    assert_eq!(counts.pending_downloads, 1);
+    assert_eq!(counts.waiting_uploads, 1);
+
+    let lease = ResourceTransferLeaseId::new();
+    let transfers = store
+        .lease_due_resources(3, Duration::from_secs(1), 10, lease)
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].peer.peer_id, source.peer_id);
+    assert_eq!(transfers[0].direction, ResourceTransferDirection::Download);
+    store
+        .complete_resource_transfer(
+            source.peer_id,
+            resource.content_id,
+            ResourceTransferDirection::Download,
+            lease,
+            4,
+        )
+        .unwrap();
+
+    let counts = store.sync_counts(4).unwrap().resources;
+    assert_eq!(counts.pending_downloads, 0);
+    assert_eq!(counts.pending_uploads, 1);
+    assert_eq!(counts.waiting_uploads, 0);
+    let upload = store
+        .lease_due_resources(
+            4,
+            Duration::from_secs(1),
+            10,
+            ResourceTransferLeaseId::new(),
+        )
+        .unwrap();
+    assert_eq!(upload.len(), 1);
+    assert_eq!(upload[0].peer.peer_id, destination.peer_id);
+    assert_eq!(upload[0].direction, ResourceTransferDirection::Upload);
 }
 
 #[test]

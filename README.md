@@ -35,11 +35,11 @@ The initial vertical slice provides:
 - a platform-neutral Rust client authoring core with explicit native key
   custody and causal create, edit, delete, and profile operations;
 - an independent client SQLite store with atomic offline commits, rebuildable
-  heads/projections, and crash-recoverable per-peer delivery leases;
+  heads/projections, and crash-recoverable operation and resource leases;
 - a supervised native sync worker with bounded signed delivery, durable
   incremental cursors, capped retry backoff, cancellation, and compact status;
-- a private crash-safe client blob store plus bounded availability, tus upload,
-  and resumable range-download transport primitives;
+- a private crash-safe client blob store plus automatic durable media queues,
+  bounded availability, tus upload, and resumable range downloads;
 - a strict TypeScript node client for projection paging, statistics, immutable
   operation reads, and delivery of already-signed operations;
 - protected Unix filesystem identity bootstrap with an explicit installation

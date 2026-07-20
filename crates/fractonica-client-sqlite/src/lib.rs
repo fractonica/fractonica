@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use fractonica_content::{ContentDescriptor, ContentId, ResourceRef};
 use fractonica_data_model::{
     EntityId, EntitySchema, MAX_CAUSAL_PARENTS, NodeId, OperationBody, OperationEnvelope,
     OperationId, ProtectedDocument, SpaceId, Visibility,
@@ -23,6 +24,7 @@ pub const CLIENT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_OUTBOX_BATCH: usize = 100;
 pub const MAX_ERROR_BYTES: usize = 2_048;
 pub const MAX_ENDPOINT_BYTES: usize = 2_048;
+pub const MAX_RESOURCE_TRANSFER_BATCH: usize = 100;
 
 const MIGRATION: &str = include_str!("../migrations/0001_client_store.sql");
 
@@ -104,6 +106,73 @@ pub struct DeliveryItem {
     pub attempt_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResourceTransferLeaseId(Uuid);
+
+impl ResourceTransferLeaseId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for ResourceTransferLeaseId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for ResourceTransferLeaseId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceTransferDirection {
+    Upload,
+    Download,
+}
+
+impl ResourceTransferDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Download => "download",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceTransferItem {
+    pub peer: PeerConfig,
+    pub resource: ResourceRef,
+    pub direction: ResourceTransferDirection,
+    pub attempt_count: u32,
+    pub remote_upload_url: Option<String>,
+    pub transferred_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct LeasedResourceTransfer {
+    peer_id: NodeId,
+    content_id: ContentId,
+    direction: ResourceTransferDirection,
+    lease_id: ResourceTransferLeaseId,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourceSyncCounts {
+    pub waiting_uploads: u64,
+    pub pending_uploads: u64,
+    pub pending_downloads: u64,
+    pub leased_transfers: u64,
+    pub completed_transfers: u64,
+    pub rejected_transfers: u64,
+    pub transferred_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalEntity {
     pub space_id: SpaceId,
@@ -144,6 +213,7 @@ pub struct SyncCounts {
     pub leased_deliveries: u64,
     pub rejected_deliveries: u64,
     pub due_pulls: u64,
+    pub resources: ResourceSyncCounts,
 }
 
 #[derive(Debug, Error)]
@@ -186,6 +256,14 @@ pub enum ClientStoreError {
     InvalidLeaseDuration,
     #[error("delivery item is not owned by the supplied active lease")]
     LeaseMismatch,
+    #[error("resource transfer is not owned by the supplied active lease")]
+    ResourceLeaseMismatch,
+    #[error("resource transfer limit must be between 1 and {MAX_RESOURCE_TRANSFER_BATCH}")]
+    InvalidResourceTransferLimit,
+    #[error("resource descriptor conflicts with an existing content identity")]
+    ResourceDescriptorConflict,
+    #[error("resource transfer progress is invalid")]
+    InvalidResourceProgress,
     #[error("delivery error must be no larger than {MAX_ERROR_BYTES} bytes")]
     DeliveryErrorTooLong,
     #[error("entity query limit must be between 1 and 200")]
@@ -287,6 +365,7 @@ impl ClientSqliteStore {
                 stored_at_unix_ms,
                 source,
             )?;
+            apply_resource_source(&transaction, operation, stored_at_unix_ms, source)?;
             let queued_peers = delivery_count(&transaction, operation.operation_id)?;
             transaction.commit()?;
             return Ok(CommitResult {
@@ -318,12 +397,14 @@ impl ClientSqliteStore {
         let local_sequence = positive_u64(transaction.last_insert_rowid())?;
         insert_graph(&transaction, operation)?;
         insert_projection(&transaction, operation)?;
+        insert_operation_resources(&transaction, operation, stored_at_unix_ms)?;
         apply_delivery_source(
             &transaction,
             operation.operation_id,
             stored_at_unix_ms,
             source,
         )?;
+        apply_resource_source(&transaction, operation, stored_at_unix_ms, source)?;
         let queued_peers = delivery_count(&transaction, operation.operation_id)?;
         transaction.commit()?;
         Ok(CommitResult {
@@ -357,6 +438,7 @@ impl ClientSqliteStore {
                    WHERE schema_id <> 'space.genesis'",
                 params![peer.peer_id.to_string(), peer.added_at_unix_ms],
             )?;
+            queue_known_resources_for_peer(&transaction, peer.peer_id, peer.added_at_unix_ms)?;
         }
         transaction.commit()?;
         Ok(())
@@ -380,6 +462,7 @@ impl ClientSqliteStore {
                    FROM client_operations WHERE schema_id <> 'space.genesis'",
                 params![peer_id.to_string()],
             )?;
+            queue_known_resources_for_peer(&transaction, peer_id, 0)?;
         }
         transaction.commit()?;
         Ok(())
@@ -613,6 +696,32 @@ impl ClientSqliteStore {
                 ))
             },
         )?;
+        let resource_values: (i64, i64, i64, i64, i64, i64, i64, i64) = connection.query_row(
+            "SELECT
+                    count(CASE WHEN direction = 'upload' AND state = 'waiting_local' THEN 1 END),
+                    count(CASE WHEN direction = 'upload' AND state = 'pending' THEN 1 END),
+                    count(CASE WHEN direction = 'download' AND state = 'pending' THEN 1 END),
+                    count(CASE WHEN state = 'leased' THEN 1 END),
+                    count(CASE WHEN state = 'complete' THEN 1 END),
+                    count(CASE WHEN state = 'rejected' THEN 1 END),
+                    coalesce(sum(transferred_bytes), 0),
+                    coalesce(sum(r.byte_length), 0)
+                 FROM client_resource_transfers t
+                 JOIN client_resources r USING(content_id)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
         Ok(SyncCounts {
             enabled_peers: nonnegative_u64(values.0)?,
             spaces: nonnegative_u64(values.1)?,
@@ -620,7 +729,409 @@ impl ClientSqliteStore {
             leased_deliveries: nonnegative_u64(values.3)?,
             rejected_deliveries: nonnegative_u64(values.4)?,
             due_pulls: nonnegative_u64(values.5)?,
+            resources: ResourceSyncCounts {
+                waiting_uploads: nonnegative_u64(resource_values.0)?,
+                pending_uploads: nonnegative_u64(resource_values.1)?,
+                pending_downloads: nonnegative_u64(resource_values.2)?,
+                leased_transfers: nonnegative_u64(resource_values.3)?,
+                completed_transfers: nonnegative_u64(resource_values.4)?,
+                rejected_transfers: nonnegative_u64(resource_values.5)?,
+                transferred_bytes: nonnegative_u64(resource_values.6)?,
+                total_bytes: nonnegative_u64(resource_values.7)?,
+            },
         })
+    }
+
+    /// Returns resources that have not yet been reconciled with the local blob
+    /// store. Callers verify these descriptors outside the SQLite lock and
+    /// report successful verification with [`Self::mark_resource_local`].
+    pub fn resource_scan_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ContentDescriptor>, ClientStoreError> {
+        validate_resource_limit(limit)?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT content_id, byte_length FROM client_resources
+             WHERE locally_available = 0 AND local_expected = 1
+             ORDER BY discovered_at_unix_ms, content_id LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit_i64(limit)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (content_id, byte_length) = row?;
+            Ok(ContentDescriptor {
+                content_id: parse_content_id(&content_id)?,
+                byte_length: nonnegative_u64(byte_length)?,
+            })
+        })
+        .collect()
+    }
+
+    /// Records that immutable bytes are locally verified. Waiting uploads
+    /// become eligible and redundant downloads complete atomically.
+    pub fn mark_resource_local(
+        &self,
+        descriptor: ContentDescriptor,
+        verified_at_unix_ms: i64,
+    ) -> Result<(), ClientStoreError> {
+        if verified_at_unix_ms < 0 {
+            return Err(ClientStoreError::NegativeTimestamp);
+        }
+        let byte_length = i64::try_from(descriptor.byte_length)
+            .map_err(|_| ClientStoreError::InvalidResourceProgress)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE client_resources SET locally_available = 1, local_verified_at_unix_ms = ?3
+             WHERE content_id = ?1 AND byte_length = ?2",
+            params![
+                descriptor.content_id.to_string(),
+                byte_length,
+                verified_at_unix_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ClientStoreError::ResourceDescriptorConflict);
+        }
+        transaction.execute(
+            "UPDATE client_resource_transfers SET
+                state = 'complete', transferred_bytes = ?2,
+                completed_at_unix_ms = ?3, lease_id = NULL,
+                lease_expires_at_unix_ms = NULL, last_error = NULL
+             WHERE content_id = ?1 AND direction = 'download' AND state <> 'complete'",
+            params![
+                descriptor.content_id.to_string(),
+                byte_length,
+                verified_at_unix_ms
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE client_resource_transfers SET
+                state = 'pending', next_attempt_at_unix_ms = ?2, last_error = NULL
+             WHERE content_id = ?1 AND direction = 'upload' AND state = 'waiting_local'",
+            params![descriptor.content_id.to_string(), verified_at_unix_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn lease_due_resources(
+        &self,
+        now_unix_ms: i64,
+        lease_duration: Duration,
+        limit: usize,
+        lease_id: ResourceTransferLeaseId,
+    ) -> Result<Vec<ResourceTransferItem>, ClientStoreError> {
+        if now_unix_ms < 0 {
+            return Err(ClientStoreError::NegativeTimestamp);
+        }
+        validate_resource_limit(limit)?;
+        let lease_ms = i64::try_from(lease_duration.as_millis())
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(ClientStoreError::InvalidLeaseDuration)?;
+        let expires = now_unix_ms
+            .checked_add(lease_ms)
+            .ok_or(ClientStoreError::InvalidLeaseDuration)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let keys = {
+            let mut statement = transaction.prepare(
+                "SELECT t.peer_id, t.content_id, t.direction
+                 FROM client_resource_transfers t
+                 JOIN client_peers p USING(peer_id)
+                 WHERE p.enabled = 1 AND (
+                    (t.state = 'pending' AND t.next_attempt_at_unix_ms <= ?1) OR
+                    (t.state = 'leased' AND t.lease_expires_at_unix_ms <= ?1)
+                 )
+                 ORDER BY CASE t.direction WHEN 'download' THEN 0 ELSE 1 END,
+                          t.next_attempt_at_unix_ms, t.peer_id, t.content_id
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![now_unix_ms, limit_i64(limit)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut items = Vec::with_capacity(keys.len());
+        for (peer_id, content_id, direction) in keys {
+            let changed = transaction.execute(
+                "UPDATE client_resource_transfers SET
+                    state = 'leased', attempt_count = attempt_count + 1,
+                    lease_id = ?4, lease_expires_at_unix_ms = ?5
+                 WHERE peer_id = ?1 AND content_id = ?2 AND direction = ?3",
+                params![
+                    peer_id,
+                    content_id,
+                    direction,
+                    lease_id.to_string(),
+                    expires
+                ],
+            )?;
+            if changed != 1 {
+                return Err(corrupt("selected resource transfer disappeared"));
+            }
+            items.push(load_resource_transfer(
+                &transaction,
+                &peer_id,
+                &content_id,
+                &direction,
+            )?);
+        }
+        transaction.commit()?;
+        Ok(items)
+    }
+
+    pub fn record_resource_progress(
+        &self,
+        peer_id: NodeId,
+        content_id: ContentId,
+        direction: ResourceTransferDirection,
+        lease_id: ResourceTransferLeaseId,
+        transferred_bytes: u64,
+        remote_upload_url: Option<&str>,
+    ) -> Result<(), ClientStoreError> {
+        let transferred = i64::try_from(transferred_bytes)
+            .map_err(|_| ClientStoreError::InvalidResourceProgress)?;
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "UPDATE client_resource_transfers SET
+                transferred_bytes = ?5,
+                remote_upload_url = CASE WHEN direction = 'upload' THEN ?6 ELSE NULL END
+             WHERE peer_id = ?1 AND content_id = ?2 AND direction = ?3
+               AND state = 'leased' AND lease_id = ?4
+               AND ?5 <= (SELECT byte_length FROM client_resources WHERE content_id = ?2)",
+            params![
+                peer_id.to_string(),
+                content_id.to_string(),
+                direction.as_str(),
+                lease_id.to_string(),
+                transferred,
+                remote_upload_url,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ClientStoreError::ResourceLeaseMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn complete_resource_transfer(
+        &self,
+        peer_id: NodeId,
+        content_id: ContentId,
+        direction: ResourceTransferDirection,
+        lease_id: ResourceTransferLeaseId,
+        completed_at_unix_ms: i64,
+    ) -> Result<(), ClientStoreError> {
+        self.finish_resource_transfer(
+            LeasedResourceTransfer {
+                peer_id,
+                content_id,
+                direction,
+                lease_id,
+            },
+            "complete",
+            completed_at_unix_ms,
+            None,
+        )
+    }
+
+    pub fn retry_resource_transfer(
+        &self,
+        peer_id: NodeId,
+        content_id: ContentId,
+        direction: ResourceTransferDirection,
+        lease_id: ResourceTransferLeaseId,
+        next_attempt_at_unix_ms: i64,
+        error: &str,
+    ) -> Result<(), ClientStoreError> {
+        self.finish_resource_transfer(
+            LeasedResourceTransfer {
+                peer_id,
+                content_id,
+                direction,
+                lease_id,
+            },
+            "pending",
+            next_attempt_at_unix_ms,
+            Some(error),
+        )
+    }
+
+    pub fn continue_resource_transfer(
+        &self,
+        peer_id: NodeId,
+        content_id: ContentId,
+        direction: ResourceTransferDirection,
+        lease_id: ResourceTransferLeaseId,
+        next_attempt_at_unix_ms: i64,
+    ) -> Result<(), ClientStoreError> {
+        if next_attempt_at_unix_ms < 0 {
+            return Err(ClientStoreError::NegativeTimestamp);
+        }
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "UPDATE client_resource_transfers SET
+                state = 'pending', attempt_count = 0,
+                next_attempt_at_unix_ms = ?5,
+                lease_id = NULL, lease_expires_at_unix_ms = NULL,
+                completed_at_unix_ms = NULL, last_error = NULL
+             WHERE peer_id = ?1 AND content_id = ?2 AND direction = ?3
+               AND state = 'leased' AND lease_id = ?4",
+            params![
+                peer_id.to_string(),
+                content_id.to_string(),
+                direction.as_str(),
+                lease_id.to_string(),
+                next_attempt_at_unix_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ClientStoreError::ResourceLeaseMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn reject_resource_transfer(
+        &self,
+        peer_id: NodeId,
+        content_id: ContentId,
+        direction: ResourceTransferDirection,
+        lease_id: ResourceTransferLeaseId,
+        rejected_at_unix_ms: i64,
+        error: &str,
+    ) -> Result<(), ClientStoreError> {
+        self.finish_resource_transfer(
+            LeasedResourceTransfer {
+                peer_id,
+                content_id,
+                direction,
+                lease_id,
+            },
+            "rejected",
+            rejected_at_unix_ms,
+            Some(error),
+        )
+    }
+
+    pub fn wait_for_local_resource(
+        &self,
+        peer_id: NodeId,
+        content_id: ContentId,
+        lease_id: ResourceTransferLeaseId,
+        next_check_at_unix_ms: i64,
+        error: &str,
+    ) -> Result<(), ClientStoreError> {
+        if next_check_at_unix_ms < 0 {
+            return Err(ClientStoreError::NegativeTimestamp);
+        }
+        if error.len() > MAX_ERROR_BYTES {
+            return Err(ClientStoreError::DeliveryErrorTooLong);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE client_resource_transfers SET
+                state = 'waiting_local', next_attempt_at_unix_ms = ?4,
+                lease_id = NULL, lease_expires_at_unix_ms = NULL, last_error = ?5
+             WHERE peer_id = ?1 AND content_id = ?2 AND direction = 'upload'
+               AND state = 'leased' AND lease_id = ?3",
+            params![
+                peer_id.to_string(),
+                content_id.to_string(),
+                lease_id.to_string(),
+                next_check_at_unix_ms,
+                error,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ClientStoreError::ResourceLeaseMismatch);
+        }
+        transaction.execute(
+            "UPDATE client_resources SET locally_available = 0, local_expected = 1,
+                    local_verified_at_unix_ms = NULL
+             WHERE content_id = ?1",
+            params![content_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn finish_resource_transfer(
+        &self,
+        transfer: LeasedResourceTransfer,
+        state: &'static str,
+        at_unix_ms: i64,
+        error: Option<&str>,
+    ) -> Result<(), ClientStoreError> {
+        if at_unix_ms < 0 {
+            return Err(ClientStoreError::NegativeTimestamp);
+        }
+        if error.is_some_and(|value| value.len() > MAX_ERROR_BYTES) {
+            return Err(ClientStoreError::DeliveryErrorTooLong);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE client_resource_transfers SET
+                state = ?5, next_attempt_at_unix_ms = ?6,
+                lease_id = NULL, lease_expires_at_unix_ms = NULL,
+                transferred_bytes = CASE WHEN ?5 = 'complete' THEN
+                    (SELECT byte_length FROM client_resources WHERE content_id = ?2)
+                    ELSE transferred_bytes END,
+                completed_at_unix_ms = CASE WHEN ?5 = 'complete' THEN ?6 ELSE NULL END,
+                last_error = ?7
+             WHERE peer_id = ?1 AND content_id = ?2 AND direction = ?3
+               AND state = 'leased' AND lease_id = ?4",
+            params![
+                transfer.peer_id.to_string(),
+                transfer.content_id.to_string(),
+                transfer.direction.as_str(),
+                transfer.lease_id.to_string(),
+                state,
+                at_unix_ms,
+                error,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ClientStoreError::ResourceLeaseMismatch);
+        }
+        if state == "complete" && transfer.direction == ResourceTransferDirection::Download {
+            let descriptor = resource_descriptor(&transaction, transfer.content_id)?;
+            transaction.execute(
+                "UPDATE client_resources SET locally_available = 1, local_verified_at_unix_ms = ?2
+                 WHERE content_id = ?1",
+                params![transfer.content_id.to_string(), at_unix_ms],
+            )?;
+            transaction.execute(
+                "UPDATE client_resource_transfers SET
+                    state = 'complete', transferred_bytes = ?2,
+                    completed_at_unix_ms = ?3, lease_id = NULL,
+                    lease_expires_at_unix_ms = NULL, last_error = NULL
+                 WHERE content_id = ?1 AND direction = 'download' AND state <> 'complete'",
+                params![
+                    transfer.content_id.to_string(),
+                    i64::try_from(descriptor.byte_length)
+                        .map_err(|_| ClientStoreError::InvalidResourceProgress)?,
+                    at_unix_ms,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE client_resource_transfers SET
+                    state = 'pending', next_attempt_at_unix_ms = ?2, last_error = NULL
+                 WHERE content_id = ?1 AND direction = 'upload' AND state = 'waiting_local'",
+                params![transfer.content_id.to_string(), at_unix_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn lease_due(
@@ -990,6 +1501,223 @@ fn validate_peer(peer: &PeerConfig) -> Result<(), ClientStoreError> {
         return Err(ClientStoreError::InvalidPeerEndpoint);
     }
     Ok(())
+}
+
+fn validate_resource_limit(limit: usize) -> Result<(), ClientStoreError> {
+    if !(1..=MAX_RESOURCE_TRANSFER_BATCH).contains(&limit) {
+        return Err(ClientStoreError::InvalidResourceTransferLimit);
+    }
+    Ok(())
+}
+
+fn insert_operation_resources(
+    transaction: &Transaction<'_>,
+    operation: &OperationEnvelope,
+    discovered_at_unix_ms: i64,
+) -> Result<(), ClientStoreError> {
+    for (position, resource) in operation.body.resources().iter().enumerate() {
+        let byte_length = i64::try_from(resource.byte_length)
+            .map_err(|_| ClientStoreError::InvalidResourceProgress)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO client_resources (
+                content_id, byte_length, media_type, role, original_name, discovered_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                resource.content_id.to_string(),
+                byte_length,
+                resource.media_type,
+                resource.role,
+                resource.original_name,
+                discovered_at_unix_ms,
+            ],
+        )?;
+        let existing_length: i64 = transaction.query_row(
+            "SELECT byte_length FROM client_resources WHERE content_id = ?1",
+            params![resource.content_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if existing_length != byte_length {
+            return Err(ClientStoreError::ResourceDescriptorConflict);
+        }
+        transaction.execute(
+            "INSERT INTO client_operation_resources (operation_id, position, content_id)
+             VALUES (?1, ?2, ?3)",
+            params![
+                operation.operation_id.to_string(),
+                limit_i64(position)?,
+                resource.content_id.to_string(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_resource_source(
+    transaction: &Transaction<'_>,
+    operation: &OperationEnvelope,
+    at_unix_ms: i64,
+    source: CommitSource,
+) -> Result<(), ClientStoreError> {
+    if operation.body.resources().is_empty() || source == CommitSource::Remote {
+        return Ok(());
+    }
+    for resource in operation.body.resources() {
+        match source {
+            CommitSource::Local => {
+                transaction.execute(
+                    "UPDATE client_resources SET local_expected = 1 WHERE content_id = ?1",
+                    params![resource.content_id.to_string()],
+                )?;
+                queue_resource_uploads(transaction, resource.content_id, at_unix_ms, None)?;
+            }
+            CommitSource::Peer(source_peer) => {
+                let (available, byte_length): (bool, i64) = transaction.query_row(
+                    "SELECT locally_available, byte_length FROM client_resources WHERE content_id = ?1",
+                    params![resource.content_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO client_resource_transfers (
+                        peer_id, content_id, direction, state, next_attempt_at_unix_ms,
+                        transferred_bytes, completed_at_unix_ms
+                     ) VALUES (?1, ?2, 'download', ?3, ?4, ?5, ?6)",
+                    params![
+                        source_peer.to_string(),
+                        resource.content_id.to_string(),
+                        if available { "complete" } else { "pending" },
+                        at_unix_ms,
+                        if available { byte_length } else { 0 },
+                        available.then_some(at_unix_ms),
+                    ],
+                )?;
+                queue_resource_uploads(
+                    transaction,
+                    resource.content_id,
+                    at_unix_ms,
+                    Some(source_peer),
+                )?;
+            }
+            CommitSource::Remote => {}
+        }
+    }
+    Ok(())
+}
+
+fn queue_resource_uploads(
+    transaction: &Transaction<'_>,
+    content_id: ContentId,
+    at_unix_ms: i64,
+    excluded_peer: Option<NodeId>,
+) -> Result<(), ClientStoreError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO client_resource_transfers (
+            peer_id, content_id, direction, state, next_attempt_at_unix_ms
+         ) SELECT p.peer_id, r.content_id, 'upload',
+                  CASE r.locally_available WHEN 1 THEN 'pending' ELSE 'waiting_local' END,
+                  ?2
+           FROM client_peers p JOIN client_resources r ON r.content_id = ?1
+          WHERE p.enabled = 1 AND (?3 IS NULL OR p.peer_id <> ?3)",
+        params![
+            content_id.to_string(),
+            at_unix_ms,
+            excluded_peer.map(|value| value.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn queue_known_resources_for_peer(
+    transaction: &Transaction<'_>,
+    peer_id: NodeId,
+    fallback_at_unix_ms: i64,
+) -> Result<(), ClientStoreError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO client_resource_transfers (
+            peer_id, content_id, direction, state, next_attempt_at_unix_ms
+         ) SELECT ?1, content_id, 'upload',
+                  CASE locally_available WHEN 1 THEN 'pending' ELSE 'waiting_local' END,
+                  max(discovered_at_unix_ms, ?2)
+           FROM client_resources",
+        params![peer_id.to_string(), fallback_at_unix_ms],
+    )?;
+    Ok(())
+}
+
+fn load_resource_transfer(
+    connection: &Connection,
+    peer_id: &str,
+    content_id: &str,
+    direction: &str,
+) -> Result<ResourceTransferItem, ClientStoreError> {
+    let row = connection.query_row(
+        "SELECT p.endpoint, p.enabled, p.added_at_unix_ms,
+                r.byte_length, r.media_type, r.role, r.original_name,
+                t.attempt_count, t.remote_upload_url, t.transferred_bytes
+         FROM client_resource_transfers t
+         JOIN client_peers p USING(peer_id)
+         JOIN client_resources r USING(content_id)
+         WHERE t.peer_id = ?1 AND t.content_id = ?2 AND t.direction = ?3",
+        params![peer_id, content_id, direction],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        },
+    )?;
+    Ok(ResourceTransferItem {
+        peer: PeerConfig {
+            peer_id: peer_id
+                .parse()
+                .map_err(|error| corrupt(format!("invalid peer ID: {error}")))?,
+            endpoint: row.0,
+            enabled: row.1,
+            added_at_unix_ms: row.2,
+        },
+        resource: ResourceRef {
+            content_id: parse_content_id(content_id)?,
+            byte_length: nonnegative_u64(row.3)?,
+            media_type: row.4,
+            role: row.5,
+            original_name: row.6,
+        },
+        direction: match direction {
+            "upload" => ResourceTransferDirection::Upload,
+            "download" => ResourceTransferDirection::Download,
+            _ => return Err(corrupt("invalid resource transfer direction")),
+        },
+        attempt_count: u32::try_from(row.7)
+            .map_err(|_| corrupt("resource attempt count overflow"))?,
+        remote_upload_url: row.8,
+        transferred_bytes: nonnegative_u64(row.9)?,
+    })
+}
+
+fn resource_descriptor(
+    connection: &Connection,
+    content_id: ContentId,
+) -> Result<ContentDescriptor, ClientStoreError> {
+    let byte_length: i64 = connection.query_row(
+        "SELECT byte_length FROM client_resources WHERE content_id = ?1",
+        params![content_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(ContentDescriptor {
+        content_id,
+        byte_length: nonnegative_u64(byte_length)?,
+    })
+}
+
+fn parse_content_id(value: &str) -> Result<ContentId, ClientStoreError> {
+    ContentId::parse(value).map_err(|error| corrupt(format!("invalid content ID: {error}")))
 }
 
 fn apply_delivery_source(

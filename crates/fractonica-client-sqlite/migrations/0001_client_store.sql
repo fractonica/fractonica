@@ -82,6 +82,31 @@ CREATE INDEX client_projections_temporal_idx
 CREATE INDEX client_projections_text_idx
     ON client_projections (space_id, schema_id, sort_text, entity_id, operation_id);
 
+CREATE TABLE client_resources (
+    content_id TEXT PRIMARY KEY,
+    byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+    media_type TEXT NOT NULL,
+    role TEXT NOT NULL,
+    original_name TEXT,
+    locally_available INTEGER NOT NULL DEFAULT 0 CHECK (locally_available IN (0, 1)),
+    local_expected INTEGER NOT NULL DEFAULT 0 CHECK (local_expected IN (0, 1)),
+    discovered_at_unix_ms INTEGER NOT NULL CHECK (discovered_at_unix_ms >= 0),
+    local_verified_at_unix_ms INTEGER
+) STRICT;
+
+CREATE TABLE client_operation_resources (
+    operation_id TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    content_id TEXT NOT NULL,
+    PRIMARY KEY (operation_id, position),
+    UNIQUE (operation_id, content_id),
+    FOREIGN KEY (operation_id) REFERENCES client_operations(operation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (content_id) REFERENCES client_resources(content_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX client_operation_resources_content_idx
+    ON client_operation_resources (content_id, operation_id);
+
 CREATE TABLE client_peers (
     peer_id TEXT PRIMARY KEY,
     endpoint TEXT NOT NULL,
@@ -126,5 +151,31 @@ CREATE TABLE client_deliveries (
 
 CREATE INDEX client_deliveries_due_idx
     ON client_deliveries (peer_id, state, next_attempt_at_unix_ms, lease_expires_at_unix_ms);
+
+CREATE TABLE client_resource_transfers (
+    peer_id TEXT NOT NULL,
+    content_id TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('upload', 'download')),
+    state TEXT NOT NULL CHECK (state IN ('waiting_local', 'pending', 'leased', 'complete', 'rejected')),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_at_unix_ms INTEGER NOT NULL CHECK (next_attempt_at_unix_ms >= 0),
+    lease_id TEXT,
+    lease_expires_at_unix_ms INTEGER,
+    remote_upload_url TEXT,
+    transferred_bytes INTEGER NOT NULL DEFAULT 0 CHECK (transferred_bytes >= 0),
+    completed_at_unix_ms INTEGER,
+    last_error TEXT,
+    PRIMARY KEY (peer_id, content_id, direction),
+    FOREIGN KEY (peer_id) REFERENCES client_peers(peer_id) ON DELETE CASCADE,
+    FOREIGN KEY (content_id) REFERENCES client_resources(content_id) ON DELETE RESTRICT,
+    CHECK ((state = 'leased') = (lease_id IS NOT NULL)),
+    CHECK ((state = 'leased') = (lease_expires_at_unix_ms IS NOT NULL)),
+    CHECK ((state = 'complete') = (completed_at_unix_ms IS NOT NULL)),
+    CHECK (direction = 'upload' OR remote_upload_url IS NULL),
+    CHECK (direction = 'upload' OR state <> 'waiting_local')
+) STRICT;
+
+CREATE INDEX client_resource_transfers_due_idx
+    ON client_resource_transfers (state, next_attempt_at_unix_ms, lease_expires_at_unix_ms, direction, peer_id);
 
 PRAGMA user_version = 1;

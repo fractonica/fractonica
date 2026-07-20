@@ -20,7 +20,17 @@ retry/rejection state is durable. Batch size is bounded so the caller can run
 each synchronous store call on a native blocking pool without monopolizing a
 UI executor.
 
+Every operation resource is also indexed by immutable content ID. The store
+creates independent per-peer upload and download jobs, persists partial byte
+progress and remote tus URLs, and leases that work with
+`ResourceTransferLeaseId`. A local verification atomically unlocks every
+waiting upload. A verified peer download completes redundant source jobs and
+unlocks fan-out to other peers without changing the signed operation.
+
+Resource bytes never enter SQLite. `fractonica-client-content` remains the
+source of truth for local byte availability; SQLite stores only descriptors,
+references, scheduling state, and aggregate progress.
+
 Entity heads and client projections are derived entirely from immutable local
 operations. `rebuild_derived_state` recreates both without altering delivery
 state.
-
