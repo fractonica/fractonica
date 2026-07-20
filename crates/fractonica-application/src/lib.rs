@@ -13,7 +13,7 @@ use fractonica_content::{ContentDescriptor, ContentId};
 use fractonica_core::InstallationMetadata;
 use fractonica_data_model::{
     ActorId, CapabilityAction, DataModelError, EntityId, EntitySchema, OperationBody,
-    OperationEnvelope, OperationId, RecordVisibility, SpaceId,
+    OperationEnvelope, OperationId, SpaceId, Visibility,
 };
 use fractonica_peer::{PeerProofError, PeerReadChangesProof};
 use serde::{Deserialize, Serialize};
@@ -318,7 +318,7 @@ pub enum RepositoryError {
 /// authorization references in the selected space, invokes
 /// [`authorization::authorize_operation`] against that same transaction view.
 /// For record revisions or tombstones it uses
-/// [`authorization::authorize_operation_for_record_visibility`] with the
+/// [`authorization::authorize_operation_for_visibility`] with the
 /// immutable visibility derived from admitted entity state. It then updates
 /// heads and inserts atomically. The operation digest is the only protocol
 /// idempotency identity.
@@ -589,9 +589,15 @@ fn validate_trusted_bootstrap(
             CapabilityAction::AppendOperation,
             CapabilityAction::ReadSpace,
         ]
-        || grant.schemas.as_slice() != [EntitySchema::RecordV1]
-        || grant.record_visibilities.as_slice()
-            != [RecordVisibility::Public, RecordVisibility::Private]
+        || grant.schemas.as_slice()
+            != [
+                EntitySchema::EventV1,
+                EntitySchema::ProfileV1,
+                EntitySchema::RecordV1,
+                EntitySchema::RecordV2,
+                EntitySchema::TagV1,
+            ]
+        || grant.visibilities.as_slice() != [Visibility::Public, Visibility::Private]
         || !grant.content_roles.is_empty()
         || grant.max_resource_byte_length.is_some()
         || grant.not_before_unix_ms.is_some()

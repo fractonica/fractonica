@@ -358,7 +358,7 @@ mod tests {
                 capability: CapabilityGrantTemplate {
                     actions: vec![CapabilityAction::ReadSpace],
                     schemas: vec![],
-                    record_visibilities: vec![],
+                    visibilities: vec![],
                     content_roles: vec![],
                     max_resource_byte_length: None,
                     not_before_unix_ms: None,

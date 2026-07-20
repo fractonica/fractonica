@@ -7,7 +7,7 @@
 use fractonica_application::{MAX_SPACE_DISPLAY_NAME_CHARS, TrustedSpaceBootstrapRequest};
 use fractonica_data_model::{
     CapabilityAction, CapabilityGrant, DataModelError, EntityId, EntitySchema, OperationBody,
-    OperationEnvelope, OperationNonce, RecordVisibility,
+    OperationEnvelope, OperationNonce, Visibility,
 };
 use fractonica_keystore::IdentityBundle;
 use thiserror::Error;
@@ -115,8 +115,14 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
                     CapabilityAction::AppendOperation,
                     CapabilityAction::ReadSpace,
                 ],
-                schemas: vec![EntitySchema::RecordV1],
-                record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+                schemas: vec![
+                    EntitySchema::EventV1,
+                    EntitySchema::ProfileV1,
+                    EntitySchema::RecordV1,
+                    EntitySchema::RecordV2,
+                    EntitySchema::TagV1,
+                ],
+                visibilities: vec![Visibility::Public, Visibility::Private],
                 content_roles: Vec::new(),
                 max_resource_byte_length: None,
                 not_before_unix_ms: None,
@@ -323,10 +329,19 @@ mod tests {
                 CapabilityAction::ReadSpace
             ]
         );
-        assert_eq!(grant.schemas, vec![EntitySchema::RecordV1]);
         assert_eq!(
-            grant.record_visibilities,
-            vec![RecordVisibility::Public, RecordVisibility::Private]
+            grant.schemas,
+            vec![
+                EntitySchema::EventV1,
+                EntitySchema::ProfileV1,
+                EntitySchema::RecordV1,
+                EntitySchema::RecordV2,
+                EntitySchema::TagV1,
+            ]
+        );
+        assert_eq!(
+            grant.visibilities,
+            vec![Visibility::Public, Visibility::Private]
         );
         assert!(grant.content_roles.is_empty());
         assert_eq!(grant.max_resource_byte_length, None);

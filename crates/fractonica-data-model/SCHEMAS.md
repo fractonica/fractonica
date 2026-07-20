@@ -68,6 +68,84 @@ Each resource is:
 The record validator retains the temporal, text, metadata, resource-count,
 resource-contract, and duplicate-content-ID bounds defined in the crate.
 
+`record.v1` is retained only as an already-published conformance fixture. New
+clients write `record.v2`.
+
+## Protected client documents
+
+`record.v2`, `tag.v1`, and `event.v1` wrap their application document in:
+
+```text
+[visibility, documentOrEnvelope, outerResources]
+```
+
+For `public`, visibility is `0`, `documentOrEnvelope` is the schema document,
+and `outerResources` is empty. For `private`, visibility is `1`, the second
+field is the encrypted envelope below, and the outer resource array contains
+only opaque encrypted descriptors:
+
+```text
+[0, keyId, nonceBase64url, ciphertextBase64url]
+```
+
+Encryption algorithm code `0` is `aes-256-gcm`. The nonce is exactly 12 bytes
+and the ciphertext includes the 16-byte authentication tag. Key identifiers
+use `key:aes256:` followed by 64 lowercase hexadecimal digits. Private resource
+descriptors use media type `application/octet-stream`, role `encrypted`, and a
+null original name.
+
+## Typed references
+
+A reference is `[relation, target]`. Actor targets are
+`[0, actorPublicKey32]`. Entity targets are
+`[1, spaceId32, entityUuid16, operationDigest32 | null]`. Reference order is
+semantic; exact duplicates are invalid. References describe relationships and
+never grant authority.
+
+## `record.v2`
+
+```text
+[
+  5,
+  protected([
+    startAtUnixMs,
+    endAtUnixMs | null,
+    emoji | null,
+    text | null,
+    metadata,
+    resources,
+    references
+  ])
+]
+```
+
+## `tag.v1`
+
+```text
+[6, protected([name, emoji | null, notes | null, colorHex | null, metadata, references])]
+```
+
+## `event.v1`
+
+```text
+[7, protected([startAtUnixMs, endAtUnixMs | null, label, typeNumber, metadata, references])]
+```
+
+Event type numbers are signed integers. Events cannot carry resources.
+
+## `profile.v1`
+
+```text
+[8, [handle, displayName, sarosAnchor, avatarResource | null, metadata]]
+```
+
+Profiles are public. Their entity UUID is deterministically derived from the
+actor public key under the `fractonica-profile-entity-v1` domain and uses the
+UUID version-8/variant-1 bit layout. Saros anchors are bounded to 101 through
+161.
+
+All five mutable client schemas use `[0]` as their tombstone body.
+
 ## `space.genesis.v1`
 
 ```text
@@ -86,7 +164,7 @@ genesis is an admission-policy decision above the pure data model.
   subjectActorPublicKey32,
   actions,
   schemas,
-  recordVisibilities,
+  visibilities,
   contentRoles,
   maxResourceByteLength | null,
   notBeforeUnixMs | null,
@@ -107,13 +185,14 @@ Action codes, in canonical order, are:
 | 4 | `writeContent` |
 
 Actions are nonempty and strictly ordered by code. Schemas are exact known
-schema names sorted by UTF-8 bytes. Record visibilities use the record codes
-above. Content roles use the lowercase `ResourceRef` role grammar and are
+schema names sorted by UTF-8 bytes. Visibilities use the codes above. Content
+roles use the lowercase `ResourceRef` role grammar and are
 sorted lexically.
 
 `appendOperation` requires a nonempty schema set, and a schema set is invalid
-without that action. A `record.v1` scope requires at least one allowed record
-visibility. `writeContent` requires nonempty content roles and an explicit
+without that action. Every client schema requires a nonempty visibility scope;
+`profile.v1` operations additionally require public visibility. `writeContent`
+requires nonempty content roles and an explicit
 maximum resource byte length; those constraints are invalid without that
 action. The maximum cannot exceed the content contract's 1 TiB bound.
 

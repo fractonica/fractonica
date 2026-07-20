@@ -3322,7 +3322,7 @@ mod tests {
     };
     use fractonica_core::{InstallationId, InstallationMetadata};
     use fractonica_data_model::{
-        OperationBody, OperationNonce, RecordDocument, RecordVisibility, SigningKey,
+        OperationBody, OperationNonce, RecordDocument, SigningKey, Visibility,
     };
     use fractonica_store_sqlite::SqliteStore;
     use http_body_util::BodyExt;
@@ -3721,7 +3721,7 @@ mod tests {
                 document: RecordDocument {
                     start_at_unix_ms: 1_784_390_400_000,
                     end_at_unix_ms: None,
-                    visibility: RecordVisibility::Private,
+                    visibility: Visibility::Private,
                     emoji: Some("🌀".to_owned()),
                     text: Some("signed API fixture".to_owned()),
                     metadata: BTreeMap::new(),
@@ -5551,7 +5551,7 @@ mod tests {
             body.pointer("/components/schemas/CanonicalBodyProjection/oneOf")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(5)
+            Some(9)
         );
         assert_eq!(
             body.pointer(
@@ -5569,7 +5569,11 @@ mod tests {
         );
         for schema in [
             "RecordPutBodyV1",
+            "RecordPutBodyV2",
             "RecordTombstoneBodyV1",
+            "TagPutBodyV1",
+            "EventPutBodyV1",
+            "ProfilePutBodyV1",
             "SpaceGenesisBodyV1",
             "CapabilityGrantBodyV1",
             "CapabilityRevokeBodyV1",
@@ -5590,7 +5594,7 @@ mod tests {
             .pointer("/components/schemas/EntitySchema/enum")
             .and_then(Value::as_array)
             .expect("closed entity schema enum");
-        assert_eq!(entity_schemas.len(), 4);
+        assert_eq!(entity_schemas.len(), 8);
         for path in [
             "/paths/~1api~1v2~1spaces~1{spaceId}~1operations~1{operationId}/get/responses/403",
             "/paths/~1api~1v2~1spaces~1{spaceId}~1entities~1{entityId}/get/responses/403",

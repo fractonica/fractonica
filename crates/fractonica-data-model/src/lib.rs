@@ -21,6 +21,7 @@ use fractonica_trust::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -50,6 +51,14 @@ pub const MAX_METADATA_CONTAINER_ITEMS: usize = 256;
 pub const MAX_METADATA_STRING_CHARS: usize = 16_384;
 /// Maximum number of immutable content resources referenced by one record.
 pub const MAX_RECORD_RESOURCES: usize = 64;
+/// Maximum number of signed semantic references in one client document.
+pub const MAX_ENTITY_REFERENCES: usize = 256;
+pub const MAX_RELATION_BYTES: usize = 64;
+pub const MAX_TAG_NAME_CHARS: usize = 128;
+pub const MAX_EVENT_LABEL_CHARS: usize = 256;
+pub const MAX_PROFILE_HANDLE_BYTES: usize = 32;
+pub const MAX_PROFILE_DISPLAY_NAME_CHARS: usize = 128;
+pub const MAX_ENCRYPTED_PAYLOAD_BYTES: usize = 1_048_576;
 /// Maximum number of schema names in one capability grant.
 pub const MAX_CAPABILITY_SCHEMAS: usize = 32;
 /// Maximum number of content roles in one capability grant.
@@ -134,33 +143,49 @@ impl<'de> Deserialize<'de> for EntityId {
 /// Versioned schema interpreted by an operation body.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum EntitySchema {
+    #[serde(rename = "event.v1")]
+    EventV1,
+    #[serde(rename = "profile.v1")]
+    ProfileV1,
     #[serde(rename = "record.v1")]
     RecordV1,
+    #[serde(rename = "record.v2")]
+    RecordV2,
     #[serde(rename = "space.genesis.v1")]
     SpaceGenesisV1,
     #[serde(rename = "capability.grant.v1")]
     CapabilityGrantV1,
     #[serde(rename = "capability.revoke.v1")]
     CapabilityRevokeV1,
+    #[serde(rename = "tag.v1")]
+    TagV1,
 }
 
 impl EntitySchema {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::EventV1 => "event.v1",
+            Self::ProfileV1 => "profile.v1",
             Self::RecordV1 => "record.v1",
+            Self::RecordV2 => "record.v2",
             Self::SpaceGenesisV1 => "space.genesis.v1",
             Self::CapabilityGrantV1 => "capability.grant.v1",
             Self::CapabilityRevokeV1 => "capability.revoke.v1",
+            Self::TagV1 => "tag.v1",
         }
     }
 
     pub fn parse(value: &str) -> Result<Self, DataModelError> {
         match value {
+            "event.v1" => Ok(Self::EventV1),
+            "profile.v1" => Ok(Self::ProfileV1),
             "record.v1" => Ok(Self::RecordV1),
+            "record.v2" => Ok(Self::RecordV2),
             "space.genesis.v1" => Ok(Self::SpaceGenesisV1),
             "capability.grant.v1" => Ok(Self::CapabilityGrantV1),
             "capability.revoke.v1" => Ok(Self::CapabilityRevokeV1),
+            "tag.v1" => Ok(Self::TagV1),
             _ => Err(DataModelError::UnsupportedSchema(value.to_owned())),
         }
     }
@@ -172,10 +197,10 @@ impl fmt::Display for EntitySchema {
     }
 }
 
-/// Visibility policy requested by a record document.
+/// Visibility policy requested by a client document.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum RecordVisibility {
+pub enum Visibility {
     Public,
     Private,
 }
@@ -187,7 +212,7 @@ pub struct RecordDocument {
     pub start_at_unix_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_at_unix_ms: Option<i64>,
-    pub visibility: RecordVisibility,
+    pub visibility: Visibility,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emoji: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,6 +297,402 @@ impl RecordDocument {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ReferenceTargetV1 {
+    Actor {
+        actor_id: ActorId,
+    },
+    Entity {
+        space_id: SpaceId,
+        entity_id: EntityId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        operation_id: Option<OperationId>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EntityReferenceV1 {
+    pub relation: String,
+    pub target: ReferenceTargetV1,
+}
+
+impl EntityReferenceV1 {
+    pub fn validate(&self) -> Result<(), DataModelError> {
+        let valid_relation = !self.relation.is_empty()
+            && self.relation.len() <= MAX_RELATION_BYTES
+            && self.relation.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            });
+        if !valid_relation {
+            return Err(DataModelError::InvalidRelation(self.relation.clone()));
+        }
+        match self.target {
+            ReferenceTargetV1::Actor { actor_id } => {
+                actor_id.public_key()?;
+            }
+            ReferenceTargetV1::Entity {
+                space_id,
+                entity_id,
+                ..
+            } => {
+                space_id.validate()?;
+                if entity_id.as_uuid().is_nil() {
+                    return Err(DataModelError::NilEntityId);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncryptionAlgorithmV1 {
+    Aes256Gcm,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EncryptedPayloadV1 {
+    pub algorithm: EncryptionAlgorithmV1,
+    /// `key:aes256:` plus 64 lowercase hexadecimal digits.
+    pub key_id: String,
+    /// Canonical unpadded base64url encoding of exactly 12 random bytes.
+    pub nonce_base64url: String,
+    /// Canonical unpadded base64url encoding including the 16-byte GCM tag.
+    pub ciphertext_base64url: String,
+}
+
+impl EncryptedPayloadV1 {
+    pub fn validate(&self) -> Result<(), DataModelError> {
+        let key_hex = self
+            .key_id
+            .strip_prefix("key:aes256:")
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+            .ok_or(DataModelError::InvalidEncryptedPayload("invalid key ID"))?;
+        debug_assert_eq!(key_hex.len(), 64);
+        let nonce = decode_canonical_base64url(&self.nonce_base64url)
+            .ok_or(DataModelError::InvalidEncryptedPayload("invalid nonce"))?;
+        if nonce.len() != 12 {
+            return Err(DataModelError::InvalidEncryptedPayload(
+                "nonce must contain exactly 12 bytes",
+            ));
+        }
+        let ciphertext = decode_canonical_base64url(&self.ciphertext_base64url).ok_or(
+            DataModelError::InvalidEncryptedPayload("invalid ciphertext"),
+        )?;
+        if !(16..=MAX_ENCRYPTED_PAYLOAD_BYTES).contains(&ciphertext.len()) {
+            return Err(DataModelError::InvalidEncryptedPayload(
+                "ciphertext length is outside the supported bounds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "visibility", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ProtectedDocumentV1<T> {
+    Public {
+        document: T,
+    },
+    Private {
+        envelope: EncryptedPayloadV1,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resources: Vec<ResourceRef>,
+    },
+}
+
+impl<T> ProtectedDocumentV1<T> {
+    #[must_use]
+    pub const fn visibility(&self) -> Visibility {
+        match self {
+            Self::Public { .. } => Visibility::Public,
+            Self::Private { .. } => Visibility::Private,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordDocumentV2 {
+    pub start_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<EntityReferenceV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TagDocumentV1 {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_hex: Option<String>,
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<EntityReferenceV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventDocumentV1 {
+    pub start_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_at_unix_ms: Option<i64>,
+    pub label: String,
+    pub type_number: i64,
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<EntityReferenceV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileDocumentV1 {
+    pub handle: String,
+    pub display_name: String,
+    pub saros_anchor: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<ResourceRef>,
+    pub metadata: BTreeMap<String, Value>,
+}
+
+#[must_use]
+pub fn profile_entity_id(actor_id: ActorId) -> EntityId {
+    let mut digest = Sha256::new();
+    digest.update(b"fractonica-profile-entity-v1\0");
+    digest.update(actor_id.as_bytes());
+    let mut bytes: [u8; 16] = digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix is exactly 16 bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    EntityId::new(Uuid::from_bytes(bytes))
+}
+
+fn validate_client_times(start: i64, end: Option<i64>) -> Result<(), DataModelError> {
+    if start < 0 {
+        return Err(DataModelError::NegativeRecordStart(start));
+    }
+    if let Some(end) = end
+        && end < start
+    {
+        return Err(DataModelError::RecordEndBeforeStart { start, end });
+    }
+    Ok(())
+}
+
+fn validate_metadata(values: &BTreeMap<String, Value>) -> Result<(), DataModelError> {
+    if values.len() > MAX_METADATA_ENTRIES {
+        return Err(DataModelError::TooManyMetadataEntries {
+            count: values.len(),
+            maximum: MAX_METADATA_ENTRIES,
+        });
+    }
+    for (key, value) in values {
+        validate_metadata_key(key)?;
+        validate_metadata_value(value, 1)?;
+    }
+    let encoded_size = serde_json::to_vec(values)
+        .map_err(|error| DataModelError::MetadataSerialization(error.to_string()))?
+        .len();
+    if encoded_size > MAX_METADATA_JSON_BYTES {
+        return Err(DataModelError::MetadataTooLarge {
+            bytes: encoded_size,
+            maximum: MAX_METADATA_JSON_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_references(references: &[EntityReferenceV1]) -> Result<(), DataModelError> {
+    if references.len() > MAX_ENTITY_REFERENCES {
+        return Err(DataModelError::TooManyEntityReferences {
+            count: references.len(),
+            maximum: MAX_ENTITY_REFERENCES,
+        });
+    }
+    for reference in references {
+        reference.validate()?;
+    }
+    for (index, reference) in references.iter().enumerate() {
+        if references[..index].contains(reference) {
+            return Err(DataModelError::DuplicateEntityReference);
+        }
+    }
+    Ok(())
+}
+
+fn validate_resources(resources: &[ResourceRef]) -> Result<(), DataModelError> {
+    if resources.len() > MAX_RECORD_RESOURCES {
+        return Err(DataModelError::TooManyResources {
+            count: resources.len(),
+            maximum: MAX_RECORD_RESOURCES,
+        });
+    }
+    let mut content_ids = BTreeSet::new();
+    for (index, resource) in resources.iter().enumerate() {
+        resource
+            .validate()
+            .map_err(|source| DataModelError::InvalidResource { index, source })?;
+        if !content_ids.insert(resource.content_id) {
+            return Err(DataModelError::DuplicateResourceContentId(
+                resource.content_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_resources(resources: &[ResourceRef]) -> Result<(), DataModelError> {
+    validate_resources(resources)?;
+    if resources.iter().any(|resource| {
+        resource.media_type != "application/octet-stream"
+            || resource.role != "encrypted"
+            || resource.original_name.is_some()
+    }) {
+        return Err(DataModelError::InvalidEncryptedPayload(
+            "private resources must use the opaque encrypted descriptor",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_canonical_base64url(value: &str) -> Option<Vec<u8>> {
+    let decoded = URL_SAFE_NO_PAD.decode(value).ok()?;
+    (URL_SAFE_NO_PAD.encode(&decoded) == value).then_some(decoded)
+}
+
+impl RecordDocumentV2 {
+    pub fn validate(&self) -> Result<(), DataModelError> {
+        validate_client_times(self.start_at_unix_ms, self.end_at_unix_ms)?;
+        if let Some(emoji) = &self.emoji {
+            validate_bounded_label("record emoji", emoji, MAX_EMOJI_CHARS, false)?;
+        }
+        if let Some(text) = &self.text
+            && text.chars().count() > MAX_TEXT_CHARS
+        {
+            return Err(DataModelError::TextTooLong {
+                length: text.chars().count(),
+                maximum: MAX_TEXT_CHARS,
+            });
+        }
+        validate_metadata(&self.metadata)?;
+        validate_resources(&self.resources)?;
+        validate_references(&self.references)
+    }
+}
+
+impl TagDocumentV1 {
+    pub fn validate(&self) -> Result<(), DataModelError> {
+        validate_bounded_label("tag name", &self.name, MAX_TAG_NAME_CHARS, false)?;
+        if let Some(emoji) = &self.emoji {
+            validate_bounded_label("tag emoji", emoji, MAX_EMOJI_CHARS, false)?;
+        }
+        if let Some(notes) = &self.notes {
+            validate_bounded_label("tag notes", notes, MAX_TEXT_CHARS, true)?;
+        }
+        if let Some(color) = &self.color_hex
+            && (color.len() != 7
+                || !color.starts_with('#')
+                || !color[1..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(DataModelError::InvalidClientDocument("invalid tag color"));
+        }
+        validate_metadata(&self.metadata)?;
+        validate_references(&self.references)
+    }
+}
+
+impl EventDocumentV1 {
+    pub fn validate(&self) -> Result<(), DataModelError> {
+        validate_client_times(self.start_at_unix_ms, self.end_at_unix_ms)?;
+        validate_bounded_label("event label", &self.label, MAX_EVENT_LABEL_CHARS, false)?;
+        validate_metadata(&self.metadata)?;
+        validate_references(&self.references)
+    }
+}
+
+impl ProfileDocumentV1 {
+    pub fn validate(&self) -> Result<(), DataModelError> {
+        let handle_valid = !self.handle.is_empty()
+            && self.handle.len() <= MAX_PROFILE_HANDLE_BYTES
+            && self.handle.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            });
+        if !handle_valid {
+            return Err(DataModelError::InvalidClientDocument(
+                "profile handle is invalid",
+            ));
+        }
+        validate_bounded_label(
+            "profile display name",
+            &self.display_name,
+            MAX_PROFILE_DISPLAY_NAME_CHARS,
+            false,
+        )?;
+        if !(101..=161).contains(&self.saros_anchor) {
+            return Err(DataModelError::InvalidClientDocument(
+                "profile Saros anchor is outside 101 through 161",
+            ));
+        }
+        if let Some(avatar) = &self.avatar {
+            avatar
+                .validate()
+                .map_err(|source| DataModelError::InvalidResource { index: 0, source })?;
+        }
+        validate_metadata(&self.metadata)
+    }
+}
+
+fn validate_protected<T>(
+    payload: &ProtectedDocumentV1<T>,
+    validate_public: impl FnOnce(&T) -> Result<(), DataModelError>,
+    allow_private_resources: bool,
+) -> Result<(), DataModelError> {
+    match payload {
+        ProtectedDocumentV1::Public { document } => validate_public(document),
+        ProtectedDocumentV1::Private {
+            envelope,
+            resources,
+        } => {
+            envelope.validate()?;
+            if allow_private_resources {
+                validate_private_resources(resources)
+            } else if resources.is_empty() {
+                Ok(())
+            } else {
+                Err(DataModelError::InvalidEncryptedPayload(
+                    "this schema cannot carry private resources",
+                ))
+            }
+        }
     }
 }
 
@@ -365,7 +786,7 @@ pub struct CapabilityGrant {
     pub subject: ActorId,
     pub actions: Vec<CapabilityAction>,
     pub schemas: Vec<EntitySchema>,
-    pub record_visibilities: Vec<RecordVisibility>,
+    pub visibilities: Vec<Visibility>,
     pub content_roles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_resource_byte_length: Option<u64>,
@@ -382,7 +803,7 @@ impl CapabilityGrant {
     pub fn normalize(&mut self) {
         self.actions.sort_unstable();
         self.schemas.sort_by_key(|schema| schema.as_str());
-        self.record_visibilities.sort_unstable();
+        self.visibilities.sort_unstable();
         self.content_roles.sort_unstable();
     }
 
@@ -399,7 +820,7 @@ impl CapabilityGrant {
         validate_sorted_by("schemas", &self.schemas, |left, right| {
             left.as_str().cmp(right.as_str())
         })?;
-        validate_sorted_set("recordVisibilities", &self.record_visibilities)?;
+        validate_sorted_set("visibilities", &self.visibilities)?;
         if self.content_roles.len() > MAX_CAPABILITY_CONTENT_ROLES {
             return Err(DataModelError::CapabilitySetTooLarge {
                 field: "contentRoles",
@@ -438,10 +859,19 @@ impl CapabilityGrant {
                 "appendOperation requires a nonempty schemas set, and schemas require appendOperation",
             ));
         }
-        let records = self.schemas.contains(&EntitySchema::RecordV1);
-        if records != !self.record_visibilities.is_empty() {
+        let visibility_scoped = self.schemas.iter().any(|schema| {
+            matches!(
+                schema,
+                EntitySchema::RecordV1
+                    | EntitySchema::RecordV2
+                    | EntitySchema::TagV1
+                    | EntitySchema::EventV1
+                    | EntitySchema::ProfileV1
+            )
+        });
+        if visibility_scoped != !self.visibilities.is_empty() {
             return Err(DataModelError::CapabilityScopeMismatch(
-                "record.v1 requires a nonempty recordVisibilities set, and recordVisibilities require record.v1",
+                "client schemas require a nonempty visibility set, and visibility scope requires a client schema",
             ));
         }
 
@@ -504,18 +934,64 @@ impl CapabilityRevocation {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum OperationBody {
-    Put { document: RecordDocument },
+    Put {
+        document: RecordDocument,
+    },
+    PutRecordV2 {
+        payload: ProtectedDocumentV1<RecordDocumentV2>,
+    },
+    PutTagV1 {
+        payload: ProtectedDocumentV1<TagDocumentV1>,
+    },
+    PutEventV1 {
+        payload: ProtectedDocumentV1<EventDocumentV1>,
+    },
+    PutProfileV1 {
+        document: ProfileDocumentV1,
+    },
     Tombstone,
-    SpaceGenesis { controller: ActorId },
-    CapabilityGrant { grant: CapabilityGrant },
-    CapabilityRevoke { revocation: CapabilityRevocation },
+    SpaceGenesis {
+        controller: ActorId,
+    },
+    CapabilityGrant {
+        grant: CapabilityGrant,
+    },
+    CapabilityRevoke {
+        revocation: CapabilityRevocation,
+    },
 }
 
 impl OperationBody {
+    #[must_use]
+    pub const fn declared_visibility(&self) -> Option<Visibility> {
+        match self {
+            Self::Put { document } => Some(document.visibility),
+            Self::PutRecordV2 { payload } => Some(payload.visibility()),
+            Self::PutTagV1 { payload } => Some(payload.visibility()),
+            Self::PutEventV1 { payload } => Some(payload.visibility()),
+            Self::PutProfileV1 { .. } => Some(Visibility::Public),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn resources(&self) -> &[ResourceRef] {
+        match self {
+            Self::Put { document } => &document.resources,
+            Self::PutRecordV2 { payload } => match payload {
+                ProtectedDocumentV1::Public { document } => &document.resources,
+                ProtectedDocumentV1::Private { resources, .. } => resources,
+            },
+            Self::PutProfileV1 { document } => document.avatar.as_slice(),
+            _ => &[],
+        }
+    }
+
     fn validate_for(
         &self,
         schema: EntitySchema,
         actor_id: ActorId,
+        entity_id: EntityId,
         causal_parents: &[OperationId],
         authorization: &[OperationId],
     ) -> Result<(), DataModelError> {
@@ -524,7 +1000,34 @@ impl OperationBody {
         }
         match (schema, self) {
             (EntitySchema::RecordV1, Self::Put { document }) => document.validate(),
-            (EntitySchema::RecordV1, Self::Tombstone) => Ok(()),
+            (EntitySchema::RecordV2, Self::PutRecordV2 { payload }) => {
+                validate_protected(payload, RecordDocumentV2::validate, true)
+            }
+            (EntitySchema::TagV1, Self::PutTagV1 { payload }) => {
+                validate_protected(payload, TagDocumentV1::validate, false)
+            }
+            (EntitySchema::EventV1, Self::PutEventV1 { payload }) => {
+                validate_protected(payload, EventDocumentV1::validate, false)
+            }
+            (EntitySchema::ProfileV1, Self::PutProfileV1 { document }) => {
+                if entity_id != profile_entity_id(actor_id) {
+                    return Err(DataModelError::ProfileEntityMismatch);
+                }
+                document.validate()
+            }
+            (
+                EntitySchema::RecordV1
+                | EntitySchema::RecordV2
+                | EntitySchema::TagV1
+                | EntitySchema::EventV1
+                | EntitySchema::ProfileV1,
+                Self::Tombstone,
+            ) => {
+                if schema == EntitySchema::ProfileV1 && entity_id != profile_entity_id(actor_id) {
+                    return Err(DataModelError::ProfileEntityMismatch);
+                }
+                Ok(())
+            }
             (EntitySchema::SpaceGenesisV1, Self::SpaceGenesis { controller }) => {
                 controller.public_key()?;
                 if *controller != actor_id {
@@ -590,6 +1093,7 @@ impl SignedOperationEnvelope {
         body.validate_for(
             schema,
             signing_key.actor_id(),
+            entity_id,
             &causal_parents,
             &authorization,
         )?;
@@ -694,6 +1198,7 @@ impl SignedOperationEnvelope {
         self.body.validate_for(
             self.schema,
             self.actor_id,
+            self.entity_id,
             &self.causal_parents,
             &self.authorization,
         )
@@ -993,6 +1498,18 @@ pub enum DataModelError {
     },
     #[error("record references content ID more than once: {0}")]
     DuplicateResourceContentId(ContentId),
+    #[error("client document is invalid: {0}")]
+    InvalidClientDocument(&'static str),
+    #[error("entity relation token is invalid: {0:?}")]
+    InvalidRelation(String),
+    #[error("document has {count} entity references; maximum is {maximum}")]
+    TooManyEntityReferences { count: usize, maximum: usize },
+    #[error("document contains a duplicate entity reference")]
+    DuplicateEntityReference,
+    #[error("encrypted payload is invalid: {0}")]
+    InvalidEncryptedPayload(&'static str),
+    #[error("profile entity ID is not the deterministic ID of its signing actor")]
+    ProfileEntityMismatch,
     #[error("capability set {field} must not be empty")]
     EmptyCapabilitySet { field: &'static str },
     #[error("capability set {field} is not unique and strictly sorted")]

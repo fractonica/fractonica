@@ -103,10 +103,14 @@ CREATE TABLE operations (
         AND entity_id <> '00000000-0000-0000-0000-000000000000'
     ),
     schema_id TEXT NOT NULL CHECK (schema_id IN (
+        'event.v1',
+        'profile.v1',
         'record.v1',
+        'record.v2',
         'space.genesis.v1',
         'capability.grant.v1',
-        'capability.revoke.v1'
+        'capability.revoke.v1',
+        'tag.v1'
     )),
     actor_id TEXT NOT NULL CHECK (
         length(actor_id) = 78
@@ -268,13 +272,15 @@ CREATE TABLE entity_heads (
 CREATE INDEX entity_heads_entity_idx
     ON entity_heads (space_id, entity_id, schema_id, operation_id);
 
--- Immutable visibility is materialized once for each record entity. Revisions
+-- Immutable visibility is materialized once for each client entity. Revisions
 -- and tombstones authorize against this row, rather than only their new body,
 -- so a narrow capability cannot cross or erase another visibility domain.
-CREATE TABLE record_entity_visibility (
+CREATE TABLE client_entity_visibility (
     space_id TEXT NOT NULL,
     entity_id TEXT NOT NULL,
-    schema_id TEXT NOT NULL DEFAULT 'record.v1' CHECK (schema_id = 'record.v1'),
+    schema_id TEXT NOT NULL CHECK (schema_id IN (
+        'event.v1', 'profile.v1', 'record.v1', 'record.v2', 'tag.v1'
+    )),
     origin_operation_id TEXT NOT NULL,
     visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
     PRIMARY KEY (space_id, entity_id),
@@ -284,8 +290,8 @@ CREATE TABLE record_entity_visibility (
         ON DELETE RESTRICT
 ) STRICT;
 
-CREATE INDEX record_entity_visibility_lookup_idx
-    ON record_entity_visibility (space_id, visibility, entity_id);
+CREATE INDEX client_entity_visibility_lookup_idx
+    ON client_entity_visibility (space_id, visibility, entity_id);
 
 -- Resource references remain valid when bytes are absent locally, so this
 -- table intentionally has no foreign key to blobs.
@@ -417,10 +423,14 @@ CREATE TABLE capability_grant_schema_scopes (
     grant_operation_id TEXT NOT NULL,
     position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 31),
     schema_id TEXT NOT NULL CHECK (schema_id IN (
+        'event.v1',
+        'profile.v1',
         'record.v1',
+        'record.v2',
         'space.genesis.v1',
         'capability.grant.v1',
-        'capability.revoke.v1'
+        'capability.revoke.v1',
+        'tag.v1'
     )),
     PRIMARY KEY (space_id, grant_operation_id, schema_id),
     UNIQUE (space_id, grant_operation_id, position),
@@ -432,7 +442,7 @@ CREATE TABLE capability_grant_schema_scopes (
 CREATE INDEX capability_grant_schema_scopes_lookup_idx
     ON capability_grant_schema_scopes (space_id, schema_id, grant_operation_id);
 
-CREATE TABLE capability_grant_record_visibilities (
+CREATE TABLE capability_grant_visibilities (
     space_id TEXT NOT NULL,
     grant_operation_id TEXT NOT NULL,
     position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 1),

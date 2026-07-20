@@ -5,13 +5,13 @@ use fractonica_application::{
     TrustedSpaceBootstrapResult,
     authorization::{
         CapabilityView, CapabilityViewError, authorize_capability_action, authorize_operation,
-        authorize_operation_for_record_visibility,
+        authorize_operation_for_visibility,
     },
 };
 use fractonica_core::InstallationMetadata;
 use fractonica_data_model::{
     CapabilityAction, CapabilityRevocationReason, EntityId, EntitySchema, OperationBody,
-    OperationEnvelope, OperationId, RecordVisibility, SpaceId,
+    OperationEnvelope, OperationId, SpaceId, Visibility,
 };
 use fractonica_trust::SignedOperation as TrustSignedOperation;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
@@ -208,7 +208,7 @@ impl OperationRepository for SqliteStore {
 
         validate_references(&transaction, &request.operation)?;
         validate_topology(&transaction, &request.operation)?;
-        let record_visibility = record_visibility_for_admission(&transaction, &request.operation)?;
+        let visibility = visibility_for_admission(&transaction, &request.operation)?;
         if let OperationBody::CapabilityRevoke { revocation } = &request.operation.body {
             let exists = transaction
                 .query_row(
@@ -228,11 +228,11 @@ impl OperationRepository for SqliteStore {
             }
         }
         let view = SqliteCapabilityView(&transaction);
-        authorize_operation_for_record_visibility(
+        authorize_operation_for_visibility(
             &request.operation,
             effective_received_at,
             &view,
-            record_visibility,
+            visibility,
         )?;
         let stored = insert_operation(&transaction, &request.operation, effective_received_at)?;
         transaction.commit().map_err(repository_sqlite)?;
@@ -596,8 +596,15 @@ fn validate_bootstrap(request: &TrustedSpaceBootstrapRequest) -> Result<(), Repo
                 CapabilityAction::AppendOperation,
                 CapabilityAction::ReadSpace,
             ]
-        && grant.schemas == [EntitySchema::RecordV1]
-        && grant.record_visibilities == [RecordVisibility::Public, RecordVisibility::Private]
+        && grant.schemas
+            == [
+                EntitySchema::EventV1,
+                EntitySchema::ProfileV1,
+                EntitySchema::RecordV1,
+                EntitySchema::RecordV2,
+                EntitySchema::TagV1,
+            ]
+        && grant.visibilities == [Visibility::Public, Visibility::Private]
         && grant.content_roles.is_empty()
         && grant.max_resource_byte_length.is_none()
         && grant.not_before_unix_ms.is_none()
@@ -846,18 +853,19 @@ fn insert_operation(
     let local_sequence = positive_u64(transaction.last_insert_rowid())?;
 
     if operation.causal_parents.is_empty()
-        && let OperationBody::Put { document } = &operation.body
+        && let Some(visibility) = operation.body.declared_visibility()
     {
         transaction
             .execute(
-                "INSERT INTO record_entity_visibility (
-                    space_id, entity_id, origin_operation_id, visibility
-                 ) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO client_entity_visibility (
+                    space_id, entity_id, schema_id, origin_operation_id, visibility
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     operation.space_id.to_string(),
                     operation.entity_id.to_string(),
+                    operation.schema.as_str(),
                     operation.operation_id.to_string(),
-                    visibility_key(document.visibility),
+                    visibility_key(visibility),
                 ],
             )
             .map_err(repository_sqlite)?;
@@ -914,8 +922,8 @@ fn insert_operation(
         )
         .map_err(repository_sqlite)?;
 
-    if let OperationBody::Put { document } = &operation.body {
-        for (position, resource) in document.resources.iter().enumerate() {
+    {
+        for (position, resource) in operation.body.resources().iter().enumerate() {
             transaction
                 .execute(
                     "INSERT INTO operation_resources (
@@ -1023,10 +1031,10 @@ fn insert_grant(
             )
             .map_err(repository_sqlite)?;
     }
-    for (position, visibility) in grant.record_visibilities.iter().enumerate() {
+    for (position, visibility) in grant.visibilities.iter().enumerate() {
         transaction
             .execute(
-                "INSERT INTO capability_grant_record_visibilities
+                "INSERT INTO capability_grant_visibilities
                 (space_id, grant_operation_id, position, visibility) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     operation.space_id.to_string(),
@@ -1170,16 +1178,23 @@ fn validate_topology(
     Ok(())
 }
 
-fn record_visibility_for_admission(
+fn visibility_for_admission(
     transaction: &Transaction<'_>,
     operation: &OperationEnvelope,
-) -> Result<Option<RecordVisibility>, RepositoryError> {
-    if operation.schema != EntitySchema::RecordV1 {
+) -> Result<Option<Visibility>, RepositoryError> {
+    if !matches!(
+        operation.schema,
+        EntitySchema::RecordV1
+            | EntitySchema::RecordV2
+            | EntitySchema::TagV1
+            | EntitySchema::EventV1
+            | EntitySchema::ProfileV1
+    ) {
         return Ok(None);
     }
     let stored = transaction
         .query_row(
-            "SELECT visibility FROM record_entity_visibility
+            "SELECT visibility FROM client_entity_visibility
              WHERE space_id = ?1 AND entity_id = ?2",
             params![
                 operation.space_id.to_string(),
@@ -1193,16 +1208,20 @@ fn record_visibility_for_admission(
         .transpose()?;
 
     if operation.causal_parents.is_empty() {
-        return match (&operation.body, stored) {
-            (OperationBody::Put { document }, None) => Ok(Some(document.visibility)),
-            (OperationBody::Put { .. }, Some(_)) => Err(corrupt(format!(
-                "new record entity {} already has materialized visibility",
+        return match (
+            operation.body.declared_visibility(),
+            &operation.body,
+            stored,
+        ) {
+            (Some(visibility), _, None) => Ok(Some(visibility)),
+            (Some(_), _, Some(_)) => Err(corrupt(format!(
+                "new client entity {} already has materialized visibility",
                 operation.entity_id
             ))),
-            (OperationBody::Tombstone, _) => Err(RepositoryError::InvalidTopology(
+            (None, OperationBody::Tombstone, _) => Err(RepositoryError::InvalidTopology(
                 "an entity cannot begin with a tombstone".into(),
             )),
-            _ => Err(corrupt("record schema has a non-record body")),
+            _ => Err(corrupt("client schema has a non-client body")),
         };
     }
 
@@ -1215,16 +1234,16 @@ fn record_visibility_for_admission(
     for parent_id in &operation.causal_parents {
         let parent = load_stored(transaction, *parent_id)?
             .ok_or_else(|| corrupt(format!("validated record parent {parent_id} disappeared")))?;
-        if let OperationBody::Put { document } = parent.operation.body
-            && document.visibility != current
+        if let Some(parent_visibility) = parent.operation.body.declared_visibility()
+            && parent_visibility != current
         {
             return Err(corrupt(format!(
                 "record parent {parent_id} disagrees with materialized visibility"
             )));
         }
     }
-    if let OperationBody::Put { document } = &operation.body
-        && document.visibility != current
+    if let Some(incoming_visibility) = operation.body.declared_visibility()
+        && incoming_visibility != current
     {
         // Deliberately return the generic authorization denial: callers must
         // not learn a private entity's visibility through an admission oracle.
@@ -1296,11 +1315,11 @@ fn parse_schema(value: &str) -> Result<EntitySchema, RepositoryError> {
     EntitySchema::parse(value).map_err(|error| corrupt(error.to_string()))
 }
 
-fn parse_visibility(value: &str) -> Result<RecordVisibility, RepositoryError> {
+fn parse_visibility(value: &str) -> Result<Visibility, RepositoryError> {
     match value {
-        "public" => Ok(RecordVisibility::Public),
-        "private" => Ok(RecordVisibility::Private),
-        _ => Err(corrupt(format!("unknown stored record visibility {value}"))),
+        "public" => Ok(Visibility::Public),
+        "private" => Ok(Visibility::Private),
+        _ => Err(corrupt(format!("unknown stored visibility {value}"))),
     }
 }
 
@@ -1319,10 +1338,10 @@ const fn action_key(value: CapabilityAction) -> &'static str {
     }
 }
 
-const fn visibility_key(value: RecordVisibility) -> &'static str {
+const fn visibility_key(value: Visibility) -> &'static str {
     match value {
-        RecordVisibility::Public => "public",
-        RecordVisibility::Private => "private",
+        Visibility::Public => "public",
+        Visibility::Private => "private",
     }
 }
 
@@ -1395,11 +1414,14 @@ mod tests {
                             CapabilityAction::AppendOperation,
                             CapabilityAction::ReadSpace,
                         ],
-                        schemas: vec![EntitySchema::RecordV1],
-                        record_visibilities: vec![
-                            RecordVisibility::Public,
-                            RecordVisibility::Private,
+                        schemas: vec![
+                            EntitySchema::EventV1,
+                            EntitySchema::ProfileV1,
+                            EntitySchema::RecordV1,
+                            EntitySchema::RecordV2,
+                            EntitySchema::TagV1,
                         ],
+                        visibilities: vec![Visibility::Public, Visibility::Private],
                         content_roles: vec![],
                         max_resource_byte_length: None,
                         not_before_unix_ms: None,
@@ -1448,7 +1470,7 @@ mod tests {
                     document: RecordDocument {
                         start_at_unix_ms: 100,
                         end_at_unix_ms: None,
-                        visibility: RecordVisibility::Public,
+                        visibility: Visibility::Public,
                         emoji: None,
                         text: Some(format!("record {seed}")),
                         metadata: BTreeMap::new(),
@@ -1667,8 +1689,14 @@ mod tests {
                         CapabilityAction::AppendOperation,
                         CapabilityAction::ReadSpace,
                     ],
-                    schemas: vec![EntitySchema::RecordV1],
-                    record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+                    schemas: vec![
+                        EntitySchema::EventV1,
+                        EntitySchema::ProfileV1,
+                        EntitySchema::RecordV1,
+                        EntitySchema::RecordV2,
+                        EntitySchema::TagV1,
+                    ],
+                    visibilities: vec![Visibility::Public, Visibility::Private],
                     content_roles: vec![],
                     max_resource_byte_length: None,
                     not_before_unix_ms: None,
@@ -1849,7 +1877,7 @@ mod tests {
                         CapabilityAction::IssueCapability,
                     ],
                     schemas: vec![EntitySchema::RecordV1],
-                    record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+                    visibilities: vec![Visibility::Public, Visibility::Private],
                     content_roles: vec![],
                     max_resource_byte_length: None,
                     not_before_unix_ms: None,
@@ -1882,7 +1910,7 @@ mod tests {
                     subject: worker.actor_id(),
                     actions: vec![CapabilityAction::AppendOperation],
                     schemas: vec![EntitySchema::RecordV1],
-                    record_visibilities: vec![RecordVisibility::Public],
+                    visibilities: vec![Visibility::Public],
                     content_roles: vec![],
                     max_resource_byte_length: None,
                     not_before_unix_ms: None,
@@ -1918,7 +1946,7 @@ mod tests {
                 document: RecordDocument {
                     start_at_unix_ms: 702,
                     end_at_unix_ms: None,
-                    visibility: RecordVisibility::Public,
+                    visibility: Visibility::Public,
                     emoji: None,
                     text: Some("authorized through two grants".into()),
                     metadata: BTreeMap::new(),
@@ -2233,7 +2261,7 @@ mod tests {
                     document: RecordDocument {
                         start_at_unix_ms: 1_000,
                         end_at_unix_ms: None,
-                        visibility: RecordVisibility::Public,
+                        visibility: Visibility::Public,
                         emoji: None,
                         text: Some(format!("space {nonce}")),
                         metadata: BTreeMap::new(),
@@ -2328,7 +2356,7 @@ mod tests {
                     subject: public_writer.actor_id(),
                     actions: vec![CapabilityAction::AppendOperation],
                     schemas: vec![EntitySchema::RecordV1],
-                    record_visibilities: vec![RecordVisibility::Public],
+                    visibilities: vec![Visibility::Public],
                     content_roles: vec![],
                     max_resource_byte_length: None,
                     not_before_unix_ms: None,
@@ -2364,7 +2392,7 @@ mod tests {
                 document: RecordDocument {
                     start_at_unix_ms: 1_101,
                     end_at_unix_ms: None,
-                    visibility: RecordVisibility::Private,
+                    visibility: Visibility::Private,
                     emoji: None,
                     text: Some("private".into()),
                     metadata: BTreeMap::new(),
@@ -2397,7 +2425,7 @@ mod tests {
                 document: RecordDocument {
                     start_at_unix_ms: 1_101,
                     end_at_unix_ms: None,
-                    visibility: RecordVisibility::Public,
+                    visibility: Visibility::Public,
                     emoji: None,
                     text: Some("visibility oracle attempt".into()),
                     metadata: BTreeMap::new(),
@@ -2445,7 +2473,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_materialized_record_visibility_fails_closed() {
+    fn missing_materialized_visibility_fails_closed() {
         let fixture = Fixture::new();
         let entity_id = EntityId::new(Uuid::from_bytes([86; 16]));
         let record = fixture.record(entity_id, vec![], 86);
@@ -2465,7 +2493,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "DELETE FROM record_entity_visibility WHERE space_id = ?1 AND entity_id = ?2",
+                "DELETE FROM client_entity_visibility WHERE space_id = ?1 AND entity_id = ?2",
                 params![fixture.space_id.to_string(), entity_id.to_string()],
             )
             .unwrap();
@@ -2507,7 +2535,7 @@ mod tests {
                     subject: expiring_writer.actor_id(),
                     actions: vec![CapabilityAction::AppendOperation],
                     schemas: vec![EntitySchema::RecordV1],
-                    record_visibilities: vec![RecordVisibility::Public],
+                    visibilities: vec![Visibility::Public],
                     content_roles: vec![],
                     max_resource_byte_length: None,
                     not_before_unix_ms: None,
@@ -2542,7 +2570,7 @@ mod tests {
                     document: RecordDocument {
                         start_at_unix_ms: 900,
                         end_at_unix_ms: None,
-                        visibility: RecordVisibility::Public,
+                        visibility: Visibility::Public,
                         emoji: None,
                         text: Some("clock rollback probe".into()),
                         metadata: BTreeMap::new(),

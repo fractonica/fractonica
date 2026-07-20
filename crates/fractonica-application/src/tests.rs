@@ -5,7 +5,7 @@ use std::sync::{
 
 use fractonica_core::{InstallationId, InstallationMetadata};
 use fractonica_data_model::{
-    CapabilityAction, CapabilityGrant, OperationNonce, RecordDocument, RecordVisibility, SigningKey,
+    CapabilityAction, CapabilityGrant, OperationNonce, RecordDocument, SigningKey, Visibility,
 };
 use serde_json::json;
 
@@ -202,7 +202,7 @@ fn record_operation(space_id: SpaceId) -> OperationEnvelope {
             document: RecordDocument {
                 start_at_unix_ms: 1_000,
                 end_at_unix_ms: None,
-                visibility: RecordVisibility::Public,
+                visibility: Visibility::Public,
                 emoji: Some("🌒".into()),
                 text: Some("signed".into()),
                 metadata: std::collections::BTreeMap::from([("source".into(), json!("test"))]),
@@ -247,8 +247,14 @@ fn bootstrap() -> TrustedSpaceBootstrapRequest {
                     CapabilityAction::AppendOperation,
                     CapabilityAction::ReadSpace,
                 ],
-                schemas: vec![EntitySchema::RecordV1],
-                record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+                schemas: vec![
+                    EntitySchema::EventV1,
+                    EntitySchema::ProfileV1,
+                    EntitySchema::RecordV1,
+                    EntitySchema::RecordV2,
+                    EntitySchema::TagV1,
+                ],
+                visibilities: vec![Visibility::Public, Visibility::Private],
                 content_roles: Vec::new(),
                 max_resource_byte_length: None,
                 not_before_unix_ms: None,
@@ -434,7 +440,7 @@ fn trusted_bootstrap_requires_controller_signature_and_distinct_writer() {
                 subject: controller.actor_id(),
                 actions: vec![CapabilityAction::ReadSpace],
                 schemas: Vec::new(),
-                record_visibilities: Vec::new(),
+                visibilities: Vec::new(),
                 content_roles: Vec::new(),
                 max_resource_byte_length: None,
                 not_before_unix_ms: None,
@@ -484,7 +490,7 @@ fn trusted_bootstrap_rejects_a_broader_writer_scope() {
                     CapabilityAction::ReadSpace,
                 ],
                 schemas: vec![EntitySchema::RecordV1],
-                record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+                visibilities: vec![Visibility::Public, Visibility::Private],
                 content_roles: Vec::new(),
                 max_resource_byte_length: None,
                 not_before_unix_ms: None,

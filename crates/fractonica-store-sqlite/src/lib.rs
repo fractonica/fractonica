@@ -24,7 +24,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 struct Migration {
     version: u32,
@@ -56,6 +56,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         sql: include_str!("../migrations/0006_peer_request_replay.sql"),
     },
+    Migration {
+        version: 7,
+        sql: include_str!("../migrations/0007_client_contract.sql"),
+    },
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +86,11 @@ pub enum StoreError {
 
     #[error("the local unsigned operation store requires explicit version 2 migration")]
     LegacyMigrationRequired,
+
+    #[error(
+        "the pre-client-contract Fractonica development database is not migrated in place; start a fresh node and import through signed operations"
+    )]
+    ClientContractMigrationRequired,
 
     #[error("stored installation ID is invalid: {0}")]
     InvalidInstallationId(#[from] uuid::Error),
@@ -767,6 +776,18 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             connection.query_row("SELECT count(*) FROM operations", [], |row| row.get(0))?;
         if legacy_operation_count != 0 {
             return Err(StoreError::LegacyMigrationRequired);
+        }
+    }
+    if (4..7).contains(&current) {
+        let operations_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'operations'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !operations_sql.is_some_and(|sql| sql.contains("'record.v2'")) {
+            return Err(StoreError::ClientContractMigrationRequired);
         }
     }
 

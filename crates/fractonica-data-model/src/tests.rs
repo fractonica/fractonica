@@ -27,7 +27,7 @@ fn document(text: &str) -> RecordDocument {
     RecordDocument {
         start_at_unix_ms: 1_000,
         end_at_unix_ms: None,
-        visibility: RecordVisibility::Public,
+        visibility: Visibility::Public,
         emoji: Some("🌒".into()),
         text: Some(text.into()),
         metadata: BTreeMap::from([("source".into(), json!("test"))]),
@@ -89,7 +89,7 @@ fn valid_grant(subject: ActorId) -> CapabilityGrant {
             CapabilityAction::WriteContent,
         ],
         schemas: vec![EntitySchema::RecordV1],
-        record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+        visibilities: vec![Visibility::Public, Visibility::Private],
         content_roles: vec!["attachment".into(), "photo".into()],
         max_resource_byte_length: Some(4_194_304),
         not_before_unix_ms: Some(1_000),
@@ -97,6 +97,208 @@ fn valid_grant(subject: ActorId) -> CapabilityGrant {
         delegation_depth: 2,
         label: "Phone writer".into(),
     }
+}
+
+fn actor_reference(actor_id: ActorId) -> EntityReferenceV1 {
+    EntityReferenceV1 {
+        relation: "mentions".into(),
+        target: ReferenceTargetV1::Actor { actor_id },
+    }
+}
+
+fn assert_signed_round_trip(operation: &SignedOperationEnvelope) {
+    operation.verify().expect("verify original operation");
+    let json = serde_json::to_value(operation).expect("serialize signed operation");
+    let decoded: SignedOperationEnvelope =
+        serde_json::from_value(json).expect("deserialize signed operation");
+    decoded.verify().expect("verify JSON round trip");
+    assert_eq!(&decoded, operation);
+    assert_eq!(
+        SignedOperationEnvelope::from_cose_sign1(&operation.cose_sign1)
+            .expect("decode canonical COSE"),
+        *operation
+    );
+}
+
+#[test]
+fn client_schema_bodies_round_trip_through_json_and_cose() {
+    let signing_key = key(11);
+    let actor_id = signing_key.actor_id();
+    let reference = actor_reference(key(12).actor_id());
+    let authorization = || vec![digest(0xa0)];
+
+    let fixtures = [
+        SignedOperationEnvelope::sign(
+            space(1),
+            entity(10),
+            EntitySchema::RecordV2,
+            Vec::new(),
+            authorization(),
+            3_000,
+            nonce(10),
+            OperationBody::PutRecordV2 {
+                payload: ProtectedDocumentV1::Public {
+                    document: RecordDocumentV2 {
+                        start_at_unix_ms: 2_000,
+                        end_at_unix_ms: Some(2_500),
+                        emoji: Some("🌒".into()),
+                        text: Some("canonical record".into()),
+                        metadata: BTreeMap::from([("source".into(), json!("test"))]),
+                        resources: Vec::new(),
+                        references: vec![reference.clone()],
+                    },
+                },
+            },
+            &signing_key,
+        )
+        .expect("sign record.v2"),
+        SignedOperationEnvelope::sign(
+            space(1),
+            entity(11),
+            EntitySchema::TagV1,
+            Vec::new(),
+            authorization(),
+            3_001,
+            nonce(11),
+            OperationBody::PutTagV1 {
+                payload: ProtectedDocumentV1::Public {
+                    document: TagDocumentV1 {
+                        name: "astronomy".into(),
+                        emoji: Some("🔭".into()),
+                        notes: None,
+                        color_hex: Some("#1020ff".into()),
+                        metadata: BTreeMap::new(),
+                        references: vec![reference.clone()],
+                    },
+                },
+            },
+            &signing_key,
+        )
+        .expect("sign tag.v1"),
+        SignedOperationEnvelope::sign(
+            space(1),
+            entity(12),
+            EntitySchema::EventV1,
+            Vec::new(),
+            authorization(),
+            3_002,
+            nonce(12),
+            OperationBody::PutEventV1 {
+                payload: ProtectedDocumentV1::Public {
+                    document: EventDocumentV1 {
+                        start_at_unix_ms: 2_100,
+                        end_at_unix_ms: Some(2_200),
+                        label: "sensor threshold".into(),
+                        type_number: -7,
+                        metadata: BTreeMap::new(),
+                        references: vec![reference],
+                    },
+                },
+            },
+            &signing_key,
+        )
+        .expect("sign event.v1"),
+        SignedOperationEnvelope::sign(
+            space(1),
+            profile_entity_id(actor_id),
+            EntitySchema::ProfileV1,
+            Vec::new(),
+            authorization(),
+            3_003,
+            nonce(13),
+            OperationBody::PutProfileV1 {
+                document: ProfileDocumentV1 {
+                    handle: "dimaswift".into(),
+                    display_name: "Dimas".into(),
+                    saros_anchor: 141,
+                    avatar: None,
+                    metadata: BTreeMap::new(),
+                },
+            },
+            &signing_key,
+        )
+        .expect("sign profile.v1"),
+    ];
+
+    for fixture in fixtures {
+        assert_signed_round_trip(&fixture);
+    }
+}
+
+#[test]
+fn private_record_is_opaque_and_enforces_opaque_resources() {
+    let signing_key = key(13);
+    let operation = SignedOperationEnvelope::sign(
+        space(2),
+        entity(20),
+        EntitySchema::RecordV2,
+        Vec::new(),
+        vec![digest(0xa0)],
+        4_000,
+        nonce(20),
+        OperationBody::PutRecordV2 {
+            payload: ProtectedDocumentV1::Private {
+                envelope: EncryptedPayloadV1 {
+                    algorithm: EncryptionAlgorithmV1::Aes256Gcm,
+                    key_id: format!("key:aes256:{}", "ab".repeat(32)),
+                    nonce_base64url: "AAAAAAAAAAAAAAAA".into(),
+                    ciphertext_base64url: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                },
+                resources: vec![ResourceRef {
+                    content_id: fractonica_content::hash_bytes(b"encrypted resource"),
+                    byte_length: 18,
+                    media_type: "application/octet-stream".into(),
+                    role: "encrypted".into(),
+                    original_name: None,
+                }],
+            },
+        },
+        &signing_key,
+    )
+    .expect("sign private record");
+    assert_signed_round_trip(&operation);
+
+    let mut disclosed = operation;
+    let OperationBody::PutRecordV2 {
+        payload: ProtectedDocumentV1::Private { resources, .. },
+    } = &mut disclosed.body
+    else {
+        panic!("private record fixture")
+    };
+    resources[0].media_type = "image/jpeg".into();
+    assert!(matches!(
+        disclosed.verify(),
+        Err(DataModelError::ProjectionMismatch { .. })
+    ));
+}
+
+#[test]
+fn profile_entity_id_is_stable_and_bound_to_its_actor() {
+    let owner = key(21);
+    let owner_id = profile_entity_id(owner.actor_id());
+    assert_eq!(owner_id, profile_entity_id(owner.actor_id()));
+    assert_eq!(owner_id.as_uuid().get_version_num(), 8);
+
+    let result = SignedOperationEnvelope::sign(
+        space(3),
+        entity(99),
+        EntitySchema::ProfileV1,
+        Vec::new(),
+        vec![digest(0xa0)],
+        5_000,
+        nonce(21),
+        OperationBody::PutProfileV1 {
+            document: ProfileDocumentV1 {
+                handle: "owner".into(),
+                display_name: "Owner".into(),
+                saros_anchor: 141,
+                avatar: None,
+                metadata: BTreeMap::new(),
+            },
+        },
+        &owner,
+    );
+    assert!(matches!(result, Err(DataModelError::ProfileEntityMismatch)));
 }
 
 #[test]
@@ -282,7 +484,7 @@ fn json_projection_rejects_omitted_fields_that_canonical_serialization_emits() {
     )
     .expect("sign grant");
     let grant = serde_json::to_value(grant).expect("serialize grant projection");
-    for field in ["schemas", "recordVisibilities", "contentRoles"] {
+    for field in ["schemas", "visibilities", "contentRoles"] {
         let mut missing = grant.clone();
         missing["body"]["grant"]
             .as_object_mut()
@@ -336,7 +538,7 @@ fn record_canonical_mapping_preserves_metadata_and_resources() {
     let content_id = fractonica_content::hash_bytes(b"image");
     let mut value = document("with resource");
     value.end_at_unix_ms = Some(1_500);
-    value.visibility = RecordVisibility::Private;
+    value.visibility = Visibility::Private;
     value.metadata = BTreeMap::from([
         ("float".into(), json!(1.5)),
         ("negative".into(), json!(-7)),

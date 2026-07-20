@@ -514,10 +514,14 @@ components:
     EntitySchema:
       type: string
       enum:
+        - event.v1
+        - profile.v1
         - record.v1
+        - record.v2
         - space.genesis.v1
         - capability.grant.v1
         - capability.revoke.v1
+        - tag.v1
       pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
       description: Exact bounded schema codec known to this protocol version.
     OperationNonce:
@@ -615,6 +619,10 @@ components:
     CanonicalBodyProjection:
       oneOf:
         - $ref: "#/components/schemas/RecordPutBodyV1"
+        - $ref: "#/components/schemas/RecordPutBodyV2"
+        - $ref: "#/components/schemas/TagPutBodyV1"
+        - $ref: "#/components/schemas/EventPutBodyV1"
+        - $ref: "#/components/schemas/ProfilePutBodyV1"
         - $ref: "#/components/schemas/RecordTombstoneBodyV1"
         - $ref: "#/components/schemas/SpaceGenesisBodyV1"
         - $ref: "#/components/schemas/CapabilityGrantBodyV1"
@@ -642,6 +650,43 @@ components:
         kind:
           type: string
           const: tombstone
+    RecordPutBodyV2:
+      type: object
+      additionalProperties: false
+      required: [kind, payload]
+      properties:
+        kind: { type: string, const: putRecordV2 }
+        payload:
+          oneOf:
+            - $ref: "#/components/schemas/PublicRecordPayloadV2"
+            - $ref: "#/components/schemas/PrivatePayloadV1"
+    TagPutBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind, payload]
+      properties:
+        kind: { type: string, const: putTagV1 }
+        payload:
+          oneOf:
+            - $ref: "#/components/schemas/PublicTagPayloadV1"
+            - $ref: "#/components/schemas/PrivatePayloadV1"
+    EventPutBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind, payload]
+      properties:
+        kind: { type: string, const: putEventV1 }
+        payload:
+          oneOf:
+            - $ref: "#/components/schemas/PublicEventPayloadV1"
+            - $ref: "#/components/schemas/PrivatePayloadV1"
+    ProfilePutBodyV1:
+      type: object
+      additionalProperties: false
+      required: [kind, document]
+      properties:
+        kind: { type: string, const: putProfileV1 }
+        document: { $ref: "#/components/schemas/ProfileDocumentV1" }
     SpaceGenesisBodyV1:
       type: object
       additionalProperties: false
@@ -687,7 +732,7 @@ components:
           minimum: 0
           description: Must be greater than or equal to `startAtUnixMs`.
         visibility:
-          $ref: "#/components/schemas/RecordVisibility"
+          $ref: "#/components/schemas/Visibility"
           description: >-
             Fixed by the entity's initial put. Revisions must retain it and a
             tombstone is authorized against the inherited visibility.
@@ -718,6 +763,134 @@ components:
           description: Content IDs must also be unique across the array.
           items:
             $ref: "#/components/schemas/ResourceRefV1"
+    PublicRecordPayloadV2:
+      type: object
+      additionalProperties: false
+      required: [visibility, document]
+      properties:
+        visibility: { type: string, const: public }
+        document: { $ref: "#/components/schemas/RecordDocumentV2" }
+    PublicTagPayloadV1:
+      type: object
+      additionalProperties: false
+      required: [visibility, document]
+      properties:
+        visibility: { type: string, const: public }
+        document: { $ref: "#/components/schemas/TagDocumentV1" }
+    PublicEventPayloadV1:
+      type: object
+      additionalProperties: false
+      required: [visibility, document]
+      properties:
+        visibility: { type: string, const: public }
+        document: { $ref: "#/components/schemas/EventDocumentV1" }
+    PrivatePayloadV1:
+      type: object
+      additionalProperties: false
+      required: [visibility, envelope]
+      properties:
+        visibility: { type: string, const: private }
+        envelope: { $ref: "#/components/schemas/EncryptedPayloadV1" }
+        resources:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/ResourceRefV1" }
+          description: Opaque encrypted descriptors; tags and events require an empty array.
+    EncryptedPayloadV1:
+      type: object
+      additionalProperties: false
+      required: [algorithm, keyId, nonceBase64url, ciphertextBase64url]
+      properties:
+        algorithm: { type: string, const: aes256-gcm }
+        keyId: { type: string, pattern: '^key:aes256:[0-9a-f]{64}$' }
+        nonceBase64url: { type: string, pattern: '^[A-Za-z0-9_-]{16}$' }
+        ciphertextBase64url:
+          type: string
+          minLength: 22
+          maxLength: 1398102
+          pattern: '^[A-Za-z0-9_-]+$'
+    EntityReferenceV1:
+      type: object
+      additionalProperties: false
+      required: [relation, target]
+      properties:
+        relation: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9._-]+$' }
+        target:
+          oneOf:
+            - $ref: "#/components/schemas/ActorReferenceTargetV1"
+            - $ref: "#/components/schemas/EntityReferenceTargetV1"
+    ActorReferenceTargetV1:
+      type: object
+      additionalProperties: false
+      required: [kind, actorId]
+      properties:
+        kind: { type: string, const: actor }
+        actorId: { $ref: "#/components/schemas/ActorId" }
+    EntityReferenceTargetV1:
+      type: object
+      additionalProperties: false
+      required: [kind, spaceId, entityId]
+      properties:
+        kind: { type: string, const: entity }
+        spaceId: { $ref: "#/components/schemas/SpaceId" }
+        entityId: { $ref: "#/components/schemas/EntityId" }
+        operationId: { $ref: "#/components/schemas/OperationId" }
+    RecordDocumentV2:
+      type: object
+      additionalProperties: false
+      required: [startAtUnixMs, metadata]
+      properties:
+        startAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        endAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        emoji: { type: string, minLength: 1, maxLength: 32 }
+        text: { type: string, maxLength: 262144 }
+        metadata:
+          type: object
+          maxProperties: 128
+          additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" }
+        resources:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/ResourceRefV1" }
+        references:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/EntityReferenceV1" }
+    TagDocumentV1:
+      type: object
+      additionalProperties: false
+      required: [name, metadata]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128 }
+        emoji: { type: string, minLength: 1, maxLength: 32 }
+        notes: { type: string, maxLength: 262144 }
+        colorHex: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
+        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" } }
+        references: { type: array, maxItems: 256, uniqueItems: true, items: { $ref: "#/components/schemas/EntityReferenceV1" } }
+    EventDocumentV1:
+      type: object
+      additionalProperties: false
+      required: [startAtUnixMs, label, typeNumber, metadata]
+      properties:
+        startAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        endAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        label: { type: string, minLength: 1, maxLength: 256 }
+        typeNumber: { type: integer, format: int64 }
+        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" } }
+        references: { type: array, maxItems: 256, uniqueItems: true, items: { $ref: "#/components/schemas/EntityReferenceV1" } }
+    ProfileDocumentV1:
+      type: object
+      additionalProperties: false
+      required: [handle, displayName, sarosAnchor, metadata]
+      properties:
+        handle: { type: string, minLength: 1, maxLength: 32, pattern: '^[a-z0-9._-]+$' }
+        displayName: { type: string, minLength: 1, maxLength: 128 }
+        sarosAnchor: { type: integer, minimum: 101, maximum: 161 }
+        avatar: { $ref: "#/components/schemas/ResourceRefV1" }
+        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" } }
     MetadataKeyV1:
       type: string
       minLength: 1
@@ -740,7 +913,7 @@ components:
             $ref: "#/components/schemas/MetadataKeyV1"
           additionalProperties:
             $ref: "#/components/schemas/MetadataValueV1"
-    RecordVisibility:
+    Visibility:
       type: string
       enum: [public, private]
     ResourceRefV1:
@@ -778,7 +951,7 @@ components:
         - subject
         - actions
         - schemas
-        - recordVisibilities
+        - visibilities
         - contentRoles
         - delegationDepth
         - label
@@ -800,13 +973,13 @@ components:
           description: Values must be strictly sorted by wire schema name.
           items:
             $ref: "#/components/schemas/EntitySchema"
-        recordVisibilities:
+        visibilities:
           type: array
           maxItems: 2
           uniqueItems: true
           description: Values must use canonical enum order.
           items:
-            $ref: "#/components/schemas/RecordVisibility"
+            $ref: "#/components/schemas/Visibility"
         contentRoles:
           type: array
           maxItems: 64
@@ -1010,7 +1183,7 @@ components:
     PairingCapabilityTemplate:
       type: object
       additionalProperties: false
-      required: [actions, schemas, recordVisibilities, contentRoles, delegationDepth, label]
+      required: [actions, schemas, visibilities, contentRoles, delegationDepth, label]
       properties:
         actions:
           type: array
@@ -1023,11 +1196,11 @@ components:
           maxItems: 32
           uniqueItems: true
           items: { $ref: "#/components/schemas/EntitySchema" }
-        recordVisibilities:
+        visibilities:
           type: array
           maxItems: 2
           uniqueItems: true
-          items: { $ref: "#/components/schemas/RecordVisibility" }
+          items: { $ref: "#/components/schemas/Visibility" }
         contentRoles:
           type: array
           maxItems: 64

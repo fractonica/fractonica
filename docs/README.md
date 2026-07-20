@@ -34,6 +34,7 @@ space-authorized content transfer remain deferred.
 - [ADR 0010: Space capabilities and QR pairing boundary](adr/0010-space-capabilities-and-pairing.md)
 - [ADR 0011: Noise pairing handshake](adr/0011-noise-pairing-handshake.md)
 - [ADR 0012: Authenticated peer reads](adr/0012-authenticated-peer-reads.md)
+- [ADR 0013: Client domain and projections](adr/0013-client-domain-and-projection-contract.md)
 - [OpenAPI v1 contract](../contracts/openapi/v1.yaml)
 - [OpenAPI v2 contract](../contracts/openapi/v2.yaml)
 - [Device protocol principles](../contracts/protocol/README.md)

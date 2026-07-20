@@ -281,7 +281,7 @@ function PairingPanel({ client, snapshot }: PairingPanelProps) {
           capability: {
             actions: ["appendOperation", "readSpace", "writeContent"],
             schemas: ["record.v1"],
-            recordVisibilities: ["public", "private"],
+            visibilities: ["public", "private"],
             contentRoles: ["record.media"],
             maxResourceByteLength: 1_073_741_824,
             delegationDepth: 0,

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use fractonica_data_model::RecordDocument;
 use fractonica_data_model::{
     ActorId, CapabilityAction, CapabilityGrant, EntitySchema, OperationBody, OperationEnvelope,
-    OperationId, RecordVisibility, SpaceId,
+    OperationId, SpaceId, Visibility,
 };
 use thiserror::Error;
 
@@ -118,31 +118,28 @@ pub fn authorize_operation(
     now_unix_ms: i64,
     view: &impl CapabilityView,
 ) -> Result<(), AuthorizationError> {
-    let record_visibility = match &operation.body {
-        OperationBody::Put { document } => Some(document.visibility),
-        _ => None,
-    };
-    authorize_operation_for_record_visibility(operation, now_unix_ms, view, record_visibility)
+    let visibility = operation.body.declared_visibility();
+    authorize_operation_for_visibility(operation, now_unix_ms, view, visibility)
 }
 
-/// Authorizes an operation against a repository-derived record visibility.
+/// Authorizes an operation against a repository-derived visibility.
 ///
 /// Persistence adapters use this for record revisions and tombstones so an
 /// operation cannot change or erase an entity outside the visibility scope of
 /// its capability. The caller must derive the value from the transaction's
 /// already admitted entity state; `None` retains schema-only behavior for
 /// non-record operations.
-pub fn authorize_operation_for_record_visibility(
+pub fn authorize_operation_for_visibility(
     operation: &OperationEnvelope,
     now_unix_ms: i64,
     view: &impl CapabilityView,
-    record_visibility: Option<RecordVisibility>,
+    visibility: Option<Visibility>,
 ) -> Result<(), AuthorizationError> {
     if operation.authorization.is_empty() {
         return Err(AuthorizationError::Required);
     }
 
-    let required = RequiredAuthority::for_operation(operation, record_visibility)?;
+    let required = RequiredAuthority::for_operation(operation, visibility)?;
     let mut context = EvaluationContext {
         view,
         now_unix_ms,
@@ -200,7 +197,7 @@ pub fn authorize_capability_action(
 enum RequiredAuthority<'a> {
     Append {
         schema: EntitySchema,
-        record_visibility: RecordVisibility,
+        visibility: Visibility,
     },
     Issue(&'a CapabilityGrant),
     Revoke,
@@ -209,17 +206,28 @@ enum RequiredAuthority<'a> {
 impl<'a> RequiredAuthority<'a> {
     fn for_operation(
         operation: &'a OperationEnvelope,
-        record_visibility: Option<RecordVisibility>,
+        visibility: Option<Visibility>,
     ) -> Result<Self, AuthorizationError> {
         match (&operation.schema, &operation.body) {
-            (EntitySchema::RecordV1, OperationBody::Put { .. })
-            | (EntitySchema::RecordV1, OperationBody::Tombstone) => {
-                let Some(record_visibility) = record_visibility else {
+            (
+                EntitySchema::RecordV1
+                | EntitySchema::RecordV2
+                | EntitySchema::TagV1
+                | EntitySchema::EventV1
+                | EntitySchema::ProfileV1,
+                OperationBody::Put { .. }
+                | OperationBody::PutRecordV2 { .. }
+                | OperationBody::PutTagV1 { .. }
+                | OperationBody::PutEventV1 { .. }
+                | OperationBody::PutProfileV1 { .. }
+                | OperationBody::Tombstone,
+            ) => {
+                let Some(visibility) = visibility else {
                     return Err(AuthorizationError::Denied);
                 };
                 Ok(Self::Append {
                     schema: operation.schema,
-                    record_visibility,
+                    visibility,
                 })
             }
             (EntitySchema::CapabilityGrantV1, OperationBody::CapabilityGrant { grant }) => {
@@ -257,13 +265,9 @@ impl EffectiveAuthority {
             (Self::RootController, RequiredAuthority::Issue(_))
             | (Self::RootController, RequiredAuthority::Revoke) => true,
             (Self::RootController, RequiredAuthority::Append { .. }) => false,
-            (
-                Self::Grant(grant),
-                RequiredAuthority::Append {
-                    schema,
-                    record_visibility,
-                },
-            ) => permits_append(grant, *schema, *record_visibility),
+            (Self::Grant(grant), RequiredAuthority::Append { schema, visibility }) => {
+                permits_append(grant, *schema, *visibility)
+            }
             (Self::Grant(grant), RequiredAuthority::Issue(child)) => {
                 permits_delegation(grant, child)
             }
@@ -397,11 +401,7 @@ fn window_contains(grant: &CapabilityGrant, now_unix_ms: i64) -> bool {
         && grant.expires_at_unix_ms.is_none_or(|end| now_unix_ms < end)
 }
 
-fn permits_append(
-    grant: &CapabilityGrant,
-    schema: EntitySchema,
-    record_visibility: RecordVisibility,
-) -> bool {
+fn permits_append(grant: &CapabilityGrant, schema: EntitySchema, visibility: Visibility) -> bool {
     if !grant.actions.contains(&CapabilityAction::AppendOperation)
         || !grant.schemas.contains(&schema)
     {
@@ -411,7 +411,7 @@ fn permits_append(
     // not upload, reveal, or mutate those bytes. `writeContent` and its role /
     // byte limits are evaluated by the future space-scoped content endpoint,
     // while record admission is governed by schema and visibility scope.
-    grant.record_visibilities.contains(&record_visibility)
+    grant.visibilities.contains(&visibility)
 }
 
 fn permits_delegation(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool {
@@ -420,7 +420,7 @@ fn permits_delegation(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool
         && child.delegation_depth < parent.delegation_depth
         && is_subset(&child.actions, &parent.actions)
         && is_subset_by(&child.schemas, &parent.schemas, |value| value.as_str())
-        && is_subset(&child.record_visibilities, &parent.record_visibilities)
+        && is_subset(&child.visibilities, &parent.visibilities)
         && is_subset(&child.content_roles, &parent.content_roles)
         && maximum_is_narrower(
             child.max_resource_byte_length,
@@ -478,7 +478,7 @@ mod tests {
 
     use fractonica_data_model::{
         CapabilityRevocation, CapabilityRevocationReason, EntityId, OperationNonce,
-        RecordVisibility, SignedOperationEnvelope, SigningKey,
+        SignedOperationEnvelope, SigningKey, Visibility,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -588,7 +588,7 @@ mod tests {
         space_id: SpaceId,
         actor: &SigningKey,
         authorization: Vec<OperationId>,
-        visibility: RecordVisibility,
+        visibility: Visibility,
         occurred_at_unix_ms: i64,
     ) -> OperationEnvelope {
         SignedOperationEnvelope::sign(
@@ -620,7 +620,7 @@ mod tests {
             subject,
             actions: vec![CapabilityAction::AppendOperation],
             schemas: vec![EntitySchema::RecordV1],
-            record_visibilities: vec![RecordVisibility::Public],
+            visibilities: vec![Visibility::Public],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
             not_before_unix_ms: None,
@@ -648,7 +648,7 @@ mod tests {
             space_id,
             &writer,
             vec![grant.operation_id],
-            RecordVisibility::Public,
+            Visibility::Public,
             NOW,
         );
         let mut view = MemoryView::default();
@@ -686,7 +686,7 @@ mod tests {
             space_id,
             &writer,
             vec![grant.operation_id],
-            RecordVisibility::Private,
+            Visibility::Private,
             NOW,
         );
         assert_eq!(
@@ -698,7 +698,7 @@ mod tests {
             space_id,
             &stranger,
             vec![grant.operation_id],
-            RecordVisibility::Public,
+            Visibility::Public,
             NOW,
         );
         assert!(matches!(
@@ -710,7 +710,7 @@ mod tests {
             space_id,
             &controller,
             vec![genesis.operation_id],
-            RecordVisibility::Public,
+            Visibility::Public,
             NOW,
         );
         assert_eq!(
@@ -752,7 +752,7 @@ mod tests {
             space_id,
             &worker,
             vec![attacker_grant.operation_id],
-            RecordVisibility::Public,
+            Visibility::Public,
             NOW,
         );
 
@@ -781,7 +781,7 @@ mod tests {
                 CapabilityAction::IssueCapability,
             ],
             schemas: vec![EntitySchema::RecordV1],
-            record_visibilities: vec![RecordVisibility::Public],
+            visibilities: vec![Visibility::Public],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
             not_before_unix_ms: Some(1_000),
@@ -801,7 +801,7 @@ mod tests {
             subject: sensor.actor_id(),
             actions: vec![CapabilityAction::AppendOperation],
             schemas: vec![EntitySchema::RecordV1],
-            record_visibilities: vec![RecordVisibility::Public],
+            visibilities: vec![Visibility::Public],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
             not_before_unix_ms: Some(2_000),
@@ -814,7 +814,7 @@ mod tests {
             space_id,
             &sensor,
             vec![child.operation_id],
-            RecordVisibility::Public,
+            Visibility::Public,
             100,
         );
         let mut view = MemoryView::default();
@@ -864,7 +864,7 @@ mod tests {
             subject: sensor.actor_id(),
             actions: vec![CapabilityAction::AppendOperation],
             schemas: vec![EntitySchema::RecordV1],
-            record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+            visibilities: vec![Visibility::Public, Visibility::Private],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
             not_before_unix_ms: None,
@@ -884,7 +884,7 @@ mod tests {
             space_id,
             &sensor,
             vec![broader.operation_id],
-            RecordVisibility::Public,
+            Visibility::Public,
             NOW,
         );
         let mut view = MemoryView::default();
@@ -897,13 +897,7 @@ mod tests {
         );
 
         let missing = OperationId::from_bytes([0xaa; 32]);
-        let missing_record = record(
-            space_id,
-            &sensor,
-            vec![missing],
-            RecordVisibility::Public,
-            NOW,
-        );
+        let missing_record = record(space_id, &sensor, vec![missing], Visibility::Public, NOW);
         assert_eq!(
             authorize_operation(&missing_record, NOW, &view),
             Err(AuthorizationError::Missing(missing))
@@ -958,7 +952,7 @@ mod tests {
         let writer = key(15);
         let genesis = genesis(space_id, &controller);
         let broad = CapabilityGrant {
-            record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+            visibilities: vec![Visibility::Public, Visibility::Private],
             ..writer_grant(writer.actor_id())
         };
         let broad = grant(
@@ -970,7 +964,7 @@ mod tests {
             broad,
         );
         let private_only = CapabilityGrant {
-            record_visibilities: vec![RecordVisibility::Private],
+            visibilities: vec![Visibility::Private],
             ..writer_grant(writer.actor_id())
         };
         let private_only = grant(
@@ -983,7 +977,7 @@ mod tests {
         );
         let mut references = vec![broad.operation_id, private_only.operation_id];
         references.sort_unstable();
-        let operation = record(space_id, &writer, references, RecordVisibility::Public, NOW);
+        let operation = record(space_id, &writer, references, Visibility::Public, NOW);
         let mut view = MemoryView::default();
         view.insert(genesis);
         view.insert(broad);
@@ -1007,7 +1001,7 @@ mod tests {
                 CapabilityAction::AppendOperation,
                 CapabilityAction::IssueCapability,
             ],
-            record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+            visibilities: vec![Visibility::Public, Visibility::Private],
             delegation_depth: 1,
             ..writer_grant(delegator.actor_id())
         };
@@ -1020,7 +1014,7 @@ mod tests {
             permitting,
         );
         let nonpermitting = CapabilityGrant {
-            record_visibilities: vec![RecordVisibility::Public, RecordVisibility::Private],
+            visibilities: vec![Visibility::Public, Visibility::Private],
             ..writer_grant(delegator.actor_id())
         };
         let nonpermitting = grant(

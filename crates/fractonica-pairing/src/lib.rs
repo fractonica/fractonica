@@ -8,7 +8,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use fractonica_data_model::{CapabilityAction, CapabilityGrant, EntitySchema, RecordVisibility};
+use fractonica_data_model::{CapabilityAction, CapabilityGrant, EntitySchema, Visibility};
 use fractonica_trust::{
     ActorId, CanonicalCborError, CanonicalValue, DetachedSignature, DetachedSignatureDomain,
     NodeId, OperationId, SigningKey, SpaceId, TrustError,
@@ -95,7 +95,7 @@ impl fmt::Debug for InvitationId {
 pub struct CapabilityGrantTemplate {
     pub actions: Vec<CapabilityAction>,
     pub schemas: Vec<EntitySchema>,
-    pub record_visibilities: Vec<RecordVisibility>,
+    pub visibilities: Vec<Visibility>,
     pub content_roles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_resource_byte_length: Option<u64>,
@@ -111,7 +111,7 @@ impl CapabilityGrantTemplate {
     pub fn normalize(&mut self) {
         self.actions.sort_unstable();
         self.schemas.sort_by_key(|schema| schema.as_str());
-        self.record_visibilities.sort_unstable();
+        self.visibilities.sort_unstable();
         self.content_roles.sort_unstable();
     }
 
@@ -120,7 +120,7 @@ impl CapabilityGrantTemplate {
             subject,
             actions: self.actions.clone(),
             schemas: self.schemas.clone(),
-            record_visibilities: self.record_visibilities.clone(),
+            visibilities: self.visibilities.clone(),
             content_roles: self.content_roles.clone(),
             max_resource_byte_length: self.max_resource_byte_length,
             not_before_unix_ms: self.not_before_unix_ms,
@@ -155,7 +155,7 @@ impl CapabilityGrantTemplate {
             (
                 key(2),
                 CanonicalValue::Array(
-                    self.record_visibilities
+                    self.visibilities
                         .iter()
                         .map(|visibility| CanonicalValue::Unsigned(visibility_code(*visibility)))
                         .collect(),
@@ -193,7 +193,7 @@ impl CapabilityGrantTemplate {
                 .into_iter()
                 .map(|value| schema_from_text(text(value)?))
                 .collect::<Result<_, _>>()?,
-            record_visibilities: array(take(&mut map, 2)?)?
+            visibilities: array(take(&mut map, 2)?)?
                 .into_iter()
                 .map(|value| visibility_from_code(unsigned(value)?))
                 .collect::<Result<_, _>>()?,
@@ -1094,18 +1094,18 @@ fn action_from_code(code: u64) -> Result<CapabilityAction, PairingError> {
     }
 }
 
-const fn visibility_code(visibility: RecordVisibility) -> u64 {
+const fn visibility_code(visibility: Visibility) -> u64 {
     match visibility {
-        RecordVisibility::Public => 0,
-        RecordVisibility::Private => 1,
+        Visibility::Public => 0,
+        Visibility::Private => 1,
     }
 }
 
-fn visibility_from_code(code: u64) -> Result<RecordVisibility, PairingError> {
+fn visibility_from_code(code: u64) -> Result<Visibility, PairingError> {
     match code {
-        0 => Ok(RecordVisibility::Public),
-        1 => Ok(RecordVisibility::Private),
-        _ => Err(PairingError::InvalidField("record visibility")),
+        0 => Ok(Visibility::Public),
+        1 => Ok(Visibility::Private),
+        _ => Err(PairingError::InvalidField("visibility")),
     }
 }
 
@@ -1294,7 +1294,7 @@ mod tests {
                     CapabilityAction::WriteContent,
                 ],
                 schemas: vec![EntitySchema::RecordV1],
-                record_visibilities: vec![RecordVisibility::Public],
+                visibilities: vec![Visibility::Public],
                 content_roles: vec!["record.attachment".to_owned()],
                 max_resource_byte_length: Some(1_048_576),
                 not_before_unix_ms: Some(NOW),

@@ -49,7 +49,7 @@ export interface NodeSnapshot {
 export interface PairingCapabilityTemplate {
   actions: Array<"appendOperation" | "readSpace" | "writeContent">;
   schemas: Array<"record.v1">;
-  recordVisibilities: Array<"public" | "private">;
+  visibilities: Array<"public" | "private">;
   contentRoles: string[];
   maxResourceByteLength?: number;
   delegationDepth: number;

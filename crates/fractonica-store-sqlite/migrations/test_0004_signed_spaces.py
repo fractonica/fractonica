@@ -106,7 +106,7 @@ def insert_space(
         (space_id, initial_grant_id),
     )
     connection.executemany(
-        "INSERT INTO capability_grant_record_visibilities VALUES (?, ?, ?, ?)",
+        "INSERT INTO capability_grant_visibilities VALUES (?, ?, ?, ?)",
         (
             (space_id, initial_grant_id, 0, "public"),
             (space_id, initial_grant_id, 1, "private"),
@@ -301,19 +301,19 @@ def test_empty_upgrade_and_constraints() -> None:
     connection.commit()
 
     connection.execute(
-        "INSERT INTO record_entity_visibility VALUES (?, ?, 'record.v1', ?, 'public')",
+        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record.v1', ?, 'public')",
         (space_one, ENTITY_A, parent_one),
     )
     expect_integrity_error(
         connection,
-        "ambiguous record visibility",
-        "INSERT INTO record_entity_visibility VALUES (?, ?, 'record.v1', ?, 'private')",
+        "ambiguous visibility",
+        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record.v1', ?, 'private')",
         (space_one, ENTITY_A, child_one),
     )
     expect_integrity_error(
         connection,
         "cross-entity visibility origin",
-        "INSERT INTO record_entity_visibility VALUES (?, ?, 'record.v1', ?, 'public')",
+        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record.v1', ?, 'public')",
         (space_one, ENTITY_A, other_entity_parent),
     )
 
@@ -396,7 +396,7 @@ def test_empty_upgrade_and_constraints() -> None:
         (space_two, grant_id),
     )
     connection.execute(
-        "INSERT INTO capability_grant_record_visibilities VALUES (?, ?, 0, 'public')",
+        "INSERT INTO capability_grant_visibilities VALUES (?, ?, 0, 'public')",
         (space_two, grant_id),
     )
     connection.execute(
