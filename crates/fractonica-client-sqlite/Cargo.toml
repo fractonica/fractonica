@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fractonica-application.workspace = true
 fractonica-content.workspace = true
 fractonica-data-model.workspace = true
 fractonica-peer.workspace = true
@@ -18,4 +19,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 fractonica-client.workspace = true
+fractonica-keystore.workspace = true
+fractonica-space-bootstrap.workspace = true
 tempfile.workspace = true

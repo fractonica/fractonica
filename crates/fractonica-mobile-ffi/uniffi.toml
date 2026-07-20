@@ -1,0 +1,12 @@
+[bindings.swift]
+module_name = "FractonicaMobileCore"
+ffi_module_name = "FractonicaMobileCoreFFI"
+ffi_module_filename = "FractonicaMobileCoreFFI"
+generate_immutable_records = true
+
+[bindings.kotlin]
+package_name = "com.fractonica.mobile.core"
+cdylib_name = "fractonica_mobile_ffi"
+generate_immutable_records = true
+android = true
+kotlin_target_version = "2.3.10"

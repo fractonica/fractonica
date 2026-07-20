@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Fractonica",
+    "slug": "fractonica",
+    "scheme": "fractonica",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.fractonica.mobile"
+    },
+    "android": {
+      "package": "com.fractonica.mobile"
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

@@ -1,0 +1,25 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'com.fractonica.mobile.nativeclient'
+version = '0.1.0'
+
+android {
+  namespace 'com.fractonica.mobile.nativeclient'
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+  }
+  lintOptions {
+    abortOnError false
+  }
+  sourceSets {
+    main.jniLibs.srcDirs = ['src/main/jniLibs']
+  }
+}
+
+dependencies {
+  implementation 'net.java.dev.jna:jna:5.18.1@aar'
+}

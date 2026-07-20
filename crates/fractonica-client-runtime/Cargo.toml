@@ -16,6 +16,7 @@ fractonica-content.workspace = true
 fractonica-data-model.workspace = true
 fractonica-keystore.workspace = true
 fractonica-peer.workspace = true
+fractonica-space-bootstrap.workspace = true
 fractonica-sync.workspace = true
 reqwest.workspace = true
 serde.workspace = true

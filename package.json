@@ -12,6 +12,14 @@
     "desktop:dev": "pnpm --filter @fractonica/desktop dev",
     "dev": "pnpm --filter @fractonica/control-center dev",
     "glyph:check": "node tools/glyph/generate-glyph-artifacts.mjs --check",
+    "mobile:android": "pnpm mobile:native:android && pnpm --filter @fractonica/mobile run android",
+    "mobile:doctor": "pnpm --filter @fractonica/mobile run doctor",
+    "mobile:ios": "pnpm mobile:native:ios && pnpm --filter @fractonica/mobile run ios",
+    "mobile:native": "./scripts/mobile/build-native.sh",
+    "mobile:native:android": "./scripts/mobile/build-android.sh",
+    "mobile:native:bindings": "./scripts/mobile/generate-bindings.sh",
+    "mobile:native:ios": "./scripts/mobile/build-ios.sh",
+    "mobile:start": "pnpm --filter @fractonica/mobile run start",
     "test": "pnpm --recursive test"
   }
 }

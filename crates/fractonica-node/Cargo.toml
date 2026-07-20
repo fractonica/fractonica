@@ -18,6 +18,7 @@ fractonica-blob-store.workspace = true
 fractonica-data-model.workspace = true
 fractonica-keystore.workspace = true
 fractonica-pairing.workspace = true
+fractonica-space-bootstrap.workspace = true
 fractonica-store-sqlite.workspace = true
 fs4.workspace = true
 getrandom.workspace = true

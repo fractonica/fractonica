@@ -61,8 +61,9 @@ reason to delete or roll back local data.
 - Desktop: the Tauri Rust process owns `ClientRuntime`. The React webview
   invokes narrow commands and receives small serializable results; it does not
   receive keys, database handles, storage paths, or synchronization controls.
-- iOS: a Swift bridge invokes the same Rust semantics or matches the published
-  conformance vectors, with actor keys held behind Keychain-backed custody.
+- Mobile: React Native calls a standalone Expo native module whose Swift and
+  Kotlin adapters invoke the same Rust semantics. Keys remain behind
+  platform-backed native custody and never enter JavaScript.
 - Headless agents: `SoftwareActorKey` may be used with an explicitly provisioned
   capability and protected service storage.
 - Embedded helpers: constrained devices may author a smaller supported

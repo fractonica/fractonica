@@ -1,0 +1,16 @@
+[package]
+name = "fractonica-space-bootstrap"
+description = "Portable construction of trusted Fractonica personal-space anchors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fractonica-application.workspace = true
+fractonica-data-model.workspace = true
+fractonica-keystore.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

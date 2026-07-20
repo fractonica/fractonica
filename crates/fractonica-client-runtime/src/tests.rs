@@ -211,6 +211,7 @@ async fn adopts_exact_node_identity_commits_locally_and_survives_restart() {
     let runtime = ClientRuntime::bootstrap_supervised(config.clone())
         .await
         .unwrap();
+    assert!(matches!(&runtime.sync, RuntimeSync::Worker { .. }));
     assert_eq!(runtime.status().node_id, identity.node_id());
     assert_eq!(runtime.status().actor_id, identity.local_writer_actor_id());
     assert_eq!(runtime.status().space_id, identity.space_id());
@@ -304,5 +305,228 @@ fn rejects_non_loopback_supervisor_endpoints_before_touching_identity() {
     assert!(matches!(
         validate_supervised_endpoint("http://192.168.0.24:8789"),
         Err(ClientRuntimeError::NodeContract(_))
+    ));
+}
+
+fn standalone_config(root: &std::path::Path) -> StandaloneClientConfig {
+    StandaloneClientConfig {
+        client_data_dir: root.join("client"),
+        display_name: "Personal space".into(),
+    }
+}
+
+fn standalone_record(text: &str) -> ProtectedDocument<RecordDocument> {
+    ProtectedDocument::Public {
+        document: RecordDocument {
+            start_at_unix_ms: 1_800_000_000_000,
+            end_at_unix_ms: None,
+            emoji: Some("🌀".into()),
+            text: Some(text.into()),
+            metadata: BTreeMap::new(),
+            resources: Vec::new(),
+            references: Vec::new(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn standalone_client_creates_offline_and_survives_force_drop() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = standalone_config(directory.path());
+    assert_eq!(
+        ClientRuntime::prepare_standalone(config.clone(), false)
+            .await
+            .unwrap(),
+        StandaloneIdentityAction::CreateOrResume
+    );
+    let identities = Arc::new(FileKeyStore::new(directory.path().join("identity")));
+    let runtime = ClientRuntime::bootstrap_standalone(config.clone(), Arc::clone(&identities))
+        .await
+        .unwrap();
+    assert!(matches!(&runtime.sync, RuntimeSync::Static(_)));
+    let initial = runtime.status();
+    assert!(!initial.sync.running);
+    assert_eq!(initial.sync.counts.unwrap().enabled_peers, 0);
+
+    let committed = runtime
+        .create_record(standalone_record("offline and durable"))
+        .await
+        .unwrap();
+    assert_eq!(committed.queued_peers, 0);
+    let expected_node = runtime.status().node_id;
+    let expected_actor = runtime.status().actor_id;
+    let expected_space = runtime.status().space_id;
+    // Deliberately omit graceful shutdown. A successful local commit is the
+    // durability boundary even when the application is force-closed.
+    drop(runtime);
+
+    assert_eq!(
+        ClientRuntime::prepare_standalone(config.clone(), true)
+            .await
+            .unwrap(),
+        StandaloneIdentityAction::OpenExisting
+    );
+    let reopened = ClientRuntime::bootstrap_standalone(config, identities)
+        .await
+        .unwrap();
+    assert_eq!(reopened.status().node_id, expected_node);
+    assert_eq!(reopened.status().actor_id, expected_actor);
+    assert_eq!(reopened.status().space_id, expected_space);
+    let records = reopened.list_records(20).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].summary.operation_id, committed.operation_id);
+    assert_eq!(
+        records[0]
+            .document
+            .as_ref()
+            .and_then(|document| document.text.as_deref()),
+        Some("offline and durable")
+    );
+    let previews = reopened.list_record_previews(20).await.unwrap();
+    assert_eq!(
+        previews[0].text_preview.as_deref(),
+        Some("offline and durable")
+    );
+    let detail = reopened
+        .record(records[0].summary.entity_id, committed.operation_id)
+        .await
+        .unwrap()
+        .expect("record detail");
+    assert_eq!(
+        detail
+            .document
+            .as_ref()
+            .and_then(|document| document.text.as_deref()),
+        Some("offline and durable")
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_rejects_a_non_directory_data_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let data_path = directory.path().join("client");
+    std::fs::write(&data_path, b"not a directory").unwrap();
+    let config = StandaloneClientConfig {
+        client_data_dir: data_path,
+        display_name: "Personal space".into(),
+    };
+
+    assert!(matches!(
+        ClientRuntime::prepare_standalone(config, false).await,
+        Err(ClientRuntimeError::UnsafeClientDataDirectory(
+            "path is not a directory"
+        ))
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn standalone_rejects_a_symbolic_link_data_directory() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let data_path = directory.path().join("client");
+    symlink(&target, &data_path).unwrap();
+    let config = StandaloneClientConfig {
+        client_data_dir: data_path,
+        display_name: "Personal space".into(),
+    };
+
+    assert!(matches!(
+        ClientRuntime::prepare_standalone(config, false).await,
+        Err(ClientRuntimeError::UnsafeClientDataDirectory(
+            "path is a symbolic link"
+        ))
+    ));
+    assert!(!target.join("client.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn standalone_preparation_resumes_both_sides_of_key_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = standalone_config(directory.path());
+    assert_eq!(
+        ClientRuntime::prepare_standalone(config.clone(), false)
+            .await
+            .unwrap(),
+        StandaloneIdentityAction::CreateOrResume
+    );
+    assert_eq!(
+        ClientRuntime::prepare_standalone(config.clone(), false)
+            .await
+            .unwrap(),
+        StandaloneIdentityAction::CreateOrResume
+    );
+
+    let identities = Arc::new(FileKeyStore::new(directory.path().join("identity")));
+    identities.load_or_create().unwrap();
+    assert_eq!(
+        ClientRuntime::prepare_standalone(config.clone(), true)
+            .await
+            .unwrap(),
+        StandaloneIdentityAction::OpenExisting
+    );
+    let runtime = ClientRuntime::bootstrap_standalone(config, identities)
+        .await
+        .unwrap();
+    assert_eq!(runtime.list_records(20).await.unwrap(), Vec::new());
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_identity_database_mismatches_fail_closed() {
+    let orphaned_identity_root = tempfile::tempdir().unwrap();
+    let orphaned_config = standalone_config(orphaned_identity_root.path());
+    let orphaned_identity = Arc::new(FileKeyStore::new(
+        orphaned_identity_root.path().join("identity"),
+    ));
+    orphaned_identity.load_or_create().unwrap();
+    assert!(matches!(
+        ClientRuntime::bootstrap_standalone(orphaned_config, orphaned_identity).await,
+        Err(ClientRuntimeError::StandaloneRecovery(
+            "protected identity exists without its client database"
+        ))
+    ));
+
+    let missing_identity_root = tempfile::tempdir().unwrap();
+    let config = standalone_config(missing_identity_root.path());
+    let identities = Arc::new(FileKeyStore::new(
+        missing_identity_root.path().join("identity"),
+    ));
+    let runtime = ClientRuntime::bootstrap_standalone(config.clone(), Arc::clone(&identities))
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    std::fs::remove_dir_all(identities.identity_dir()).unwrap();
+    assert!(matches!(
+        ClientRuntime::bootstrap_standalone(config, identities).await,
+        Err(ClientRuntimeError::StandaloneRecovery(
+            "established client database has no established protected identity"
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn standalone_rejects_a_different_established_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = standalone_config(directory.path());
+    let first = Arc::new(FileKeyStore::new(directory.path().join("identity-a")));
+    let runtime = ClientRuntime::bootstrap_standalone(config.clone(), first)
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let replacement = Arc::new(FileKeyStore::new(directory.path().join("identity-b")));
+    replacement.load_or_create().unwrap();
+    assert!(matches!(
+        ClientRuntime::bootstrap_standalone(config, replacement).await,
+        Err(ClientRuntimeError::StandaloneRecovery(
+            "protected identity does not match the established client binding"
+        ))
     ));
 }

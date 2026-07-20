@@ -21,6 +21,7 @@ space-authorized content transfer remain deferred.
 - [Canonical octal glyphs](glyphs.md)
 - [Signed, space-scoped HTTP API](signed-operation-api.md)
 - [Client core and local-first write path](client-core.md)
+- [ADR 0014: React Native mobile client boundary](adr/0014-react-native-mobile-client.md)
 - [ADR 0001: Use a monorepo](adr/0001-monorepo.md)
 - [ADR 0002: Rust core with C++ ESP-IDF helpers](adr/0002-rust-core-cpp-esp-idf-helpers.md)
 - [ADR 0003: Node and helper process boundary](adr/0003-node-helper-boundary.md)

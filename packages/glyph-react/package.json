@@ -14,11 +14,11 @@
     "@fractonica/glyph-core": "workspace:*"
   },
   "peerDependencies": {
-    "react": "^19.1.1"
+    "react": ">=19.1.0 <20"
   },
   "devDependencies": {
     "@types/react": "^19.1.9",
-    "react": "^19.1.1",
+    "react": "19.2.3",
     "typescript": "^5.9.2"
   }
 }

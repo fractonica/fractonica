@@ -112,14 +112,17 @@ portable identifiers.
 ## Client boundaries
 
 The desktop webview does not hold long-lived private keys in ordinary browser
-storage. Its Tauri Rust layer owns the client actor and signs operations. iOS
-uses the same client-core semantics through a reviewed native boundary and
-keeps keys in Keychain-backed custody. Both implementations must pass the same
-canonical operation, encryption-AAD, reference, and profile-ID vectors.
+storage. Its Tauri Rust layer owns the client actor and signs operations. The
+React Native mobile client uses the same client-core semantics through a
+reviewed Expo native/Rust boundary; iOS keeps device-only keys in
+Keychain-backed custody and Android uses Android Keystore-backed protection.
+Every implementation must pass the same canonical operation, encryption-AAD,
+reference, and profile-ID vectors.
 
-The first web client may use loopback projection routes. iOS synchronization
-continues to use the signed operation log and content resources; it does not
-depend on server projections being a replication format.
+The first web client may use loopback projection routes. Mobile
+synchronization continues to use the signed operation log and content
+resources; it does not depend on server projections being a replication
+format.
 
 ## External-source boundary
 

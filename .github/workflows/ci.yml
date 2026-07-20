@@ -102,6 +102,134 @@ jobs:
       - name: Build
         run: pnpm build
 
+  mobile-android:
+    name: Mobile Android native assembly
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      NODE_ENV: development
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install Android Rust targets
+        run: >-
+          rustup target add
+          aarch64-linux-android
+          armv7-linux-androideabi
+          i686-linux-android
+          x86_64-linux-android
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.9.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile --filter @fractonica/mobile...
+
+      - name: Install pinned Android NDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.1.12297006"
+
+      - name: Build Rust libraries and generated bindings
+        run: pnpm mobile:native:android
+
+      - name: Verify checked-in UniFFI bindings
+        run: >-
+          git diff --exit-code --
+          packages/mobile-native/ios/Generated
+          packages/mobile-native/android/src/main/java/com/fractonica/mobile/core
+
+      - name: Generate Android application
+        run: pnpm --filter @fractonica/mobile run prebuild -- --platform android --no-install
+
+      - name: Assemble Android development application
+        working-directory: apps/mobile/android
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Verify packaged native libraries
+        run: |
+          apk="apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            unzip -Z1 "$apk" | grep -Fx "lib/$abi/libfractonica_mobile_ffi.so"
+            unzip -Z1 "$apk" | grep -Fx "lib/$abi/libjnidispatch.so"
+          done
+
+  mobile-ios:
+    name: Mobile iOS native assembly
+    runs-on: macos-15
+    env:
+      CARGO_INCREMENTAL: "0"
+      NODE_ENV: development
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install iOS Rust targets
+        run: rustup target add aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-ios
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.9.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile --filter @fractonica/mobile...
+
+      - name: Build Rust XCFramework and generated bindings
+        run: pnpm mobile:native:ios
+
+      - name: Verify XCFramework architectures
+        run: |
+          framework="packages/mobile-native/ios/Rust/FractonicaMobileCoreFFI.xcframework"
+          lipo "$framework/ios-arm64/libfractonica_mobile_ffi.a" \
+            -verify_arch arm64
+          lipo "$framework/ios-arm64_x86_64-simulator/libfractonica_mobile_ffi.a" \
+            -verify_arch arm64 x86_64
+
+      - name: Verify checked-in UniFFI bindings
+        run: >-
+          git diff --exit-code --
+          packages/mobile-native/ios/Generated
+          packages/mobile-native/android/src/main/java/com/fractonica/mobile/core
+
+      - name: Generate iOS application
+        run: pnpm --filter @fractonica/mobile run prebuild -- --platform ios --no-install
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/mobile/ios
+        run: pod install
+
+      - name: Build iOS simulator application
+        working-directory: apps/mobile/ios
+        run: >-
+          xcodebuild
+          -workspace Fractonica.xcworkspace
+          -scheme Fractonica
+          -configuration Debug
+          -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO
+          build
+
   desktop:
     name: Desktop assembly
     runs-on: ubuntu-latest

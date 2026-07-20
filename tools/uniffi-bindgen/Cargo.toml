@@ -1,0 +1,16 @@
+[package]
+name = "fractonica-uniffi-bindgen"
+description = "Repository-pinned UniFFI binding generator for Fractonica mobile clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "fractonica-uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { workspace = true, features = ["cli"] }

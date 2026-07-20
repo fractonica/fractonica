@@ -2,6 +2,8 @@ use std::{collections::BTreeMap, time::Duration};
 
 use fractonica_content::{ResourceRef, hash_bytes};
 use fractonica_data_model::{OperationNonce, RecordDocument, SigningKey};
+use fractonica_keystore::IdentityBundle;
+use fractonica_space_bootstrap::build_trusted_space_bootstrap;
 
 use super::*;
 
@@ -110,6 +112,16 @@ fn seeded_store() -> (ClientSqliteStore, SigningKey, OperationEnvelope) {
     (store, signing_key, genesis)
 }
 
+fn standalone_identity(seed: u8) -> IdentityBundle {
+    IdentityBundle::from_keys(
+        key(seed),
+        key(seed + 1),
+        key(seed + 2),
+        SpaceId::from_bytes([seed + 3; 32]),
+    )
+    .unwrap()
+}
+
 #[test]
 fn local_commit_is_atomic_replayable_and_materialized_before_delivery() {
     let (store, signing_key, genesis) = seeded_store();
@@ -150,8 +162,64 @@ fn local_commit_is_atomic_replayable_and_materialized_before_delivery() {
             .and_then(|document| document.text.as_deref()),
         Some("offline first")
     );
+    let previews = store.list_record_previews(space(), 20).unwrap();
+    assert_eq!(previews[0].emoji.as_deref(), Some("🌀"));
+    assert_eq!(previews[0].text_preview.as_deref(), Some("offline first"));
+    assert!(!previews[0].preview_truncated);
+    let detail = store
+        .record(space(), operation.entity_id, operation.operation_id)
+        .unwrap()
+        .expect("record detail");
+    assert_eq!(
+        detail
+            .document
+            .as_ref()
+            .and_then(|document| document.text.as_deref()),
+        Some("offline first")
+    );
     assert!(store.commit_local(&operation, 4).unwrap().replayed);
     assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 1);
+}
+
+#[test]
+fn record_feed_projection_is_bounded_and_detail_requires_the_exact_live_head() {
+    let (store, signing_key, genesis) = seeded_store();
+    let long_text = "🌀".repeat(MAX_RECORD_PREVIEW_TEXT_CHARS + 1);
+    let operation = record(
+        &signing_key,
+        entity(21),
+        Vec::new(),
+        genesis.operation_id,
+        21,
+        100,
+        &long_text,
+    );
+    store.commit_local(&operation, 3).unwrap();
+
+    let previews = store.list_record_previews(space(), 20).unwrap();
+    assert_eq!(previews.len(), 1);
+    let preview = &previews[0];
+    assert_eq!(
+        preview.text_preview.as_deref().unwrap().chars().count(),
+        MAX_RECORD_PREVIEW_TEXT_CHARS
+    );
+    assert_eq!(preview.text_preview.as_deref().unwrap().len(), 768);
+    assert!(preview.preview_truncated);
+
+    let detail = store
+        .record(space(), operation.entity_id, operation.operation_id)
+        .unwrap()
+        .expect("exact detail");
+    assert_eq!(
+        detail.document.and_then(|document| document.text),
+        Some(long_text)
+    );
+    assert!(
+        store
+            .record(space(), entity(22), operation.operation_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -730,4 +798,146 @@ fn peer_space_cursor_and_failure_state_use_compare_and_swap() {
     assert_eq!(store.due_sync_targets(39, 10).unwrap().len(), 0);
     let failed = store.due_sync_targets(40, 10).unwrap().remove(0);
     assert_eq!(failed.pull_failure_count, 1);
+}
+
+#[test]
+fn standalone_establishment_is_atomic_replayable_and_pins_exact_anchors() {
+    let store = ClientSqliteStore::open_in_memory().unwrap();
+    assert_eq!(store.installation().unwrap(), ClientInstallation::Unbound);
+    assert_eq!(
+        store.begin_local_installation().unwrap(),
+        ClientInstallation::Initializing
+    );
+    let identity = standalone_identity(40);
+    let bootstrap = build_trusted_space_bootstrap(&identity, "Personal space", 100).unwrap();
+
+    let established = store
+        .establish_local_space(identity.node_id(), &bootstrap)
+        .unwrap();
+    assert!(!established.replayed);
+    assert_eq!(established.binding.node_id, identity.node_id());
+    assert_eq!(established.binding.space_id, identity.space_id());
+    assert_eq!(
+        established.binding.controller_actor_id,
+        identity.space_controller_actor_id()
+    );
+    assert_eq!(
+        established.binding.local_writer_actor_id,
+        identity.local_writer_actor_id()
+    );
+    assert_eq!(
+        store
+            .operation(bootstrap.genesis.operation_id)
+            .unwrap()
+            .unwrap(),
+        bootstrap.genesis
+    );
+    assert_eq!(
+        store
+            .operation(bootstrap.initial_grant.operation_id)
+            .unwrap()
+            .unwrap(),
+        bootstrap.initial_grant
+    );
+    assert_eq!(operation_count(&store.lock().unwrap()).unwrap(), 2);
+
+    let replay = store
+        .establish_local_space(identity.node_id(), &bootstrap)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.binding, established.binding);
+}
+
+#[test]
+fn standalone_establishment_rejects_an_exact_preexisting_anchor() {
+    let store = ClientSqliteStore::open_in_memory().unwrap();
+    store.begin_local_installation().unwrap();
+    let identity = standalone_identity(50);
+    let bootstrap = build_trusted_space_bootstrap(&identity, "Personal space", 200).unwrap();
+    store.commit_remote(&bootstrap.genesis, 200).unwrap();
+
+    assert!(matches!(
+        store.establish_local_space(identity.node_id(), &bootstrap),
+        Err(ClientStoreError::UntrackedInstallationOperations)
+    ));
+    assert_eq!(
+        store.installation().unwrap(),
+        ClientInstallation::Initializing
+    );
+    assert!(
+        store
+            .operation(bootstrap.initial_grant.operation_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_store_rejects_a_symbolic_link_database_path() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let real_path = directory.path().join("real.sqlite3");
+    drop(ClientSqliteStore::open(&real_path).unwrap());
+    let linked_path = directory.path().join("linked.sqlite3");
+    symlink(&real_path, &linked_path).unwrap();
+
+    assert!(matches!(
+        ClientSqliteStore::open(&linked_path),
+        Err(ClientStoreError::Sqlite(_))
+    ));
+}
+
+#[test]
+fn standalone_establishment_rejects_untracked_operations() {
+    let store = ClientSqliteStore::open_in_memory().unwrap();
+    store.begin_local_installation().unwrap();
+    let expected_identity = standalone_identity(70);
+    let expected =
+        build_trusted_space_bootstrap(&expected_identity, "Personal space", 300).unwrap();
+    let unrelated_identity = standalone_identity(80);
+    let unrelated = build_trusted_space_bootstrap(&unrelated_identity, "Other space", 301).unwrap();
+    store.commit_remote(&unrelated.genesis, 301).unwrap();
+
+    assert!(matches!(
+        store.establish_local_space(expected_identity.node_id(), &expected),
+        Err(ClientStoreError::UntrackedInstallationOperations)
+    ));
+    assert_eq!(
+        store.installation().unwrap(),
+        ClientInstallation::Initializing
+    );
+    assert!(
+        store
+            .operation(expected.genesis.operation_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn ordered_migrations_upgrade_a_version_one_client_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("client.sqlite3");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATIONS[0]).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    let store = ClientSqliteStore::open(&path).unwrap();
+    assert_eq!(store.installation().unwrap(), ClientInstallation::Unbound);
+    let connection = store.lock().unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        CLIENT_SCHEMA_VERSION
+    );
 }

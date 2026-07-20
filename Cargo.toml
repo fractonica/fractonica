@@ -14,14 +14,17 @@ members = [
     "crates/fractonica-data-model",
     "crates/fractonica-glyph",
     "crates/fractonica-keystore",
+    "crates/fractonica-mobile-ffi",
     "crates/fractonica-node",
     "crates/fractonica-pairing",
     "crates/fractonica-peer",
     "crates/fractonica-saros-engine",
     "crates/fractonica-saros-geo",
+    "crates/fractonica-space-bootstrap",
     "crates/fractonica-store-sqlite",
     "crates/fractonica-temporal-core",
     "crates/fractonica-trust",
+    "tools/uniffi-bindgen",
 ]
 resolver = "3"
 
@@ -51,10 +54,12 @@ fractonica-core = { path = "crates/fractonica-core" }
 fractonica-data-model = { path = "crates/fractonica-data-model" }
 fractonica-glyph = { path = "crates/fractonica-glyph" }
 fractonica-keystore = { path = "crates/fractonica-keystore" }
+fractonica-mobile-ffi = { path = "crates/fractonica-mobile-ffi" }
 fractonica-pairing = { path = "crates/fractonica-pairing" }
 fractonica-peer = { path = "crates/fractonica-peer" }
 fractonica-saros-engine = { path = "crates/fractonica-saros-engine" }
 fractonica-saros-geo = { path = "crates/fractonica-saros-geo" }
+fractonica-space-bootstrap = { path = "crates/fractonica-space-bootstrap" }
 fractonica-store-sqlite = { path = "crates/fractonica-store-sqlite" }
 fractonica-temporal-core = { path = "crates/fractonica-temporal-core" }
 fractonica-trust = { path = "crates/fractonica-trust" }
@@ -91,5 +96,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 uuid = { version = "1.24.0", features = ["serde", "v4", "v7"] }
+uniffi = "=0.32.0"
 zeroize = "1.9.0"
 x25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }

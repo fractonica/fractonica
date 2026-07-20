@@ -508,10 +508,7 @@ impl ApplicationService {
         &self,
         request: TrustedSpaceBootstrapRequest,
     ) -> Result<TrustedSpaceBootstrapResult, ApplicationError> {
-        validate_received_at(request.received_at_unix_ms)?;
-        request.genesis.verify()?;
-        request.initial_grant.verify()?;
-        validate_trusted_bootstrap(&request)?;
+        validate_trusted_space_bootstrap(&request)?;
         self.repository
             .bootstrap_trusted_space(&request)
             .map_err(Into::into)
@@ -623,9 +620,18 @@ fn validate_received_at(received_at_unix_ms: i64) -> Result<(), ApplicationError
     }
 }
 
-fn validate_trusted_bootstrap(
+/// Validates the complete trusted personal-space bootstrap contract without
+/// admitting it to a repository.
+///
+/// Local clients use the same pure boundary before atomically establishing
+/// their offline store. Keeping this validation here prevents node and client
+/// bootstrap rules from drifting apart.
+pub fn validate_trusted_space_bootstrap(
     request: &TrustedSpaceBootstrapRequest,
 ) -> Result<(), ApplicationError> {
+    validate_received_at(request.received_at_unix_ms)?;
+    request.genesis.verify()?;
+    request.initial_grant.verify()?;
     let display_name_length = request.display_name.chars().count();
     if display_name_length == 0
         || display_name_length > MAX_SPACE_DISPLAY_NAME_CHARS

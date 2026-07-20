@@ -29,6 +29,8 @@ The initial vertical slice provides:
 - a React control center that can inspect the local node and administer the
   loopback Noise pairing ceremony through a scannable QR and two-glyph human
   confirmation;
+- an Expo/React Native mobile foundation with a strict native-client boundary,
+  canonical SVG glyph rendering, and an offline-first records surface;
 - dual-signed, pairing-bound `readSpace` change pages with durable replay
   protection;
 - a Tauri desktop shell that supervises the node and owns a native client
@@ -137,6 +139,32 @@ Create a release bundle with:
 ```sh
 pnpm desktop:build
 ```
+
+## Run the mobile application
+
+The mobile app requires an Expo development build because the Fractonica
+client is an autolinked native module. Expo Go is not supported.
+
+```sh
+pnpm install
+rustup target add aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-ios
+pnpm mobile:native:ios
+pnpm --filter @fractonica/mobile run prebuild
+pnpm mobile:ios
+```
+
+For a fresh Android checkout, install the Rust targets for Expo's four default
+ABIs, run `pnpm mobile:native:android` before prebuild, then use
+`pnpm mobile:android`:
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+```
+
+The top-level platform commands rebuild their Rust artifacts on later runs.
+After the development build is installed, run `pnpm mobile:start` to start
+Metro. The linked native module owns identity, SQLite, signing, and the local
+commit boundary; it never substitutes a JavaScript database or mock records.
 
 ## Validate
 

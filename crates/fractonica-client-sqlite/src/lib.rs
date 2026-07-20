@@ -10,23 +10,32 @@ use std::{
     time::Duration,
 };
 
+use fractonica_application::{TrustedSpaceBootstrapRequest, validate_trusted_space_bootstrap};
 use fractonica_content::{ContentDescriptor, ContentId, ResourceRef};
 use fractonica_data_model::{
-    EntityId, EntitySchema, MAX_CAUSAL_PARENTS, NodeId, OperationBody, OperationEnvelope,
+    ActorId, EntityId, EntitySchema, MAX_CAUSAL_PARENTS, NodeId, OperationBody, OperationEnvelope,
     OperationId, ProtectedDocument, RecordDocument, SpaceId, Visibility,
 };
 use fractonica_peer::PeerSessionId;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CLIENT_SCHEMA_VERSION: u32 = 1;
+pub const CLIENT_SCHEMA_VERSION: u32 = 3;
 pub const MAX_OUTBOX_BATCH: usize = 100;
 pub const MAX_ERROR_BYTES: usize = 2_048;
 pub const MAX_ENDPOINT_BYTES: usize = 2_048;
 pub const MAX_RESOURCE_TRANSFER_BATCH: usize = 100;
+/// Maximum Unicode scalars stored for a record feed preview.
+pub const MAX_RECORD_PREVIEW_TEXT_CHARS: usize = 192;
 
-const MIGRATION: &str = include_str!("../migrations/0001_client_store.sql");
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_client_store.sql"),
+    include_str!("../migrations/0002_local_installation.sql"),
+    include_str!("../migrations/0003_record_previews.sql"),
+];
 
 #[derive(Clone)]
 pub struct ClientSqliteStore {
@@ -47,6 +56,37 @@ pub struct CommitResult {
     pub operation_id: OperationId,
     pub replayed: bool,
     pub queued_peers: u64,
+}
+
+/// Durable public binding between a standalone client's protected identity
+/// and the exact authorization anchors in its local operation log.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientInstallationBinding {
+    pub node_id: NodeId,
+    pub space_id: SpaceId,
+    pub controller_actor_id: ActorId,
+    pub local_writer_actor_id: ActorId,
+    pub genesis_operation_id: OperationId,
+    pub initial_grant_operation_id: OperationId,
+    pub display_name: String,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientInstallation {
+    /// No standalone lifecycle has claimed this otherwise-empty client store.
+    Unbound,
+    /// The database marker is durable; protected identity creation may safely
+    /// be started or resumed.
+    Initializing,
+    /// Identity and exact signed space anchors were committed as one unit.
+    Established(Box<ClientInstallationBinding>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EstablishLocalSpaceResult {
+    pub binding: ClientInstallationBinding,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +252,15 @@ pub struct LocalRecordSummary {
     pub document: Option<RecordDocument>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRecordPreview {
+    pub summary: LocalEntitySummary,
+    /// Bounded public display fields. Private content is never projected.
+    pub emoji: Option<String>,
+    pub text_preview: Option<String>,
+    pub preview_truncated: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutboxCounts {
     pub pending: u64,
@@ -241,6 +290,8 @@ pub enum ClientStoreError {
     InvalidOperation(String),
     #[error("client database uses schema {found}, but this binary supports {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
+    #[error("client database migration {expected} completed with schema {found}")]
+    MigrationVersionMismatch { expected: u32, found: u32 },
     #[error("client database lock was poisoned")]
     LockPoisoned,
     #[error("stored client data is corrupt: {0}")]
@@ -289,22 +340,33 @@ pub enum ClientStoreError {
     PullCursorMismatch,
     #[error("pull cursor cannot move backwards or exceed signed 64-bit storage")]
     InvalidPullCursor,
+    #[error("trusted local-space bootstrap is invalid: {0}")]
+    InvalidBootstrap(String),
+    #[error("standalone initialization requires an otherwise-empty client operation log")]
+    UntrackedInstallationOperations,
+    #[error("standalone installation is not in its initializing phase")]
+    InstallationNotInitializing,
+    #[error("standalone installation binding or anchor replay differs from established state")]
+    InstallationConflict,
 }
 
 impl ClientSqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ClientStoreError> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-            set_private_permissions(parent, true)?;
-        }
-        let mut connection = Connection::open(&path)?;
+        let requested_path = path.as_ref().to_path_buf();
+        let open_path = nofollow_database_path(&requested_path)?;
+        let mut connection = Connection::open_with_flags(
+            &open_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         configure(&connection, true)?;
         migrate(&mut connection)?;
-        secure_sqlite_files(&path)?;
+        secure_sqlite_files(&open_path)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
-            path: Arc::new(path),
+            path: Arc::new(requested_path),
         })
     }
 
@@ -321,6 +383,134 @@ impl ClientSqliteStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         self.path.as_path()
+    }
+
+    /// Returns the standalone identity/database binding without changing it.
+    pub fn installation(&self) -> Result<ClientInstallation, ClientStoreError> {
+        let connection = self.lock()?;
+        load_installation(&connection)
+    }
+
+    /// Durably announces standalone initialization before protected identity
+    /// creation is allowed to begin.
+    ///
+    /// Replaying this method while already initializing is harmless. An
+    /// unbound database containing operations is never silently adopted.
+    pub fn begin_local_installation(&self) -> Result<ClientInstallation, ClientStoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let installation = load_installation(&transaction)?;
+        match installation {
+            ClientInstallation::Unbound => {
+                if operation_count(&transaction)? != 0 {
+                    return Err(ClientStoreError::UntrackedInstallationOperations);
+                }
+                transaction.execute(
+                    "INSERT INTO client_local_installation (singleton, phase)
+                     VALUES (1, 'initializing')",
+                    [],
+                )?;
+                transaction.commit()?;
+                Ok(ClientInstallation::Initializing)
+            }
+            ClientInstallation::Initializing => {
+                transaction.commit()?;
+                Ok(ClientInstallation::Initializing)
+            }
+            established @ ClientInstallation::Established(_) => {
+                transaction.commit()?;
+                Ok(established)
+            }
+        }
+    }
+
+    /// Atomically commits a standalone client's two trust anchors and the
+    /// public identity binding that makes future startup fail closed.
+    ///
+    /// A crash cannot expose only one newly admitted anchor because both
+    /// anchors and the binding share this transaction. The initializing phase
+    /// is valid only while the operation log remains empty.
+    pub fn establish_local_space(
+        &self,
+        node_id: NodeId,
+        request: &TrustedSpaceBootstrapRequest,
+    ) -> Result<EstablishLocalSpaceResult, ClientStoreError> {
+        validate_trusted_space_bootstrap(request)
+            .map_err(|error| ClientStoreError::InvalidBootstrap(error.to_string()))?;
+        let binding = installation_binding(node_id, request)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match load_installation(&transaction)? {
+            ClientInstallation::Unbound => {
+                return Err(ClientStoreError::InstallationNotInitializing);
+            }
+            ClientInstallation::Established(existing) => {
+                if existing.as_ref() != &binding
+                    || !operation_matches(&transaction, &request.genesis)?
+                    || !operation_matches(&transaction, &request.initial_grant)?
+                {
+                    return Err(ClientStoreError::InstallationConflict);
+                }
+                transaction.commit()?;
+                return Ok(EstablishLocalSpaceResult {
+                    binding: *existing,
+                    replayed: true,
+                });
+            }
+            ClientInstallation::Initializing => {}
+        }
+
+        if operation_count(&transaction)? != 0 {
+            return Err(ClientStoreError::UntrackedInstallationOperations);
+        }
+        let genesis = commit_transaction(
+            &transaction,
+            &request.genesis,
+            request.received_at_unix_ms,
+            CommitSource::Remote,
+        )?;
+        let grant = commit_transaction(
+            &transaction,
+            &request.initial_grant,
+            request.received_at_unix_ms,
+            CommitSource::Remote,
+        )?;
+        let changed = transaction.execute(
+            "UPDATE client_local_installation SET
+                phase = 'established', node_id = ?1, space_id = ?2,
+                controller_actor_id = ?3, local_writer_actor_id = ?4,
+                genesis_operation_id = ?5, initial_grant_operation_id = ?6,
+                display_name = ?7, created_at_unix_ms = ?8
+             WHERE singleton = 1 AND phase = 'initializing'",
+            params![
+                binding.node_id.to_string(),
+                binding.space_id.to_string(),
+                binding.controller_actor_id.to_string(),
+                binding.local_writer_actor_id.to_string(),
+                binding.genesis_operation_id.to_string(),
+                binding.initial_grant_operation_id.to_string(),
+                binding.display_name,
+                binding.created_at_unix_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ClientStoreError::InstallationNotInitializing);
+        }
+        transaction.commit()?;
+        Ok(EstablishLocalSpaceResult {
+            binding,
+            replayed: genesis.replayed || grant.replayed,
+        })
+    }
+
+    /// Reads one exact locally stored signed operation by its digest identity.
+    pub fn operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<OperationEnvelope>, ClientStoreError> {
+        let connection = self.lock()?;
+        load_operation_row(&connection, operation_id)
+            .map(|value| value.map(|(_, operation)| operation))
     }
 
     pub fn commit_local(
@@ -360,76 +550,11 @@ impl ClientSqliteStore {
         stored_at_unix_ms: i64,
         source: CommitSource,
     ) -> Result<CommitResult, ClientStoreError> {
-        operation
-            .verify()
-            .map_err(|error| ClientStoreError::InvalidOperation(error.to_string()))?;
-        if stored_at_unix_ms < 0 {
-            return Err(ClientStoreError::NegativeTimestamp);
-        }
-        let projection_json = serde_json::to_string(operation)
-            .map_err(|error| ClientStoreError::InvalidOperation(error.to_string()))?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some((sequence, existing)) =
-            load_operation_row(&transaction, operation.operation_id)?
-        {
-            if existing != *operation {
-                return Err(ClientStoreError::OperationConflict(operation.operation_id));
-            }
-            apply_delivery_source(
-                &transaction,
-                operation.operation_id,
-                stored_at_unix_ms,
-                source,
-            )?;
-            apply_resource_source(&transaction, operation, stored_at_unix_ms, source)?;
-            let queued_peers = delivery_count(&transaction, operation.operation_id)?;
-            transaction.commit()?;
-            return Ok(CommitResult {
-                local_sequence: sequence,
-                operation_id: operation.operation_id,
-                replayed: true,
-                queued_peers,
-            });
-        }
-        validate_references(&transaction, operation)?;
-        validate_topology(&transaction, operation)?;
-        transaction.execute(
-            "INSERT INTO client_operations (
-                operation_id, space_id, entity_id, schema_id, actor_id,
-                occurred_at_unix_ms, stored_at_unix_ms, locally_authored, projection_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                operation.operation_id.to_string(),
-                operation.space_id.to_string(),
-                operation.entity_id.to_string(),
-                operation.schema.as_str(),
-                operation.actor_id.to_string(),
-                operation.occurred_at_unix_ms,
-                stored_at_unix_ms,
-                i64::from(matches!(source, CommitSource::Local)),
-                projection_json,
-            ],
-        )?;
-        let local_sequence = positive_u64(transaction.last_insert_rowid())?;
-        insert_graph(&transaction, operation)?;
-        insert_projection(&transaction, operation)?;
-        insert_operation_resources(&transaction, operation, stored_at_unix_ms)?;
-        apply_delivery_source(
-            &transaction,
-            operation.operation_id,
-            stored_at_unix_ms,
-            source,
-        )?;
-        apply_resource_source(&transaction, operation, stored_at_unix_ms, source)?;
-        let queued_peers = delivery_count(&transaction, operation.operation_id)?;
+        let result = commit_transaction(&transaction, operation, stored_at_unix_ms, source)?;
         transaction.commit()?;
-        Ok(CommitResult {
-            local_sequence,
-            operation_id: operation.operation_id,
-            replayed: false,
-            queued_peers,
-        })
+        Ok(result)
     }
 
     pub fn upsert_peer(&self, peer: &PeerConfig) -> Result<(), ClientStoreError> {
@@ -1504,23 +1629,7 @@ impl ClientSqliteStore {
             let operation_id =
                 OperationId::parse(&row.0).map_err(|error| corrupt(error.to_string()))?;
             let entity_id = EntityId::parse(&row.1).map_err(|error| corrupt(error.to_string()))?;
-            let operation = decode_operation(&row.10)?;
-            if operation.operation_id != operation_id
-                || operation.entity_id != entity_id
-                || operation.space_id != space_id
-                || operation.schema != EntitySchema::Record
-            {
-                return Err(corrupt("record projection does not match its operation"));
-            }
-            let document = match operation.body {
-                OperationBody::PutRecord {
-                    payload: ProtectedDocument::Public { document },
-                } => Some(document),
-                OperationBody::PutRecord {
-                    payload: ProtectedDocument::Private { .. },
-                } => None,
-                _ => return Err(corrupt("record projection has a non-record body")),
-            };
+            let operation = decode_record_projection(&row.10, space_id, entity_id, operation_id)?;
             Ok(LocalRecordSummary {
                 summary: LocalEntitySummary {
                     operation_id,
@@ -1535,10 +1644,144 @@ impl ClientSqliteStore {
                     media_bytes: nonnegative_u64(row.8)?,
                     conflicted: row.9,
                 },
-                document,
+                document: operation,
             })
         })
         .collect()
+    }
+
+    /// Reads bounded display projections without loading full operation JSON.
+    /// Mobile bridge code should use this path rather than [`Self::list_records`].
+    pub fn list_record_previews(
+        &self,
+        space_id: SpaceId,
+        limit: usize,
+    ) -> Result<Vec<LocalRecordPreview>, ClientStoreError> {
+        if !(1..=200).contains(&limit) {
+            return Err(ClientStoreError::InvalidEntityLimit);
+        }
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT p.operation_id, p.entity_id, p.visibility, p.tombstone,
+                    p.start_at_unix_ms, p.end_at_unix_ms, p.sort_text,
+                    p.resource_count, p.media_bytes,
+                    (SELECT count(*) FROM client_entity_heads h2
+                     WHERE h2.space_id = p.space_id AND h2.entity_id = p.entity_id) > 1,
+                    p.preview_emoji, p.preview_text, p.preview_truncated
+             FROM client_projections p
+             JOIN client_entity_heads h ON h.operation_id = p.operation_id
+             WHERE p.space_id = ?1 AND p.schema_id = 'record' AND p.tombstone = 0
+             ORDER BY coalesce(p.start_at_unix_ms, -1) DESC, p.entity_id, p.operation_id
+             LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![space_id.to_string(), limit_i64(limit)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, bool>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, bool>(12)?,
+                ))
+            })?;
+        rows.map(|row| {
+            let row = row?;
+            Ok(LocalRecordPreview {
+                summary: LocalEntitySummary {
+                    operation_id: OperationId::parse(&row.0)
+                        .map_err(|error| corrupt(error.to_string()))?,
+                    entity_id: EntityId::parse(&row.1)
+                        .map_err(|error| corrupt(error.to_string()))?,
+                    schema: EntitySchema::Record,
+                    visibility: parse_visibility(&row.2)?,
+                    tombstone: row.3,
+                    start_at_unix_ms: row.4,
+                    end_at_unix_ms: row.5,
+                    sort_text: row.6,
+                    resource_count: nonnegative_u64(row.7)?,
+                    media_bytes: nonnegative_u64(row.8)?,
+                    conflicted: row.9,
+                },
+                emoji: row.10,
+                text_preview: row.11,
+                preview_truncated: row.12,
+            })
+        })
+        .collect()
+    }
+
+    /// Reads one exact live record head selected by both immutable operation
+    /// identity and entity identity. Historical and cross-space operations are
+    /// deliberately not exposed through this projection lookup.
+    pub fn record(
+        &self,
+        space_id: SpaceId,
+        entity_id: EntityId,
+        operation_id: OperationId,
+    ) -> Result<Option<LocalRecordSummary>, ClientStoreError> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT p.visibility, p.tombstone, p.start_at_unix_ms,
+                        p.end_at_unix_ms, p.sort_text, p.resource_count,
+                        p.media_bytes,
+                        (SELECT count(*) FROM client_entity_heads h2
+                         WHERE h2.space_id = p.space_id AND h2.entity_id = p.entity_id) > 1,
+                        o.projection_json
+                 FROM client_projections p
+                 JOIN client_entity_heads h ON h.operation_id = p.operation_id
+                 JOIN client_operations o ON o.operation_id = p.operation_id
+                 WHERE p.space_id = ?1 AND p.entity_id = ?2
+                   AND p.operation_id = ?3 AND p.schema_id = 'record'
+                   AND p.tombstone = 0",
+                params![
+                    space_id.to_string(),
+                    entity_id.to_string(),
+                    operation_id.to_string()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, bool>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let document = decode_record_projection(&row.8, space_id, entity_id, operation_id)?;
+        Ok(Some(LocalRecordSummary {
+            summary: LocalEntitySummary {
+                operation_id,
+                entity_id,
+                schema: EntitySchema::Record,
+                visibility: parse_visibility(&row.0)?,
+                tombstone: row.1,
+                start_at_unix_ms: row.2,
+                end_at_unix_ms: row.3,
+                sort_text: row.4,
+                resource_count: nonnegative_u64(row.5)?,
+                media_bytes: nonnegative_u64(row.6)?,
+                conflicted: row.7,
+            },
+            document,
+        }))
     }
 
     /// Rebuilds every entity head and client projection from immutable local
@@ -1573,6 +1816,204 @@ impl ClientSqliteStore {
     }
 }
 
+fn commit_transaction(
+    transaction: &Transaction<'_>,
+    operation: &OperationEnvelope,
+    stored_at_unix_ms: i64,
+    source: CommitSource,
+) -> Result<CommitResult, ClientStoreError> {
+    operation
+        .verify()
+        .map_err(|error| ClientStoreError::InvalidOperation(error.to_string()))?;
+    if stored_at_unix_ms < 0 {
+        return Err(ClientStoreError::NegativeTimestamp);
+    }
+    let projection_json = serde_json::to_string(operation)
+        .map_err(|error| ClientStoreError::InvalidOperation(error.to_string()))?;
+    if let Some((sequence, existing)) = load_operation_row(transaction, operation.operation_id)? {
+        if existing != *operation {
+            return Err(ClientStoreError::OperationConflict(operation.operation_id));
+        }
+        apply_delivery_source(
+            transaction,
+            operation.operation_id,
+            stored_at_unix_ms,
+            source,
+        )?;
+        apply_resource_source(transaction, operation, stored_at_unix_ms, source)?;
+        return Ok(CommitResult {
+            local_sequence: sequence,
+            operation_id: operation.operation_id,
+            replayed: true,
+            queued_peers: delivery_count(transaction, operation.operation_id)?,
+        });
+    }
+    validate_references(transaction, operation)?;
+    validate_topology(transaction, operation)?;
+    transaction.execute(
+        "INSERT INTO client_operations (
+            operation_id, space_id, entity_id, schema_id, actor_id,
+            occurred_at_unix_ms, stored_at_unix_ms, locally_authored, projection_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            operation.operation_id.to_string(),
+            operation.space_id.to_string(),
+            operation.entity_id.to_string(),
+            operation.schema.as_str(),
+            operation.actor_id.to_string(),
+            operation.occurred_at_unix_ms,
+            stored_at_unix_ms,
+            i64::from(matches!(source, CommitSource::Local)),
+            projection_json,
+        ],
+    )?;
+    let local_sequence = positive_u64(transaction.last_insert_rowid())?;
+    insert_graph(transaction, operation)?;
+    insert_projection(transaction, operation)?;
+    insert_operation_resources(transaction, operation, stored_at_unix_ms)?;
+    apply_delivery_source(
+        transaction,
+        operation.operation_id,
+        stored_at_unix_ms,
+        source,
+    )?;
+    apply_resource_source(transaction, operation, stored_at_unix_ms, source)?;
+    Ok(CommitResult {
+        local_sequence,
+        operation_id: operation.operation_id,
+        replayed: false,
+        queued_peers: delivery_count(transaction, operation.operation_id)?,
+    })
+}
+
+fn installation_binding(
+    node_id: NodeId,
+    request: &TrustedSpaceBootstrapRequest,
+) -> Result<ClientInstallationBinding, ClientStoreError> {
+    let OperationBody::SpaceGenesis { controller } = request.genesis.body else {
+        return Err(ClientStoreError::InvalidBootstrap(
+            "genesis body has the wrong kind".into(),
+        ));
+    };
+    let OperationBody::CapabilityGrant { ref grant } = request.initial_grant.body else {
+        return Err(ClientStoreError::InvalidBootstrap(
+            "initial grant body has the wrong kind".into(),
+        ));
+    };
+    Ok(ClientInstallationBinding {
+        node_id,
+        space_id: request.genesis.space_id,
+        controller_actor_id: controller,
+        local_writer_actor_id: grant.subject,
+        genesis_operation_id: request.genesis.operation_id,
+        initial_grant_operation_id: request.initial_grant.operation_id,
+        display_name: request.display_name.clone(),
+        created_at_unix_ms: request.received_at_unix_ms,
+    })
+}
+
+fn load_installation(connection: &Connection) -> Result<ClientInstallation, ClientStoreError> {
+    type InstallationRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    );
+    let row: Option<InstallationRow> = connection
+        .query_row(
+            "SELECT phase, node_id, space_id, controller_actor_id,
+                    local_writer_actor_id, genesis_operation_id,
+                    initial_grant_operation_id, display_name, created_at_unix_ms
+             FROM client_local_installation WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(ClientInstallation::Unbound);
+    };
+    if row.0 == "initializing" {
+        if row.1.is_some()
+            || row.2.is_some()
+            || row.3.is_some()
+            || row.4.is_some()
+            || row.5.is_some()
+            || row.6.is_some()
+            || row.7.is_some()
+            || row.8.is_some()
+        {
+            return Err(corrupt(
+                "initializing installation contains established fields",
+            ));
+        }
+        return Ok(ClientInstallation::Initializing);
+    }
+    if row.0 != "established" {
+        return Err(corrupt("unknown client installation phase"));
+    }
+    let required = |value: Option<String>, name: &'static str| {
+        value.ok_or_else(|| corrupt(format!("established installation omitted {name}")))
+    };
+    let binding = ClientInstallationBinding {
+        node_id: required(row.1, "node ID")?
+            .parse()
+            .map_err(|error| corrupt(format!("invalid installation node ID: {error}")))?,
+        space_id: required(row.2, "space ID")?
+            .parse()
+            .map_err(|error| corrupt(format!("invalid installation space ID: {error}")))?,
+        controller_actor_id: required(row.3, "controller actor ID")?
+            .parse()
+            .map_err(|error| corrupt(format!("invalid installation controller ID: {error}")))?,
+        local_writer_actor_id: required(row.4, "local writer actor ID")?
+            .parse()
+            .map_err(|error| corrupt(format!("invalid installation writer ID: {error}")))?,
+        genesis_operation_id: OperationId::parse(&required(row.5, "genesis operation ID")?)
+            .map_err(|error| corrupt(format!("invalid installation genesis ID: {error}")))?,
+        initial_grant_operation_id: OperationId::parse(&required(
+            row.6,
+            "initial grant operation ID",
+        )?)
+        .map_err(|error| corrupt(format!("invalid installation grant ID: {error}")))?,
+        display_name: required(row.7, "display name")?,
+        created_at_unix_ms: row
+            .8
+            .ok_or_else(|| corrupt("established installation omitted creation time"))?,
+    };
+    Ok(ClientInstallation::Established(Box::new(binding)))
+}
+
+fn operation_count(connection: &Connection) -> Result<u64, ClientStoreError> {
+    let count = connection.query_row("SELECT count(*) FROM client_operations", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    nonnegative_u64(count)
+}
+
+fn operation_matches(
+    connection: &Connection,
+    expected: &OperationEnvelope,
+) -> Result<bool, ClientStoreError> {
+    Ok(load_operation_row(connection, expected.operation_id)?
+        .is_some_and(|(_, operation)| operation == *expected))
+}
+
 fn secure_sqlite_files(path: &Path) -> Result<(), ClientStoreError> {
     set_private_permissions(path, false)?;
     for suffix in ["-wal", "-shm"] {
@@ -1584,6 +2025,26 @@ fn secure_sqlite_files(path: &Path) -> Result<(), ClientStoreError> {
         }
     }
     Ok(())
+}
+
+/// Resolves only the parent directory so `SQLITE_OPEN_NOFOLLOW` still checks
+/// the final database component. This also accepts normal platform paths whose
+/// ancestors (for example macOS `/var`) are symbolic links.
+fn nofollow_database_path(path: &Path) -> Result<PathBuf, ClientStoreError> {
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    set_private_permissions(parent, true)?;
+    let parent = std::fs::canonicalize(parent)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client database path must name a file",
+        )
+    })?;
+    Ok(parent.join(file_name))
 }
 
 #[cfg(unix)]
@@ -1612,17 +2073,30 @@ fn configure(connection: &Connection, persistent: bool) -> Result<(), ClientStor
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), ClientStoreError> {
-    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let mut version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > CLIENT_SCHEMA_VERSION {
         return Err(ClientStoreError::UnsupportedSchema {
             found: version,
             supported: CLIENT_SCHEMA_VERSION,
         });
     }
-    if version == 0 {
+    while version < CLIENT_SCHEMA_VERSION {
+        let expected = version + 1;
+        let migration =
+            MIGRATIONS
+                .get(version as usize)
+                .ok_or(ClientStoreError::MigrationVersionMismatch {
+                    expected,
+                    found: version,
+                })?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(MIGRATION)?;
+        transaction.execute_batch(migration)?;
+        let found: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found != expected {
+            return Err(ClientStoreError::MigrationVersionMismatch { expected, found });
+        }
         transaction.commit()?;
+        version = expected;
     }
     Ok(())
 }
@@ -2051,41 +2525,61 @@ fn insert_projection(
     transaction: &Transaction<'_>,
     operation: &OperationEnvelope,
 ) -> Result<(), ClientStoreError> {
-    let (start, end, sort_text) = match &operation.body {
-        OperationBody::PutRecord {
-            payload: ProtectedDocument::Public { document },
-        } => (
-            Some(document.start_at_unix_ms),
-            document.end_at_unix_ms,
-            None,
-        ),
-        OperationBody::PutEvent {
-            payload: ProtectedDocument::Public { document },
-        } => (
-            Some(document.start_at_unix_ms),
-            document.end_at_unix_ms,
-            Some(document.label.to_lowercase()),
-        ),
-        OperationBody::PutTag {
-            payload: ProtectedDocument::Public { document },
-        } => (None, None, Some(document.name.to_lowercase())),
-        OperationBody::PutProfile { document } => (None, None, Some(document.handle.clone())),
-        OperationBody::PutRecord {
-            payload: ProtectedDocument::Private { .. },
-        }
-        | OperationBody::PutTag {
-            payload: ProtectedDocument::Private { .. },
-        }
-        | OperationBody::PutEvent {
-            payload: ProtectedDocument::Private { .. },
-        }
-        | OperationBody::Tombstone
-            if is_client_schema(operation.schema) =>
-        {
-            (None, None, None)
-        }
-        _ => return Ok(()),
-    };
+    let (start, end, sort_text, preview_emoji, preview_text, preview_truncated) =
+        match &operation.body {
+            OperationBody::PutRecord {
+                payload: ProtectedDocument::Public { document },
+            } => {
+                let (preview_text, preview_truncated) =
+                    bounded_record_preview(document.text.as_deref());
+                (
+                    Some(document.start_at_unix_ms),
+                    document.end_at_unix_ms,
+                    None,
+                    document.emoji.clone(),
+                    preview_text,
+                    preview_truncated,
+                )
+            }
+            OperationBody::PutEvent {
+                payload: ProtectedDocument::Public { document },
+            } => (
+                Some(document.start_at_unix_ms),
+                document.end_at_unix_ms,
+                Some(document.label.to_lowercase()),
+                None,
+                None,
+                false,
+            ),
+            OperationBody::PutTag {
+                payload: ProtectedDocument::Public { document },
+            } => (
+                None,
+                None,
+                Some(document.name.to_lowercase()),
+                None,
+                None,
+                false,
+            ),
+            OperationBody::PutProfile { document } => {
+                (None, None, Some(document.handle.clone()), None, None, false)
+            }
+            OperationBody::PutRecord {
+                payload: ProtectedDocument::Private { .. },
+            }
+            | OperationBody::PutTag {
+                payload: ProtectedDocument::Private { .. },
+            }
+            | OperationBody::PutEvent {
+                payload: ProtectedDocument::Private { .. },
+            }
+            | OperationBody::Tombstone
+                if is_client_schema(operation.schema) =>
+            {
+                (None, None, None, None, None, false)
+            }
+            _ => return Ok(()),
+        };
     let visibility = if let Some(value) = operation.body.declared_visibility() {
         let value = visibility_key(value).to_owned();
         if operation.causal_parents.is_empty() {
@@ -2132,8 +2626,9 @@ fn insert_projection(
     transaction.execute(
         "INSERT INTO client_projections (
             operation_id, space_id, entity_id, schema_id, visibility, tombstone,
-            start_at_unix_ms, end_at_unix_ms, sort_text, resource_count, media_bytes
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            start_at_unix_ms, end_at_unix_ms, sort_text, resource_count, media_bytes,
+            preview_emoji, preview_text, preview_truncated
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             operation.operation_id.to_string(),
             operation.space_id.to_string(),
@@ -2146,9 +2641,26 @@ fn insert_projection(
             sort_text,
             resource_count,
             media_bytes,
+            preview_emoji,
+            preview_text,
+            preview_truncated,
         ],
     )?;
     Ok(())
+}
+
+fn bounded_record_preview(text: Option<&str>) -> (Option<String>, bool) {
+    let Some(text) = text else {
+        return (None, false);
+    };
+    match text
+        .char_indices()
+        .nth(MAX_RECORD_PREVIEW_TEXT_CHARS)
+        .map(|(index, _)| index)
+    {
+        Some(cutoff) => (Some(text[..cutoff].to_owned()), true),
+        None => (Some(text.to_owned()), false),
+    }
 }
 
 fn load_operation_row(
@@ -2164,6 +2676,31 @@ fn load_operation_row(
         .optional()?
         .map(|(sequence, json)| Ok((positive_u64(sequence)?, decode_operation(&json)?)))
         .transpose()
+}
+
+fn decode_record_projection(
+    json: &str,
+    space_id: SpaceId,
+    entity_id: EntityId,
+    operation_id: OperationId,
+) -> Result<Option<RecordDocument>, ClientStoreError> {
+    let operation = decode_operation(json)?;
+    if operation.operation_id != operation_id
+        || operation.entity_id != entity_id
+        || operation.space_id != space_id
+        || operation.schema != EntitySchema::Record
+    {
+        return Err(corrupt("record projection does not match its operation"));
+    }
+    match operation.body {
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public { document },
+        } => Ok(Some(document)),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Private { .. },
+        } => Ok(None),
+        _ => Err(corrupt("record projection has a non-record body")),
+    }
 }
 
 fn decode_operation(json: &str) -> Result<OperationEnvelope, ClientStoreError> {
