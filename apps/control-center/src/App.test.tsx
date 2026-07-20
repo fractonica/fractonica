@@ -4,6 +4,7 @@ import { act } from "react";
 import { describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { NodeClient, NodeSnapshot } from "./api";
+import type { ClientCore, ClientRecord } from "./client-core";
 import { READY_SNAPSHOT, SAROS_SNAPSHOT } from "./test/fixtures";
 
 function deferred<T>() {
@@ -24,6 +25,47 @@ function makeClient(readStatus: NodeClient["readStatus"]): NodeClient {
     readPairing: vi.fn(),
     confirmPairing: vi.fn(),
     cancelPairing: vi.fn(),
+  };
+}
+
+function makeClientCore(records: ClientRecord[] = []): ClientCore {
+  return {
+    status: vi.fn().mockResolvedValue({
+      phase: "ready",
+      nodeId: `node:ed25519:${"1".repeat(64)}`,
+      actorId: `actor:ed25519:${"2".repeat(64)}`,
+      spaceId: `space:${"3".repeat(64)}`,
+      syncRunning: true,
+      cycle: 1,
+      pendingOperations: 0,
+      rejectedOperations: 0,
+      waitingUploads: 0,
+      pendingUploads: 0,
+      pendingDownloads: 0,
+      rejectedResources: 0,
+      synchronizedBytes: 0,
+      totalBytes: 0,
+    }),
+    listRecords: vi.fn().mockResolvedValue(records),
+    importAttachments: vi.fn().mockResolvedValue([]),
+    createRecord: vi.fn().mockResolvedValue({
+      localSequence: 1,
+      operationId: `sha-256:${"4".repeat(64)}`,
+      replayed: false,
+      queuedPeers: 1,
+    }),
+    updateRecord: vi.fn().mockResolvedValue({
+      localSequence: 2,
+      operationId: `sha-256:${"5".repeat(64)}`,
+      replayed: false,
+      queuedPeers: 1,
+    }),
+    deleteRecord: vi.fn().mockResolvedValue({
+      localSequence: 3,
+      operationId: `sha-256:${"6".repeat(64)}`,
+      replayed: false,
+      queuedPeers: 1,
+    }),
   };
 }
 
@@ -107,6 +149,7 @@ describe("control center", () => {
     const user = userEvent.setup();
 
     render(<App client={client} />);
+    await user.click(screen.getByRole("button", { name: "Pair devices" }));
     await screen.findByRole("heading", { name: "Pair a device" });
     await user.click(screen.getByRole("button", { name: "Create invitation" }));
 
@@ -124,5 +167,111 @@ describe("control center", () => {
     expect(await screen.findByText("Device authorized")).toBeInTheDocument();
     expect(screen.getByText(completed.grantOperationId)).toBeInTheDocument();
     expect(client.confirmPairing).toHaveBeenCalledWith(invitationId, "0123456701");
+  });
+
+  it("creates a record through the native local-first client", async () => {
+    const nodeClient = makeClient(vi.fn().mockResolvedValue(READY_SNAPSHOT));
+    const clientCore = makeClientCore();
+    const attachment = {
+      contentId: `sha-256:${"8".repeat(64)}`,
+      byteLength: 24_000,
+      mediaType: "image/jpeg",
+      role: "record.media",
+      originalName: "moon.jpg",
+    };
+    vi.mocked(clientCore.importAttachments).mockResolvedValue([attachment]);
+    const user = userEvent.setup();
+
+    render(<App client={nodeClient} clientCore={clientCore} />);
+
+    expect(await screen.findByRole("heading", { name: "Records" })).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Record emoji"), "🌒");
+    await user.type(screen.getByLabelText("Record text"), "A local moment");
+    await user.click(screen.getByRole("button", { name: "Attach files" }));
+    expect(await screen.findByText("moon.jpg")).toBeInTheDocument();
+    expect(screen.getByText("Photo · 24.0 kB")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save locally" }));
+
+    expect(clientCore.createRecord).toHaveBeenCalledWith({
+      visibility: "public",
+      document: expect.objectContaining({
+        emoji: "🌒",
+        text: "A local moment",
+        metadata: {},
+        resources: [attachment],
+        references: [],
+      }),
+    });
+    expect(clientCore.importAttachments).toHaveBeenCalledTimes(1);
+  });
+
+  it("edits without dropping resources and requires delete confirmation", async () => {
+    const record: ClientRecord = {
+      operationId: `sha-256:${"7".repeat(64)}`,
+      entityId: "019f6576-f20d-7ba0-a718-e1db44d6c9b2",
+      schema: "record",
+      visibility: "public",
+      conflicted: false,
+      tombstone: false,
+      startAtUnixMs: 1_784_265_600_000,
+      resourceCount: 1,
+      mediaBytes: 12,
+      document: {
+        startAtUnixMs: 1_784_265_600_000,
+        emoji: "☀️",
+        text: "Original",
+        metadata: { source: "fixture" },
+        resources: [{
+          contentId: `sha-256:${"8".repeat(64)}`,
+          byteLength: 12,
+          mediaType: "image/jpeg",
+          role: "record.media",
+          originalName: "sun.jpg",
+        }],
+        references: [],
+      },
+    };
+    const nodeClient = makeClient(vi.fn().mockResolvedValue(READY_SNAPSHOT));
+    const clientCore = makeClientCore([record]);
+    const imported = {
+      contentId: `sha-256:${"9".repeat(64)}`,
+      byteLength: 3_200,
+      mediaType: "audio/mpeg",
+      role: "record.media",
+      originalName: "voice.mp3",
+    };
+    vi.mocked(clientCore.importAttachments).mockResolvedValue([imported]);
+    const user = userEvent.setup();
+
+    render(<App client={nodeClient} clientCore={clientCore} />);
+    await user.click(await screen.findByRole("button", { name: /Original/ }));
+    await user.clear(screen.getByLabelText("Record text"));
+    await user.type(screen.getByLabelText("Record text"), "Revised");
+    await user.click(screen.getByRole("button", { name: "Attach files" }));
+    expect(await screen.findByText("voice.mp3")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(clientCore.updateRecord).toHaveBeenCalledWith(
+      record.entityId,
+      expect.objectContaining({
+        document: expect.objectContaining({
+          resources: [...(record.document?.resources ?? []), imported],
+        }),
+      }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Remove sun.jpg" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(clientCore.updateRecord).toHaveBeenLastCalledWith(
+      record.entityId,
+      expect.objectContaining({
+        document: expect.objectContaining({ resources: [] }),
+      }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    expect(clientCore.deleteRecord).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Confirm delete" }));
+    expect(clientCore.deleteRecord).toHaveBeenCalledWith(record.entityId);
   });
 });

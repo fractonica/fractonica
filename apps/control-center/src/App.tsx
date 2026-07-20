@@ -11,11 +11,15 @@ import type {
   SpaceDescriptor,
 } from "./api";
 import { formatCheckedAt, formatLocalDateTime, formatUptime } from "./format";
+import { createRuntimeClientCore } from "./client-core";
+import type { ClientCore } from "./client-core";
+import { RecordsWorkspace } from "./RecordsWorkspace";
 import { useNodeStatus } from "./use-node-status";
 import "./app.css";
 
 export interface AppProps {
   client?: NodeClient;
+  clientCore?: ClientCore | null;
 }
 
 function FractonicaMark() {
@@ -488,8 +492,15 @@ function PairingPanel({ client, snapshot }: PairingPanelProps) {
   );
 }
 
-export default function App({ client: suppliedClient }: AppProps) {
+type WorkspaceView = "records" | "node" | "pairing";
+
+export default function App({ client: suppliedClient, clientCore: suppliedClientCore }: AppProps) {
   const client = useMemo(() => suppliedClient ?? createRuntimeNodeClient(), [suppliedClient]);
+  const clientCore = useMemo(
+    () => suppliedClientCore === undefined ? createRuntimeClientCore() : suppliedClientCore,
+    [suppliedClientCore],
+  );
+  const [view, setView] = useState<WorkspaceView>(() => clientCore ? "records" : "node");
   const { error, lastCheckedAt, phase, refresh, refreshing, snapshot } = useNodeStatus(client);
 
   return (
@@ -501,8 +512,9 @@ export default function App({ client: suppliedClient }: AppProps) {
         </div>
         <nav aria-label="Control center">
           <span className="nav-label">Local workspace</span>
-          <a className="nav-item" href="#overview"><span aria-hidden="true" className="nav-item__glyph">◈</span>Node overview</a>
-          <a className="nav-item nav-item--secondary" href="#pairing"><span aria-hidden="true" className="nav-item__glyph">⌁</span>Pair devices</a>
+          <button className={`nav-item${view === "records" ? "" : " nav-item--secondary"}`} onClick={() => setView("records")} type="button"><span aria-hidden="true" className="nav-item__glyph">✦</span>Records</button>
+          <button className={`nav-item${view === "node" ? "" : " nav-item--secondary"}`} onClick={() => setView("node")} type="button"><span aria-hidden="true" className="nav-item__glyph">◈</span>Node overview</button>
+          <button className={`nav-item${view === "pairing" ? "" : " nav-item--secondary"}`} onClick={() => setView("pairing")} type="button"><span aria-hidden="true" className="nav-item__glyph">⌁</span>Pair devices</button>
         </nav>
         <div className="sidebar__status">
           <StatusBadge tone={toneForPhase(phase)}>{labelForPhase(phase)}</StatusBadge>
@@ -511,25 +523,49 @@ export default function App({ client: suppliedClient }: AppProps) {
         </div>
       </aside>
 
-      <main id="overview">
-        <header className="page-header">
-          <div>
-            <p className="section-kicker">Control plane · local</p>
-            <h1>Node overview</h1>
-            <p>Observe the runtime and grant bounded authority from one local surface.</p>
-          </div>
-          <Button aria-label={refreshing ? "Checking node status" : "Refresh node status"} disabled={refreshing} onClick={() => void refresh()} variant="quiet">
-            <span aria-hidden="true" className={refreshing ? "refresh-icon is-spinning" : "refresh-icon"}>↻</span>
-            {refreshing ? "Checking" : "Refresh"}
-          </Button>
-        </header>
+      <main id={view}>
+        {view === "records" && clientCore ? <RecordsWorkspace client={clientCore} /> : null}
+        {view === "records" && !clientCore ? (
+          <>
+            <header className="page-header">
+              <div><p className="section-kicker">Native workspace</p><h1>Records</h1><p>The local-first editor lives inside the Fractonica desktop application.</p></div>
+            </header>
+            <Panel className="desktop-required-panel">
+              <FractonicaMark />
+              <div><h2>Open the desktop client</h2><p>The browser control center can inspect a node, but it cannot access private client SQLite, keys, or local content. Launch Fractonica Desktop to create and edit records.</p></div>
+              <code>pnpm desktop:dev</code>
+            </Panel>
+          </>
+        ) : null}
 
-        <div aria-live="polite" className="content-stack">
-          {phase === "loading" ? <LoadingOverview baseUrl={client.baseUrl} /> : null}
-          {phase === "offline" ? <OfflineOverview baseUrl={client.baseUrl} error={error} onRetry={() => void refresh()} refreshing={refreshing} /> : null}
-          {phase === "ready" && snapshot ? <ReadyOverview snapshot={snapshot} /> : null}
-        </div>
-        {phase === "ready" && snapshot ? <PairingPanel client={client} snapshot={snapshot} /> : null}
+        {view === "node" ? (
+          <>
+            <header className="page-header">
+              <div>
+                <p className="section-kicker">Control plane · local</p>
+                <h1>Node overview</h1>
+                <p>Observe the runtime and its protected local installation.</p>
+              </div>
+              <Button aria-label={refreshing ? "Checking node status" : "Refresh node status"} disabled={refreshing} onClick={() => void refresh()} variant="quiet">
+                <span aria-hidden="true" className={refreshing ? "refresh-icon is-spinning" : "refresh-icon"}>↻</span>
+                {refreshing ? "Checking" : "Refresh"}
+              </Button>
+            </header>
+            <div aria-live="polite" className="content-stack">
+              {phase === "loading" ? <LoadingOverview baseUrl={client.baseUrl} /> : null}
+              {phase === "offline" ? <OfflineOverview baseUrl={client.baseUrl} error={error} onRetry={() => void refresh()} refreshing={refreshing} /> : null}
+              {phase === "ready" && snapshot ? <ReadyOverview snapshot={snapshot} /> : null}
+            </div>
+          </>
+        ) : null}
+
+        {view === "pairing" ? (
+          <>
+            {phase === "loading" ? <LoadingOverview baseUrl={client.baseUrl} /> : null}
+            {phase === "offline" ? <OfflineOverview baseUrl={client.baseUrl} error={error} onRetry={() => void refresh()} refreshing={refreshing} /> : null}
+            {phase === "ready" && snapshot ? <PairingPanel client={client} snapshot={snapshot} /> : null}
+          </>
+        ) : null}
 
         <footer className="page-footer">
           <span>Fractonica local control center</span>

@@ -13,7 +13,7 @@ use std::{
 use fractonica_content::{ContentDescriptor, ContentId, ResourceRef};
 use fractonica_data_model::{
     EntityId, EntitySchema, MAX_CAUSAL_PARENTS, NodeId, OperationBody, OperationEnvelope,
-    OperationId, ProtectedDocument, SpaceId, Visibility,
+    OperationId, ProtectedDocument, RecordDocument, SpaceId, Visibility,
 };
 use fractonica_peer::PeerSessionId;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -204,6 +204,14 @@ pub struct LocalEntitySummary {
     pub media_bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalRecordSummary {
+    pub summary: LocalEntitySummary,
+    /// Public record content is directly readable. Private content remains an
+    /// opaque encrypted envelope until platform key management is connected.
+    pub document: Option<RecordDocument>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutboxCounts {
     pub pending: u64,
@@ -288,10 +296,12 @@ impl ClientSqliteStore {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
+            set_private_permissions(parent, true)?;
         }
         let mut connection = Connection::open(&path)?;
         configure(&connection, true)?;
         migrate(&mut connection)?;
+        secure_sqlite_files(&path)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             path: Arc::new(path),
@@ -1450,6 +1460,87 @@ impl ClientSqliteStore {
         .collect()
     }
 
+    pub fn list_records(
+        &self,
+        space_id: SpaceId,
+        limit: usize,
+    ) -> Result<Vec<LocalRecordSummary>, ClientStoreError> {
+        if !(1..=200).contains(&limit) {
+            return Err(ClientStoreError::InvalidEntityLimit);
+        }
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT p.operation_id, p.entity_id, p.visibility, p.tombstone,
+                    p.start_at_unix_ms, p.end_at_unix_ms, p.sort_text,
+                    p.resource_count, p.media_bytes,
+                    (SELECT count(*) FROM client_entity_heads h2
+                     WHERE h2.space_id = p.space_id AND h2.entity_id = p.entity_id) > 1,
+                    o.projection_json
+             FROM client_projections p
+             JOIN client_entity_heads h ON h.operation_id = p.operation_id
+             JOIN client_operations o ON o.operation_id = p.operation_id
+             WHERE p.space_id = ?1 AND p.schema_id = 'record' AND p.tombstone = 0
+             ORDER BY coalesce(p.start_at_unix_ms, -1) DESC, p.entity_id, p.operation_id
+             LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![space_id.to_string(), limit_i64(limit)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, bool>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })?;
+        rows.map(|row| {
+            let row = row?;
+            let operation_id =
+                OperationId::parse(&row.0).map_err(|error| corrupt(error.to_string()))?;
+            let entity_id = EntityId::parse(&row.1).map_err(|error| corrupt(error.to_string()))?;
+            let operation = decode_operation(&row.10)?;
+            if operation.operation_id != operation_id
+                || operation.entity_id != entity_id
+                || operation.space_id != space_id
+                || operation.schema != EntitySchema::Record
+            {
+                return Err(corrupt("record projection does not match its operation"));
+            }
+            let document = match operation.body {
+                OperationBody::PutRecord {
+                    payload: ProtectedDocument::Public { document },
+                } => Some(document),
+                OperationBody::PutRecord {
+                    payload: ProtectedDocument::Private { .. },
+                } => None,
+                _ => return Err(corrupt("record projection has a non-record body")),
+            };
+            Ok(LocalRecordSummary {
+                summary: LocalEntitySummary {
+                    operation_id,
+                    entity_id,
+                    schema: EntitySchema::Record,
+                    visibility: parse_visibility(&row.2)?,
+                    tombstone: row.3,
+                    start_at_unix_ms: row.4,
+                    end_at_unix_ms: row.5,
+                    sort_text: row.6,
+                    resource_count: nonnegative_u64(row.7)?,
+                    media_bytes: nonnegative_u64(row.8)?,
+                    conflicted: row.9,
+                },
+                document,
+            })
+        })
+        .collect()
+    }
+
     /// Rebuilds every entity head and client projection from immutable local
     /// operations. Delivery state is not touched.
     pub fn rebuild_derived_state(&self) -> Result<u64, ClientStoreError> {
@@ -1480,6 +1571,34 @@ impl ClientSqliteStore {
             .lock()
             .map_err(|_| ClientStoreError::LockPoisoned)
     }
+}
+
+fn secure_sqlite_files(path: &Path) -> Result<(), ClientStoreError> {
+    set_private_permissions(path, false)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.try_exists()? {
+            set_private_permissions(&sidecar, false)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, directory: bool) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
+    )
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _directory: bool) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 fn configure(connection: &Connection, persistent: bool) -> Result<(), ClientStoreError> {

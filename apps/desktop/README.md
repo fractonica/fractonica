@@ -61,8 +61,20 @@ The current Tauri commands expose:
 - `client_status` for lifecycle, operation queue, and resource progress;
 - create and update commands for records, events, and tags;
 - `client_put_profile`;
-- `client_delete`; and
-- `client_list` for bounded local projection summaries.
+- `client_delete`;
+- `client_list` for bounded local projection summaries;
+- `client_list_records` for one-query timeline summaries with editable public
+  documents and opaque private entries; and
+- `client_import_attachments` for native selection and content-addressed import
+  without exposing selected paths or file bytes to the webview.
+
+The desktop opens directly into the Records workspace. It supports public
+record creation, editing, local deletion, local-time start/end fields,
+structured metadata, and synchronization progress. Existing attachments and
+references are retained during edits. Users can add or remove up to 64 record
+attachments; import, SHA-256 derivation, private storage, and deduplication run
+off the UI thread. Private-record decryption remains a separate upcoming native
+boundary.
 
 `node_connection` remains temporarily available to the existing control-center
 screens that inspect node and system APIs directly. Application data editing
@@ -73,3 +85,6 @@ The sidecar and synchronization worker receive explicit cancellation when the
 application exits. An unexpected sidecar exit removes the live client runtime
 and is surfaced through `client_status` instead of silently leaving a stale
 ready state.
+
+Client directories are mode `0700` and client SQLite, WAL, and shared-memory
+files are mode `0600` on Unix platforms.

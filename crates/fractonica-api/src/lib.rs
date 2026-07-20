@@ -388,10 +388,10 @@ pub fn router(state: ApiState) -> Router {
     let bearer_token_required = state.bearer_token.is_some();
     configure_openapi_transport_security(&mut openapi, bearer_token_required);
     let allowed_origins = AllowOrigin::list([
-        HeaderValue::from_static("http://127.0.0.1:5173"),
-        HeaderValue::from_static("http://localhost:5173"),
-        HeaderValue::from_static("http://127.0.0.1:4173"),
-        HeaderValue::from_static("http://localhost:4173"),
+        HeaderValue::from_static("http://127.0.0.1:1420"),
+        HeaderValue::from_static("http://localhost:1420"),
+        HeaderValue::from_static("http://127.0.0.1:1421"),
+        HeaderValue::from_static("http://localhost:1421"),
         HeaderValue::from_static("http://tauri.localhost"),
         HeaderValue::from_static("tauri://localhost"),
     ]);
@@ -2462,10 +2462,10 @@ async fn tus_error_with_upload_state(
 
 fn add_upload_options_cors_headers(response: &mut Response, request_headers: &HeaderMap) {
     const ALLOWED_ORIGINS: &[&str] = &[
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-        "http://127.0.0.1:4173",
-        "http://localhost:4173",
+        "http://127.0.0.1:1420",
+        "http://localhost:1420",
+        "http://127.0.0.1:1421",
+        "http://localhost:1421",
         "http://tauri.localhost",
         "tauri://localhost",
     ];
@@ -4416,7 +4416,7 @@ mod tests {
                 Request::builder()
                     .method(Method::OPTIONS)
                     .uri(format!("/api/spaces/{}/operations", fixture_space()))
-                    .header(header::ORIGIN, "http://127.0.0.1:5173")
+                    .header(header::ORIGIN, "http://127.0.0.1:1420")
                     .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
                     .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
                     .body(Body::empty())

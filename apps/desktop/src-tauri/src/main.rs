@@ -11,13 +11,15 @@ use std::{
 };
 
 use fractonica_client_runtime::{ClientRuntime, SupervisedNodeConfig};
-use fractonica_client_sqlite::{CommitResult, LocalEntitySummary};
+use fractonica_client_sqlite::{CommitResult, LocalEntitySummary, LocalRecordSummary};
+use fractonica_content::ResourceRef;
 use fractonica_data_model::{
     EntityId, EntitySchema, EventDocument, ProfileDocument, ProtectedDocument, RecordDocument,
     TagDocument,
 };
 use serde::Serialize;
 use tauri::{Manager, RunEvent, State};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_shell::{ShellExt, process::CommandChild};
 use uuid::Uuid;
 
@@ -93,11 +95,32 @@ struct EntitySummaryResponse {
     visibility: &'static str,
     conflicted: bool,
     tombstone: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     start_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     end_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sort_text: Option<String>,
     resource_count: u64,
     media_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordSummaryResponse {
+    #[serde(flatten)]
+    summary: EntitySummaryResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<RecordDocument>,
+}
+
+impl From<LocalRecordSummary> for RecordSummaryResponse {
+    fn from(value: LocalRecordSummary) -> Self {
+        Self {
+            summary: value.summary.into(),
+            document: value.document,
+        }
+    }
 }
 
 impl From<LocalEntitySummary> for EntitySummaryResponse {
@@ -304,6 +327,65 @@ async fn client_list(
         .collect())
 }
 
+#[tauri::command]
+async fn client_list_records(
+    sidecar: State<'_, NodeSidecar>,
+    limit: usize,
+) -> Result<Vec<RecordSummaryResponse>, String> {
+    Ok(client(&sidecar)?
+        .list_records(limit)
+        .await
+        .map_err(command_error)?
+        .into_iter()
+        .map(RecordSummaryResponse::from)
+        .collect())
+}
+
+#[tauri::command]
+async fn client_import_attachments(
+    window: tauri::WebviewWindow,
+    sidecar: State<'_, NodeSidecar>,
+    limit: usize,
+) -> Result<Vec<ResourceRef>, String> {
+    if !(1..=fractonica_data_model::MAX_RECORD_RESOURCES).contains(&limit) {
+        return Err("Attachment import limit must be between 1 and 64.".to_owned());
+    }
+    let runtime = client(&sidecar)?;
+    let selected = window
+        .dialog()
+        .file()
+        .set_title("Attach files to this record")
+        .blocking_pick_files()
+        .unwrap_or_default();
+    if selected.len() > limit {
+        return Err(format!(
+            "Select at most {limit} more attachment{} for this record.",
+            if limit == 1 { "" } else { "s" }
+        ));
+    }
+    let mut resources = Vec::with_capacity(selected.len());
+    for selected_file in selected {
+        let path = selected_file
+            .into_path()
+            .map_err(|_| "Only local filesystem attachments are supported.".to_owned())?;
+        let media_type = mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_owned();
+        let original_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned);
+        resources.push(
+            runtime
+                .import_attachment(path, media_type, original_name)
+                .await
+                .map_err(command_error)?,
+        );
+    }
+    Ok(resources)
+}
+
 fn client(sidecar: &NodeSidecar) -> Result<Arc<ClientRuntime>, String> {
     sidecar
         .client
@@ -330,6 +412,7 @@ fn command_error(error: impl std::fmt::Display) -> String {
 
 fn main() {
     let application = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(NodeSidecar::default())
         .invoke_handler(tauri::generate_handler![
@@ -344,6 +427,8 @@ fn main() {
             client_put_profile,
             client_delete,
             client_list,
+            client_list_records,
+            client_import_attachments,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -421,6 +506,7 @@ fn main() {
                                 }
                             }
                             Err(error) => {
+                                eprintln!("Fractonica client runtime failed to start: {error}");
                                 if let Ok(mut client_error) =
                                     readiness_handle.state::<NodeSidecar>().client_error.lock()
                                 {
@@ -556,4 +642,31 @@ fn terminate_child(child: CommandChild) {
 #[cfg(not(unix))]
 fn terminate_child(child: CommandChild) {
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_summary_wire_shape_omits_absent_optional_values() {
+        let serialized = serde_json::to_value(EntitySummaryResponse {
+            operation_id: format!("sha-256:{}", "a".repeat(64)),
+            entity_id: "019f6576-f20d-7ba0-a718-e1db44d6c9b2".to_owned(),
+            schema: "record",
+            visibility: "public",
+            conflicted: false,
+            tombstone: false,
+            start_at_unix_ms: Some(1_784_265_600_000),
+            end_at_unix_ms: None,
+            sort_text: None,
+            resource_count: 0,
+            media_bytes: 0,
+        })
+        .expect("summary serializes");
+
+        assert_eq!(serialized["startAtUnixMs"], 1_784_265_600_000_i64);
+        assert!(serialized.get("endAtUnixMs").is_none());
+        assert!(serialized.get("sortText").is_none());
+    }
 }

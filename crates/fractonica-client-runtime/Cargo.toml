@@ -12,6 +12,7 @@ fractonica-application.workspace = true
 fractonica-client.workspace = true
 fractonica-client-content.workspace = true
 fractonica-client-sqlite.workspace = true
+fractonica-content.workspace = true
 fractonica-data-model.workspace = true
 fractonica-keystore.workspace = true
 fractonica-peer.workspace = true

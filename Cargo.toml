@@ -65,6 +65,7 @@ http-body-util = "0.1.4"
 httpdate = "1.0.3"
 libc = "0.2.186"
 libm = "0.2.16"
+mime_guess = "2.0.5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
 rustix = { version = "1.1.4", features = ["process"] }
@@ -78,6 +79,7 @@ subtle = "2.6.1"
 tempfile = "3.27.0"
 tauri = "2.11.5"
 tauri-build = "2.6.3"
+tauri-plugin-dialog = "2.7.2"
 tauri-plugin-shell = "2.3.5"
 thiserror = "2.0.18"
 time = { version = "0.3.53", features = ["formatting", "parsing"] }

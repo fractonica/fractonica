@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use fractonica_content::{ContentDescriptor, ContentId};
+use fractonica_content::{ContentDescriptor, ContentId, MAX_CONTENT_BYTE_LENGTH};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -41,6 +41,8 @@ pub enum ClientContentError {
     Io(#[from] io::Error),
     #[error("content bytes exceed declared length {expected}")]
     LengthOverflow { expected: u64 },
+    #[error("content length {actual} exceeds protocol maximum {maximum}")]
+    ContentTooLarge { actual: u64, maximum: u64 },
     #[error("content length is {actual}, expected {expected}")]
     LengthMismatch { expected: u64, actual: u64 },
     #[error("content digest is {actual}, expected {expected}")]
@@ -118,6 +120,57 @@ impl ClientContentStore {
             let _ = remove_if_exists(&temporary);
         })?;
         self.publish(descriptor, &temporary)
+    }
+
+    /// Imports a native file without trusting caller-supplied content metadata.
+    ///
+    /// The source must be a regular, non-symlink file. Its SHA-256 identity and
+    /// byte length are derived while copying it into a private temporary file,
+    /// and publication into the immutable store is atomic and deduplicating.
+    pub fn import_file(
+        &self,
+        source_path: impl AsRef<Path>,
+    ) -> Result<LocalBlob, ClientContentError> {
+        let source_path = source_path.as_ref();
+        let mut source = open_regular_file(source_path)?;
+        let initial_length = source.metadata()?.len();
+        ensure_protocol_length(initial_length)?;
+
+        let temporary = self.unidentified_import_path(Uuid::now_v7());
+        let result = (|| {
+            let mut output = create_private_truncated(&temporary)?;
+            let mut hasher = Sha256::new();
+            let mut length = 0_u64;
+            let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+            loop {
+                let read = source.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                length = length
+                    .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+                    .ok_or(ClientContentError::ContentTooLarge {
+                        actual: u64::MAX,
+                        maximum: MAX_CONTENT_BYTE_LENGTH,
+                    })?;
+                ensure_protocol_length(length)?;
+                hasher.update(&buffer[..read]);
+                output.write_all(&buffer[..read])?;
+            }
+            output.sync_all()?;
+            drop(output);
+
+            let descriptor = ContentDescriptor {
+                content_id: ContentId::new(hasher.finalize().into()),
+                byte_length: length,
+            };
+            self.publish(descriptor, &temporary)
+        })();
+
+        if result.is_err() {
+            let _ = remove_if_exists(&temporary);
+        }
+        result
     }
 
     pub fn partial_offset(&self, descriptor: ContentDescriptor) -> Result<u64, ClientContentError> {
@@ -295,6 +348,12 @@ impl ClientContentStore {
             .join("partial")
             .join(format!("{}.{}.import", &wire[8..], nonce.simple()))
     }
+
+    fn unidentified_import_path(&self, nonce: Uuid) -> PathBuf {
+        self.root
+            .join("partial")
+            .join(format!("pending.{}.import", nonce.simple()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -370,6 +429,17 @@ fn verify_expected(
         });
     }
     Ok(())
+}
+
+fn ensure_protocol_length(actual: u64) -> Result<(), ClientContentError> {
+    if actual > MAX_CONTENT_BYTE_LENGTH {
+        Err(ClientContentError::ContentTooLarge {
+            actual,
+            maximum: MAX_CONTENT_BYTE_LENGTH,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn prepare_private_directory(path: &Path) -> Result<(), ClientContentError> {

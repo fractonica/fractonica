@@ -1,6 +1,11 @@
 # Fractonica control center
 
-React control surface for a local Fractonica node. It reads:
+React surface shared by the browser control center and Fractonica Desktop.
+The browser surface can inspect and administer a local node. The desktop
+surface additionally uses narrow Tauri commands to access the native
+local-first client.
+
+The node views read:
 
 - `GET /health/ready`
 - `GET /api/node`
@@ -23,6 +28,17 @@ stateless `saros` profile reports that no local storage is configured.
 
 The node base URL comes from `VITE_FRACTONICA_NODE_URL` and defaults to
 `http://127.0.0.1:8789`.
+
+Inside Tauri, Records is the default workspace. It lists public or opaque
+private records from client SQLite, creates and edits public records, preserves
+existing resources and entity references during edits, imports or removes
+record attachments, performs two-step local deletion, and displays compact
+operation/resource synchronization status. File selection, hashing, and
+content-store import stay native; the webview receives only validated
+content-addressed resource references, never keys, database handles,
+filesystem paths, or file bytes. A normal browser intentionally shows a
+desktop-required explanation instead of pretending it has access to native
+client storage.
 
 ```sh
 pnpm --filter @fractonica/control-center dev

@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use fractonica_application::OperationChangePage;
+use fractonica_content::hash_bytes;
 use fractonica_data_model::{
     CapabilityAction, CapabilityGrant, EntitySchema, OperationBody, OperationNonce, Visibility,
 };
@@ -177,7 +178,7 @@ async fn adopts_exact_node_identity_commits_locally_and_survives_restart() {
         node: json!({
             "nodeId": identity.node_id(),
             "spaces": [space],
-            "profile": "full"
+            "profile": "node"
         }),
         genesis,
         grant,
@@ -213,6 +214,51 @@ async fn adopts_exact_node_identity_commits_locally_and_survives_restart() {
     assert_eq!(runtime.status().node_id, identity.node_id());
     assert_eq!(runtime.status().actor_id, identity.local_writer_actor_id());
     assert_eq!(runtime.status().space_id, identity.space_id());
+
+    let attachment_source = directory.path().join("eclipse.jpg");
+    let attachment_bytes = b"native attachment";
+    std::fs::write(&attachment_source, attachment_bytes).unwrap();
+    assert!(matches!(
+        runtime
+            .import_attachment(
+                attachment_source.clone(),
+                "invalid media type".into(),
+                Some("eclipse.jpg".into()),
+            )
+            .await,
+        Err(ClientRuntimeError::ResourceValidation(_))
+    ));
+    let attachment = runtime
+        .import_attachment(
+            attachment_source.clone(),
+            "image/jpeg".into(),
+            Some("eclipse.jpg".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(attachment.content_id, hash_bytes(attachment_bytes));
+    assert_eq!(attachment.byte_length, attachment_bytes.len() as u64);
+    assert_eq!(attachment.media_type, "image/jpeg");
+    assert_eq!(attachment.role, RECORD_MEDIA_ROLE);
+    assert_eq!(attachment.original_name.as_deref(), Some("eclipse.jpg"));
+    assert_eq!(
+        runtime
+            .content_store()
+            .read_range(attachment.descriptor(), 0, 100)
+            .unwrap(),
+        attachment_bytes
+    );
+    assert_eq!(
+        runtime
+            .import_attachment(
+                attachment_source,
+                "image/jpeg".into(),
+                Some("eclipse.jpg".into()),
+            )
+            .await
+            .unwrap(),
+        attachment
+    );
 
     let created = runtime
         .create_record(ProtectedDocument::Public {

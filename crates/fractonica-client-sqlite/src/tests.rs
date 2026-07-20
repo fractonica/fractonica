@@ -140,6 +140,16 @@ fn local_commit_is_atomic_replayable_and_materialized_before_delivery() {
         .unwrap();
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].start_at_unix_ms, Some(100));
+    let records = store.list_records(space(), 20).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].summary.entity_id, operation.entity_id);
+    assert_eq!(
+        records[0]
+            .document
+            .as_ref()
+            .and_then(|document| document.text.as_deref()),
+        Some("offline first")
+    );
     assert!(store.commit_local(&operation, 4).unwrap().replayed);
     assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 1);
 }
@@ -630,6 +640,16 @@ fn file_store_survives_reopen_with_heads_and_outbox_intact() {
         vec![operation]
     );
     assert_eq!(reopened.outbox_counts(peer.peer_id).unwrap().pending, 1);
+    drop(reopened);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 #[test]

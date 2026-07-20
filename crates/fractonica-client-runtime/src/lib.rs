@@ -20,9 +20,10 @@ use fractonica_client::{
 };
 use fractonica_client_content::{ClientContentError, ClientContentStore};
 use fractonica_client_sqlite::{
-    ClientSqliteStore, ClientStoreError, CommitResult, LocalEntitySummary, PeerConfig,
-    PeerReadMode, PeerSpaceConfig,
+    ClientSqliteStore, ClientStoreError, CommitResult, LocalEntitySummary, LocalRecordSummary,
+    PeerConfig, PeerReadMode, PeerSpaceConfig,
 };
+use fractonica_content::{ContentId, ContentValidationError, ResourceRef};
 use fractonica_data_model::{
     ActorId, EntityId, EntitySchema, EventDocument, NodeId, OperationBody, OperationEnvelope,
     ProfileDocument, ProtectedDocument, RecordDocument, SpaceId, TagDocument,
@@ -40,6 +41,7 @@ use tokio::{sync::watch, task::JoinHandle};
 
 const CLIENT_DATABASE_FILE: &str = "client.sqlite3";
 const CLIENT_CONTENT_DIRECTORY: &str = "content";
+pub const RECORD_MEDIA_ROLE: &str = "record.media";
 
 #[derive(Clone, Debug)]
 pub struct SupervisedNodeConfig {
@@ -217,6 +219,37 @@ impl ClientRuntime {
         &self.content
     }
 
+    /// Imports a native attachment into the immutable client content store.
+    ///
+    /// File access, hashing, and copying run on Tokio's blocking pool. The
+    /// returned reference is validated against the wire protocol and always
+    /// carries the canonical record-media role.
+    pub async fn import_attachment(
+        &self,
+        path: PathBuf,
+        media_type: String,
+        original_name: Option<String>,
+    ) -> Result<ResourceRef, ClientRuntimeError> {
+        let content = self.content.clone();
+        blocking(move || {
+            let mut resource = ResourceRef {
+                content_id: ContentId::new([0_u8; 32]),
+                byte_length: 0,
+                media_type,
+                role: RECORD_MEDIA_ROLE.to_owned(),
+                original_name,
+            };
+            resource.validate()?;
+
+            let blob = content.import_file(path)?;
+            resource.content_id = blob.descriptor.content_id;
+            resource.byte_length = blob.descriptor.byte_length;
+            resource.validate()?;
+            Ok(resource)
+        })
+        .await
+    }
+
     pub async fn create_record(
         &self,
         payload: ProtectedDocument<RecordDocument>,
@@ -319,6 +352,15 @@ impl ClientRuntime {
         let store = self.store.clone();
         let space_id = self.space_id;
         blocking(move || Ok(store.list_entities(space_id, schema, limit)?)).await
+    }
+
+    pub async fn list_records(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<LocalRecordSummary>, ClientRuntimeError> {
+        let store = self.store.clone();
+        let space_id = self.space_id;
+        blocking(move || Ok(store.list_records(space_id, limit)?)).await
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientRuntimeError> {
@@ -425,8 +467,10 @@ fn validate_node_contract(
     node: &BootstrapNodeResponse,
     identity: &IdentityBundle,
 ) -> Result<(NodeId, SpaceDescriptor), ClientRuntimeError> {
-    if node.profile != "full" {
-        return Err(contract("supervised client runtime requires a full node"));
+    if node.profile != "node" {
+        return Err(contract(
+            "supervised client runtime requires a node profile",
+        ));
     }
     let node_id = node
         .node_id
@@ -598,6 +642,8 @@ pub enum ClientRuntimeError {
     Store(#[from] ClientStoreError),
     #[error("client content store failed: {0}")]
     Content(#[from] ClientContentError),
+    #[error("attachment reference is invalid: {0}")]
+    ResourceValidation(#[from] ContentValidationError),
     #[error("client authoring failed: {0}")]
     Authoring(#[from] fractonica_client::ClientError),
     #[error("synchronization setup failed: {0}")]

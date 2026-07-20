@@ -29,6 +29,84 @@ fn imports_verifies_and_reads_immutable_content() {
 }
 
 #[test]
+fn imports_native_file_from_derived_descriptor_and_deduplicates() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ClientContentStore::open(directory.path().join("store")).unwrap();
+    let first_source = directory.path().join("first.bin");
+    let second_source = directory.path().join("second.bin");
+    let bytes = b"native attachment bytes";
+    fs::write(&first_source, bytes).unwrap();
+    fs::write(&second_source, bytes).unwrap();
+
+    let first = store.import_file(&first_source).unwrap();
+    let second = store.import_file(&second_source).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.descriptor, descriptor(bytes));
+    assert_eq!(store.read_range(first.descriptor, 0, 100).unwrap(), bytes);
+    assert_eq!(fs::read(first_source).unwrap(), bytes);
+    assert_eq!(
+        fs::read_dir(store.root().join("partial")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn rejects_non_regular_native_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ClientContentStore::open(directory.path().join("store")).unwrap();
+
+    assert!(matches!(
+        store.import_file(directory.path()),
+        Err(ClientContentError::UnsafePath(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlinked_native_sources() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ClientContentStore::open(directory.path().join("store")).unwrap();
+    let target = directory.path().join("target.bin");
+    let source = directory.path().join("source.bin");
+    fs::write(&target, b"do not import through a link").unwrap();
+    symlink(&target, &source).unwrap();
+
+    assert!(matches!(
+        store.import_file(source),
+        Err(ClientContentError::UnsafePath(_))
+    ));
+    assert_eq!(
+        fs::read_dir(store.root().join("partial")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn rejects_native_sources_above_the_protocol_bound_without_copying() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ClientContentStore::open(directory.path().join("store")).unwrap();
+    let source = directory.path().join("oversize.bin");
+    let file = File::create(&source).unwrap();
+    file.set_len(MAX_CONTENT_BYTE_LENGTH + 1).unwrap();
+    drop(file);
+
+    assert!(matches!(
+        store.import_file(source),
+        Err(ClientContentError::ContentTooLarge {
+            actual,
+            maximum: MAX_CONTENT_BYTE_LENGTH
+        }) if actual == MAX_CONTENT_BYTE_LENGTH + 1
+    ));
+    assert_eq!(
+        fs::read_dir(store.root().join("partial")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
 fn resumes_partial_download_and_publishes_only_after_digest_verification() {
     let directory = tempfile::tempdir().unwrap();
     let store = ClientContentStore::open(directory.path()).unwrap();

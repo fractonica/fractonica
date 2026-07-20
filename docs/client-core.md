@@ -139,9 +139,21 @@ creating a parallel identity or trusting metadata that disagrees with its
 protected keys.
 
 Local create, update, delete, bounded list, status, and shutdown operations are
-now wired through Tauri. Moving the existing React record views onto those
-commands, importing attachments into the private content store, and exposing
-paired-device lifecycle commands are the next client-facing layers.
+wired through Tauri. The React Records workspace now consumes that boundary:
+it reads client SQLite rather than node projections, returns from saves at the
+local commit boundary, preserves resources and references on edits, and treats
+private payloads as opaque. Client SQLite and its WAL/SHM files are private on
+Unix.
+
+Attachment selection also stays behind the native boundary. The picker returns
+its selected paths only to Rust; the client hashes and copies regular files on
+the blocking pool, atomically publishes their immutable bytes in the private
+content store, and returns only validated `record.media` references to React.
+Cancelling is a no-op, equal bytes deduplicate, and removing a draft reference
+does not delete historical content.
+
+Private-record key management/decryption, richer pagination, and paired-device
+lifecycle commands are the next client-facing layers.
 
 The paired peer route is still loopback-only and unauthenticated transport is
 not safe to expose on a LAN. Encrypted session transport remains a subsequent
