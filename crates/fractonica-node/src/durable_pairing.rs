@@ -233,7 +233,7 @@ impl NodePairingControl {
             let operation = OperationEnvelope::sign(
                 session.descriptor.space_id,
                 entity_id,
-                EntitySchema::CapabilityGrantV1,
+                EntitySchema::CapabilityGrant,
                 vec![],
                 vec![session.descriptor.genesis_operation_id],
                 now,

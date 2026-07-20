@@ -7,8 +7,8 @@
 
 ## Context
 
-The signed operation v2 trust kernel intentionally began with only
-`record.v1`. Exeligmos demonstrates the product surface we need to preserve,
+The signed-operation trust kernel needs a small application vocabulary.
+Exeligmos demonstrates useful source data,
 but its password accounts, server revisions, CRUD commands, short record IDs,
 and server-authoritative tables are not Fractonica protocol concepts.
 
@@ -19,15 +19,14 @@ conformance impossible to review.
 
 ## Decision
 
-Protocol v2 gains four client schemas while retaining `record.v1` only as an
-already-published compatibility fixture:
+Fractonica defines four client schemas:
 
-- `record.v2`: temporal journal/data record with ordered immutable resources
+- `record`: temporal journal/data record with ordered immutable resources
   and typed references;
-- `tag.v1`: reusable user-defined classification entity;
-- `event.v1`: lightweight temporal interval with numeric type, label,
+- `tag`: reusable user-defined classification entity;
+- `event`: lightweight temporal interval with numeric type, label,
   metadata, and references, but no media;
-- `profile.v1`: the public presentation of the signing actor, including its
+- `profile`: the public presentation of the signing actor, including its
   handle, display name, Saros anchor, and optional avatar resource.
 
 Every mutable schema uses the existing causal operation rules. Creation has no
@@ -36,7 +35,7 @@ an immutable tombstone. Absence from a peer or projection never means delete.
 
 ### References
 
-`EntityReferenceV1` is an ordered, signed value containing:
+`EntityReference` is an ordered, signed value containing:
 
 - a bounded lowercase relation token;
 - either an actor target or an entity target;
@@ -56,14 +55,14 @@ matching the shared grammar. Meaning can evolve without changing SQL columns.
 
 A profile is authored only by the actor it presents. Its `EntityId` is
 deterministically derived from the actor public key and the domain
-`fractonica-profile-entity-v1`, preventing two offline devices from inventing
+`fractonica-profile-entity`, preventing two offline devices from inventing
 different profile entities for the same actor. Handles are presentation data,
 not authentication identities or globally unique authority.
 
 ### Visibility and encryption
 
 `public` means the signed application document is cleartext. `private` means
-the signed body contains an `EncryptedPayloadV1` envelope instead of the
+the signed body contains an `EncryptedPayload` envelope instead of the
 application document. The outer operation still exposes protocol version,
 space, actor, entity, schema, causal and authorization references, operation
 time, nonce, ciphertext length, key identifier, and encrypted-resource
@@ -86,12 +85,12 @@ encrypted envelope is rejected for the new schemas.
 ### Capability scope
 
 The previously committed `recordVisibilities` JSON name in
-`capability.grant.v1` is replaced by the
+`capability.grant` is replaced by the
 semantically correct `visibilities` name before client release. Its canonical
 CBOR position and codes remain unchanged. Visibility scope applies to every
 client schema carrying a public/private payload, not only records.
 
-`profile.v1` is public-only. Append authority for it is still explicit and the
+`profile` is public-only. Append authority for it is still explicit and the
 profile signer/entity derivation rules are additionally enforced.
 
 ### Rebuildable projections
@@ -102,7 +101,7 @@ operations. The first query contract provides bounded, cursor-based reads for:
 - records ordered by `startAtUnixMs`, then entity ID;
 - events ordered by `startAtUnixMs`, then entity ID;
 - tags ordered by normalized display name, then entity ID;
-- profiles resolved by actor ID;
+- profiles ordered by normalized handle and carrying their signing actor ID;
 - aggregate record/media counts and media bytes.
 
 Private entities remain visible to an authorized client as opaque heads until
@@ -122,17 +121,12 @@ The first web client may use loopback projection routes. iOS synchronization
 continues to use the signed operation log and content resources; it does not
 depend on server projections being a replication format.
 
-## Migration boundary
+## External-source boundary
 
-The v2 Exeligmos migration agent receives a dedicated capability grant and
-creates newly signed Fractonica entities. Exeligmos UUIDs, short public IDs,
-server revisions, device IDs, and source timestamps are retained as bounded
+An Exeligmos import agent receives a dedicated capability grant and creates
+ordinary signed Fractonica entities through the same client core. Exeligmos
+UUIDs, short public IDs, revisions, and device IDs may be retained as bounded
 provenance, never reused as Fractonica operation identities or authority.
-
-Migration cannot begin until tag/event/profile mappings and private key custody
-are implemented and the destination can rebuild projections from an empty
-database. Exeligmos remains read-only source material until count and content
-hash verification succeeds.
 
 ## Consequences
 

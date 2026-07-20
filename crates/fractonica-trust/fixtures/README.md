@@ -1,6 +1,6 @@
 # Fractonica trust conformance fixtures
 
-`operation-v2.json` is generated from a fixed, non-secret Ed25519 seed and is
+`operation.json` is generated from a fixed, non-secret Ed25519 seed and is
 normative for the byte-level protocol. Implementations must reproduce every
 identifier, canonical CBOR payload byte, SHA-256 operation identifier,
 signature, and tagged COSE_Sign1 byte exactly.
@@ -8,7 +8,7 @@ signature, and tagged COSE_Sign1 byte exactly.
 The fixture key is test material only and must never be used as an identity.
 The signed payload is the fixed CBOR array:
 
-1. domain text (`org.fractonica.operation.v2`);
+1. domain text (`org.fractonica.operation`);
 2. protocol version (`2`);
 3. 32-byte space ID;
 4. 32-byte actor Ed25519 public key;

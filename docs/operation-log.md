@@ -6,14 +6,12 @@ Ed25519 author signature, direct parent digests, and an explicit space
 authorization chain. Mutable entity heads, search indexes, summaries, and
 other query structures are projections of accepted operations.
 
-This document describes the implemented operation protocol version 2. The
+This document describes the implemented operation protocol. The
 cryptographic contract is fixed by
 [ADR 0009](adr/0009-signed-operation-trust-kernel.md), while space admission is
 fixed by [ADR 0010](adr/0010-space-capabilities-and-pairing.md). The full node
 enforces capability admission for signed operation writes. Pairing,
-actor-authenticated remote reads, and non-loopback networking are not enabled;
-the obsolete unsigned version 1 operation routes are rejected rather than
-treated as authority.
+actor-authenticated remote reads, and non-loopback networking are not enabled.
 
 ## Operation envelope
 
@@ -21,7 +19,7 @@ The authoritative wire value is deterministic CBOR inside an exact COSE Sign1
 Ed25519 envelope. JSON is a human/API projection and is never signed. The
 unsigned payload commits to:
 
-- the domain `org.fractonica.operation.v2` and protocol version `2`;
+- the domain `org.fractonica.operation` and protocol version `1`;
 - a random 256-bit `SpaceId`;
 - the author's Ed25519-public-key `ActorId`;
 - the affected entity UUID and versioned schema;
@@ -96,7 +94,7 @@ the signer knew every branch or that a peer has disclosed the complete graph.
 
 ## Capability admission
 
-Except for the explicitly trusted `space.genesis.v1` bootstrap, every operation
+Except for the explicitly trusted `space.genesis` bootstrap, every operation
 names the immutable capability grants on which its actor relies. The receiver
 verifies the complete issuer chain, subject, action, schema, restrictions,
 delegation depth, and accepted revocations before applying the operation.
@@ -126,7 +124,7 @@ revocation before distributed authorization is enabled.
 
 ## Record bodies and resources
 
-`record.v1` bodies remain complete document puts or tombstones. A record put
+`record` bodies remain complete document puts or tombstones. A record put
 defines its temporal fields, visibility, optional emoji/text/metadata, and up
 to 64 ordered immutable resource references. Resource bytes are addressed
 separately by content digest; their local availability is not part of operation
@@ -152,14 +150,10 @@ causal clock, event time, capability order, or global sequence. A cursor from
 one node has no meaning on another node. The HTTP cursor is a nonnegative
 signed 64-bit integer, matching the SQLite sequence domain.
 
-## Version 1 migration
+## External data sources
 
-Unsigned UUID-based version 1 operations are not valid version 2 operations.
-Version 2 receivers reject them and do not provide dual interpretation. A
-migration re-encodes logical documents into deterministic CBOR, assigns a
-space and actor, maps UUID parent references to operation digests, and signs
-the resulting operations. Legacy UUIDs may be retained as application
-provenance, but a new signature does not prove the legacy author's identity.
-
-This intentional pre-release break prevents installation UUID attribution and
-unsigned causal identifiers from becoming a permanent compatibility burden.
+Imports do not enter a compatibility mode. An importer is an ordinary agent:
+it reads a source system, maps source values into the current schema, and signs
+new operations under an explicitly granted actor. Source identifiers may be
+retained as bounded provenance, but they never become Fractonica identities or
+proof of the source author's identity.

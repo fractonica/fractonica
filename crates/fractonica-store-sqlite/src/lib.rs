@@ -84,14 +84,6 @@ pub enum StoreError {
     #[error("SQLite migration declared schema {expected}, but database reports {found}")]
     MigrationVersionMismatch { expected: u32, found: u32 },
 
-    #[error("the local unsigned operation store requires explicit version 2 migration")]
-    LegacyMigrationRequired,
-
-    #[error(
-        "the pre-client-contract Fractonica development database is not migrated in place; start a fresh node and import through signed operations"
-    )]
-    ClientContractMigrationRequired,
-
     #[error("stored installation ID is invalid: {0}")]
     InvalidInstallationId(#[from] uuid::Error),
 
@@ -630,11 +622,13 @@ fn positive_u64(value: i64) -> Result<u64, RepositoryError> {
         .ok_or_else(|| RepositoryError::Corrupt(format!("invalid local sequence {value}")))
 }
 
+fn nonnegative_u64(value: i64) -> Result<u64, RepositoryError> {
+    u64::try_from(value)
+        .map_err(|_| RepositoryError::Corrupt(format!("invalid nonnegative count {value}")))
+}
+
 fn repository_unavailable(error: StoreError) -> RepositoryError {
-    match error {
-        StoreError::LegacyMigrationRequired => RepositoryError::LegacyMigrationRequired,
-        other => RepositoryError::Unavailable(other.to_string()),
-    }
+    RepositoryError::Unavailable(error.to_string())
 }
 
 fn repository_sqlite(error: rusqlite::Error) -> RepositoryError {
@@ -771,26 +765,6 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             supported: SCHEMA_VERSION,
         });
     }
-    if (2..4).contains(&current) {
-        let legacy_operation_count: i64 =
-            connection.query_row("SELECT count(*) FROM operations", [], |row| row.get(0))?;
-        if legacy_operation_count != 0 {
-            return Err(StoreError::LegacyMigrationRequired);
-        }
-    }
-    if (4..7).contains(&current) {
-        let operations_sql: Option<String> = connection
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'operations'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if !operations_sql.is_some_and(|sql| sql.contains("'record.v2'")) {
-            return Err(StoreError::ClientContractMigrationRequired);
-        }
-    }
-
     for migration in MIGRATIONS {
         if migration.version <= current {
             continue;

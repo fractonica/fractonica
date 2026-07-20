@@ -1,7 +1,7 @@
 //! Fractonica application use cases and persistence ports.
 //!
 //! HTTP, SQLite, clocks, key custody, and replication are adapters around this
-//! boundary. The application accepts already signed protocol-v2 operations;
+//! boundary. The application accepts already signed operations;
 //! it never injects a local actor or signs on a remote caller's behalf.
 
 pub mod authorization;
@@ -26,6 +26,8 @@ pub const MAX_SPACE_DISPLAY_NAME_CHARS: usize = 128;
 /// Hard bound that keeps entity materialization and all-head merges finite.
 pub const MAX_ENTITY_HEADS: usize = 64;
 pub const MAX_AVAILABILITY_CONTENT_IDS: usize = 256;
+pub const DEFAULT_CLIENT_QUERY_LIMIT: usize = 50;
+pub const MAX_CLIENT_QUERY_LIMIT: usize = 200;
 
 /// Identifies one node-local resumable upload session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -260,6 +262,54 @@ impl EntityState {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientProjectionCursor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_number: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_text: Option<String>,
+    pub entity_id: EntityId,
+    pub operation_id: OperationId,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientEntitySummary {
+    pub operation: StoredOperation,
+    pub visibility: Visibility,
+    pub conflicted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_text: Option<String>,
+    pub resource_count: u64,
+    pub media_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientEntityPage {
+    pub space_id: SpaceId,
+    pub schema: EntitySchema,
+    pub items: Vec<ClientEntitySummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<ClientProjectionCursor>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientStats {
+    pub records: u64,
+    pub events: u64,
+    pub tags: u64,
+    pub profiles: u64,
+    pub media_files: u64,
+    pub media_bytes: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("space {0} is not trusted on this node")]
@@ -294,9 +344,6 @@ pub enum RepositoryError {
 
     #[error("space {0} already has a different trusted genesis or initial grant")]
     GenesisConflict(SpaceId),
-
-    #[error("the local unsigned operation store requires explicit version 2 migration")]
-    LegacyMigrationRequired,
 
     #[error("stored operation data is corrupt: {0}")]
     Corrupt(String),
@@ -369,6 +416,24 @@ pub trait OperationRepository: Send + Sync {
             "peer reads are not implemented by this repository".into(),
         ))
     }
+
+    fn client_entities(
+        &self,
+        _space_id: SpaceId,
+        _schema: EntitySchema,
+        _cursor: Option<&ClientProjectionCursor>,
+        _limit: usize,
+    ) -> Result<ClientEntityPage, RepositoryError> {
+        Err(RepositoryError::Unavailable(
+            "client projections are not implemented by this repository".into(),
+        ))
+    }
+
+    fn client_stats(&self, _space_id: SpaceId) -> Result<ClientStats, RepositoryError> {
+        Err(RepositoryError::Unavailable(
+            "client projections are not implemented by this repository".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -390,6 +455,12 @@ pub enum ApplicationError {
 
     #[error("change limit must be between 1 and {MAX_CHANGE_LIMIT}")]
     InvalidChangeLimit,
+
+    #[error("client query limit must be between 1 and {MAX_CLIENT_QUERY_LIMIT}")]
+    InvalidClientQueryLimit,
+
+    #[error("schema {0} is not a client entity schema")]
+    InvalidClientSchema(EntitySchema),
 
     #[error("peer proof is invalid: {0}")]
     InvalidPeerProof(#[from] PeerProofError),
@@ -460,7 +531,7 @@ impl ApplicationService {
                 operation: request.operation.space_id,
             });
         }
-        if request.operation.schema == EntitySchema::SpaceGenesisV1 {
+        if request.operation.schema == EntitySchema::SpaceGenesis {
             return Err(ApplicationError::GenericGenesisForbidden);
         }
         self.repository
@@ -517,6 +588,31 @@ impl ApplicationService {
         }
         self.repository.peer_changes(&request).map_err(Into::into)
     }
+
+    pub fn client_entities(
+        &self,
+        space_id: SpaceId,
+        schema: EntitySchema,
+        cursor: Option<&ClientProjectionCursor>,
+        limit: usize,
+    ) -> Result<ClientEntityPage, ApplicationError> {
+        if !(1..=MAX_CLIENT_QUERY_LIMIT).contains(&limit) {
+            return Err(ApplicationError::InvalidClientQueryLimit);
+        }
+        if !matches!(
+            schema,
+            EntitySchema::Record | EntitySchema::Event | EntitySchema::Tag | EntitySchema::Profile
+        ) {
+            return Err(ApplicationError::InvalidClientSchema(schema));
+        }
+        self.repository
+            .client_entities(space_id, schema, cursor, limit)
+            .map_err(Into::into)
+    }
+
+    pub fn client_stats(&self, space_id: SpaceId) -> Result<ClientStats, ApplicationError> {
+        self.repository.client_stats(space_id).map_err(Into::into)
+    }
 }
 
 fn validate_received_at(received_at_unix_ms: i64) -> Result<(), ApplicationError> {
@@ -539,12 +635,12 @@ fn validate_trusted_bootstrap(
             "display name must be a bounded non-control label",
         ));
     }
-    if request.genesis.schema != EntitySchema::SpaceGenesisV1 {
+    if request.genesis.schema != EntitySchema::SpaceGenesis {
         return Err(ApplicationError::InvalidTrustedBootstrap(
             "genesis operation has the wrong schema",
         ));
     }
-    if request.initial_grant.schema != EntitySchema::CapabilityGrantV1 {
+    if request.initial_grant.schema != EntitySchema::CapabilityGrant {
         return Err(ApplicationError::InvalidTrustedBootstrap(
             "initial grant operation has the wrong schema",
         ));
@@ -591,11 +687,10 @@ fn validate_trusted_bootstrap(
         ]
         || grant.schemas.as_slice()
             != [
-                EntitySchema::EventV1,
-                EntitySchema::ProfileV1,
-                EntitySchema::RecordV1,
-                EntitySchema::RecordV2,
-                EntitySchema::TagV1,
+                EntitySchema::Event,
+                EntitySchema::Profile,
+                EntitySchema::Record,
+                EntitySchema::Tag,
             ]
         || grant.visibilities.as_slice() != [Visibility::Public, Visibility::Private]
         || !grant.content_roles.is_empty()

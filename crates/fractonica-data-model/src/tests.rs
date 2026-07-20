@@ -27,11 +27,11 @@ fn document(text: &str) -> RecordDocument {
     RecordDocument {
         start_at_unix_ms: 1_000,
         end_at_unix_ms: None,
-        visibility: Visibility::Public,
         emoji: Some("🌒".into()),
         text: Some(text.into()),
         metadata: BTreeMap::from([("source".into(), json!("test"))]),
         resources: Vec::new(),
+        references: Vec::new(),
     }
 }
 
@@ -42,17 +42,19 @@ fn put(
     parents: Vec<OperationId>,
     nonce_byte: u8,
     text: &str,
-) -> SignedOperationEnvelope {
-    SignedOperationEnvelope::sign(
+) -> OperationEnvelope {
+    OperationEnvelope::sign(
         space_id,
         entity_id,
-        EntitySchema::RecordV1,
+        EntitySchema::Record,
         parents,
         vec![digest(0xa0)],
         2_000 + i64::from(nonce_byte),
         nonce(nonce_byte),
-        OperationBody::Put {
-            document: document(text),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public {
+                document: document(text),
+            },
         },
         key,
     )
@@ -65,11 +67,11 @@ fn tombstone(
     entity_id: EntityId,
     parent: OperationId,
     nonce_byte: u8,
-) -> SignedOperationEnvelope {
-    SignedOperationEnvelope::sign(
+) -> OperationEnvelope {
+    OperationEnvelope::sign(
         space_id,
         entity_id,
-        EntitySchema::RecordV1,
+        EntitySchema::Record,
         vec![parent],
         vec![digest(0xa0)],
         2_000 + i64::from(nonce_byte),
@@ -88,7 +90,7 @@ fn valid_grant(subject: ActorId) -> CapabilityGrant {
             CapabilityAction::ReadSpace,
             CapabilityAction::WriteContent,
         ],
-        schemas: vec![EntitySchema::RecordV1],
+        schemas: vec![EntitySchema::Record],
         visibilities: vec![Visibility::Public, Visibility::Private],
         content_roles: vec!["attachment".into(), "photo".into()],
         max_resource_byte_length: Some(4_194_304),
@@ -99,23 +101,22 @@ fn valid_grant(subject: ActorId) -> CapabilityGrant {
     }
 }
 
-fn actor_reference(actor_id: ActorId) -> EntityReferenceV1 {
-    EntityReferenceV1 {
+fn actor_reference(actor_id: ActorId) -> EntityReference {
+    EntityReference {
         relation: "mentions".into(),
-        target: ReferenceTargetV1::Actor { actor_id },
+        target: ReferenceTarget::Actor { actor_id },
     }
 }
 
-fn assert_signed_round_trip(operation: &SignedOperationEnvelope) {
+fn assert_signed_round_trip(operation: &OperationEnvelope) {
     operation.verify().expect("verify original operation");
     let json = serde_json::to_value(operation).expect("serialize signed operation");
-    let decoded: SignedOperationEnvelope =
+    let decoded: OperationEnvelope =
         serde_json::from_value(json).expect("deserialize signed operation");
     decoded.verify().expect("verify JSON round trip");
     assert_eq!(&decoded, operation);
     assert_eq!(
-        SignedOperationEnvelope::from_cose_sign1(&operation.cose_sign1)
-            .expect("decode canonical COSE"),
+        OperationEnvelope::from_cose_sign1(&operation.cose_sign1).expect("decode canonical COSE"),
         *operation
     );
 }
@@ -128,17 +129,17 @@ fn client_schema_bodies_round_trip_through_json_and_cose() {
     let authorization = || vec![digest(0xa0)];
 
     let fixtures = [
-        SignedOperationEnvelope::sign(
+        OperationEnvelope::sign(
             space(1),
             entity(10),
-            EntitySchema::RecordV2,
+            EntitySchema::Record,
             Vec::new(),
             authorization(),
             3_000,
             nonce(10),
-            OperationBody::PutRecordV2 {
-                payload: ProtectedDocumentV1::Public {
-                    document: RecordDocumentV2 {
+            OperationBody::PutRecord {
+                payload: ProtectedDocument::Public {
+                    document: RecordDocument {
                         start_at_unix_ms: 2_000,
                         end_at_unix_ms: Some(2_500),
                         emoji: Some("🌒".into()),
@@ -151,18 +152,18 @@ fn client_schema_bodies_round_trip_through_json_and_cose() {
             },
             &signing_key,
         )
-        .expect("sign record.v2"),
-        SignedOperationEnvelope::sign(
+        .expect("sign record"),
+        OperationEnvelope::sign(
             space(1),
             entity(11),
-            EntitySchema::TagV1,
+            EntitySchema::Tag,
             Vec::new(),
             authorization(),
             3_001,
             nonce(11),
-            OperationBody::PutTagV1 {
-                payload: ProtectedDocumentV1::Public {
-                    document: TagDocumentV1 {
+            OperationBody::PutTag {
+                payload: ProtectedDocument::Public {
+                    document: TagDocument {
                         name: "astronomy".into(),
                         emoji: Some("🔭".into()),
                         notes: None,
@@ -174,18 +175,18 @@ fn client_schema_bodies_round_trip_through_json_and_cose() {
             },
             &signing_key,
         )
-        .expect("sign tag.v1"),
-        SignedOperationEnvelope::sign(
+        .expect("sign tag"),
+        OperationEnvelope::sign(
             space(1),
             entity(12),
-            EntitySchema::EventV1,
+            EntitySchema::Event,
             Vec::new(),
             authorization(),
             3_002,
             nonce(12),
-            OperationBody::PutEventV1 {
-                payload: ProtectedDocumentV1::Public {
-                    document: EventDocumentV1 {
+            OperationBody::PutEvent {
+                payload: ProtectedDocument::Public {
+                    document: EventDocument {
                         start_at_unix_ms: 2_100,
                         end_at_unix_ms: Some(2_200),
                         label: "sensor threshold".into(),
@@ -197,17 +198,17 @@ fn client_schema_bodies_round_trip_through_json_and_cose() {
             },
             &signing_key,
         )
-        .expect("sign event.v1"),
-        SignedOperationEnvelope::sign(
+        .expect("sign event"),
+        OperationEnvelope::sign(
             space(1),
             profile_entity_id(actor_id),
-            EntitySchema::ProfileV1,
+            EntitySchema::Profile,
             Vec::new(),
             authorization(),
             3_003,
             nonce(13),
-            OperationBody::PutProfileV1 {
-                document: ProfileDocumentV1 {
+            OperationBody::PutProfile {
+                document: ProfileDocument {
                     handle: "dimaswift".into(),
                     display_name: "Dimas".into(),
                     saros_anchor: 141,
@@ -217,7 +218,7 @@ fn client_schema_bodies_round_trip_through_json_and_cose() {
             },
             &signing_key,
         )
-        .expect("sign profile.v1"),
+        .expect("sign profile"),
     ];
 
     for fixture in fixtures {
@@ -228,18 +229,18 @@ fn client_schema_bodies_round_trip_through_json_and_cose() {
 #[test]
 fn private_record_is_opaque_and_enforces_opaque_resources() {
     let signing_key = key(13);
-    let operation = SignedOperationEnvelope::sign(
+    let operation = OperationEnvelope::sign(
         space(2),
         entity(20),
-        EntitySchema::RecordV2,
+        EntitySchema::Record,
         Vec::new(),
         vec![digest(0xa0)],
         4_000,
         nonce(20),
-        OperationBody::PutRecordV2 {
-            payload: ProtectedDocumentV1::Private {
-                envelope: EncryptedPayloadV1 {
-                    algorithm: EncryptionAlgorithmV1::Aes256Gcm,
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Private {
+                envelope: EncryptedPayload {
+                    algorithm: EncryptionAlgorithm::Aes256Gcm,
                     key_id: format!("key:aes256:{}", "ab".repeat(32)),
                     nonce_base64url: "AAAAAAAAAAAAAAAA".into(),
                     ciphertext_base64url: "AAAAAAAAAAAAAAAAAAAAAA".into(),
@@ -259,8 +260,8 @@ fn private_record_is_opaque_and_enforces_opaque_resources() {
     assert_signed_round_trip(&operation);
 
     let mut disclosed = operation;
-    let OperationBody::PutRecordV2 {
-        payload: ProtectedDocumentV1::Private { resources, .. },
+    let OperationBody::PutRecord {
+        payload: ProtectedDocument::Private { resources, .. },
     } = &mut disclosed.body
     else {
         panic!("private record fixture")
@@ -279,16 +280,16 @@ fn profile_entity_id_is_stable_and_bound_to_its_actor() {
     assert_eq!(owner_id, profile_entity_id(owner.actor_id()));
     assert_eq!(owner_id.as_uuid().get_version_num(), 8);
 
-    let result = SignedOperationEnvelope::sign(
+    let result = OperationEnvelope::sign(
         space(3),
         entity(99),
-        EntitySchema::ProfileV1,
+        EntitySchema::Profile,
         Vec::new(),
         vec![digest(0xa0)],
         5_000,
         nonce(21),
-        OperationBody::PutProfileV1 {
-            document: ProfileDocumentV1 {
+        OperationBody::PutProfile {
+            document: ProfileDocument {
                 handle: "owner".into(),
                 display_name: "Owner".into(),
                 saros_anchor: 141,
@@ -308,9 +309,9 @@ fn signed_record_round_trips_through_strict_json_and_cose() {
 
     let json = serde_json::to_value(&operation).expect("serialize projection");
     assert_eq!(json["protocolVersion"], PROTOCOL_VERSION);
-    assert_eq!(json["schema"], "record.v1");
+    assert_eq!(json["schema"], "record");
     assert_eq!(json["nonce"], "03030303030303030303030303030303");
-    assert_eq!(json["body"]["kind"], "put");
+    assert_eq!(json["body"]["kind"], "putRecord");
     assert!(json["coseSign1"].as_str().is_some_and(|value| {
         !value.contains('=')
             && value
@@ -318,13 +319,12 @@ fn signed_record_round_trips_through_strict_json_and_cose() {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     }));
 
-    let decoded: SignedOperationEnvelope =
+    let decoded: OperationEnvelope =
         serde_json::from_value(json).expect("deserialize strict projection");
     assert_eq!(decoded, operation);
     decoded.verify().expect("verify deserialized projection");
     assert_eq!(
-        SignedOperationEnvelope::from_cose_sign1(&operation.cose_sign1)
-            .expect("project canonical COSE"),
+        OperationEnvelope::from_cose_sign1(&operation.cose_sign1).expect("project canonical COSE"),
         operation
     );
 }
@@ -343,7 +343,10 @@ fn projection_drift_and_signature_tampering_are_rejected() {
     );
 
     let mut text = operation.clone();
-    let OperationBody::Put { document } = &mut text.body else {
+    let OperationBody::PutRecord {
+        payload: ProtectedDocument::Public { document },
+    } = &mut text.body
+    else {
         panic!("put fixture")
     };
     document.text = Some("tampered".into());
@@ -393,7 +396,7 @@ fn every_redundant_projection_identity_field_is_bound_to_signed_bytes() {
     );
 
     let mut schema = operation.clone();
-    schema.schema = EntitySchema::CapabilityGrantV1;
+    schema.schema = EntitySchema::CapabilityGrant;
     assert_eq!(
         schema.verify(),
         Err(DataModelError::ProjectionMismatch { field: "schema" })
@@ -426,7 +429,7 @@ fn every_redundant_projection_identity_field_is_bound_to_signed_bytes() {
 }
 
 #[test]
-fn json_projection_rejects_v1_noncanonical_nonce_and_padded_base64() {
+fn json_projection_rejects_unsupported_version_noncanonical_nonce_and_padded_base64() {
     let operation = put(&key(7), space(1), entity(1), Vec::new(), 5, "created");
     let mut value = serde_json::to_value(operation).expect("serialize projection");
 
@@ -437,42 +440,42 @@ fn json_projection_rejects_v1_noncanonical_nonce_and_padded_base64() {
     ] {
         let mut invalid_entity = value.clone();
         invalid_entity["entityId"] = json!(noncanonical);
-        assert!(serde_json::from_value::<SignedOperationEnvelope>(invalid_entity).is_err());
+        assert!(serde_json::from_value::<OperationEnvelope>(invalid_entity).is_err());
     }
 
-    value["protocolVersion"] = json!(1);
-    let version: SignedOperationEnvelope =
+    value["protocolVersion"] = json!(2);
+    let version: OperationEnvelope =
         serde_json::from_value(value.clone()).expect("version is structurally JSON-valid");
     assert!(matches!(
         version.verify(),
-        Err(DataModelError::UnsupportedProtocolVersion { found: 1, .. })
+        Err(DataModelError::UnsupportedProtocolVersion { found: 2, .. })
     ));
 
     value["protocolVersion"] = json!(PROTOCOL_VERSION);
     value["nonce"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-    assert!(serde_json::from_value::<SignedOperationEnvelope>(value.clone()).is_err());
+    assert!(serde_json::from_value::<OperationEnvelope>(value.clone()).is_err());
 
     value["nonce"] = json!("05050505050505050505050505050505");
     let padded = format!("{}=", value["coseSign1"].as_str().expect("COSE string"));
     value["coseSign1"] = json!(padded);
-    assert!(serde_json::from_value::<SignedOperationEnvelope>(value).is_err());
+    assert!(serde_json::from_value::<OperationEnvelope>(value).is_err());
 }
 
 #[test]
 fn json_projection_rejects_omitted_fields_that_canonical_serialization_emits() {
     let operation = put(&key(7), space(1), entity(1), Vec::new(), 5, "created");
     let mut record = serde_json::to_value(operation).expect("serialize record projection");
-    record["body"]["document"]
+    record["body"]["payload"]["document"]
         .as_object_mut()
         .expect("record document")
         .remove("metadata");
-    assert!(serde_json::from_value::<SignedOperationEnvelope>(record).is_err());
+    assert!(serde_json::from_value::<OperationEnvelope>(record).is_err());
 
     let signing_key = key(7);
-    let grant = SignedOperationEnvelope::sign(
+    let grant = OperationEnvelope::sign(
         space(1),
         entity(2),
-        EntitySchema::CapabilityGrantV1,
+        EntitySchema::CapabilityGrant,
         Vec::new(),
         vec![digest(0xa0)],
         2_000,
@@ -491,7 +494,7 @@ fn json_projection_rejects_omitted_fields_that_canonical_serialization_emits() {
             .expect("grant projection")
             .remove(field);
         assert!(
-            serde_json::from_value::<SignedOperationEnvelope>(missing).is_err(),
+            serde_json::from_value::<OperationEnvelope>(missing).is_err(),
             "missing {field} must be rejected"
         );
     }
@@ -504,7 +507,7 @@ fn arbitrary_or_noncanonical_schema_bodies_are_not_typed_records() {
         space(1),
         signing_key.actor_id(),
         entity(1).as_uuid(),
-        EntitySchema::RecordV1.as_str(),
+        EntitySchema::Record.as_str(),
         Vec::new(),
         vec![digest(0xa0)],
         2_000,
@@ -518,9 +521,9 @@ fn arbitrary_or_noncanonical_schema_bodies_are_not_typed_records() {
         .to_cose_sign1()
         .expect("encode COSE");
     assert!(matches!(
-        SignedOperationEnvelope::from_cose_sign1(&cose),
+        OperationEnvelope::from_cose_sign1(&cose),
         Err(DataModelError::InvalidCanonicalBody {
-            schema: EntitySchema::RecordV1,
+            schema: EntitySchema::Record,
             ..
         })
     ));
@@ -528,7 +531,7 @@ fn arbitrary_or_noncanonical_schema_bodies_are_not_typed_records() {
     let mut trailing = put(&signing_key, space(1), entity(1), Vec::new(), 7, "created").cose_sign1;
     trailing.push(0);
     assert!(matches!(
-        SignedOperationEnvelope::from_cose_sign1(&trailing),
+        OperationEnvelope::from_cose_sign1(&trailing),
         Err(DataModelError::Trust(_))
     ));
 }
@@ -538,7 +541,6 @@ fn record_canonical_mapping_preserves_metadata_and_resources() {
     let content_id = fractonica_content::hash_bytes(b"image");
     let mut value = document("with resource");
     value.end_at_unix_ms = Some(1_500);
-    value.visibility = Visibility::Private;
     value.metadata = BTreeMap::from([
         ("float".into(), json!(1.5)),
         ("negative".into(), json!(-7)),
@@ -551,24 +553,31 @@ fn record_canonical_mapping_preserves_metadata_and_resources() {
         role: "photo".into(),
         original_name: Some("eclipse.jpeg".into()),
     });
-    let operation = SignedOperationEnvelope::sign(
+    let operation = OperationEnvelope::sign(
         space(1),
         entity(1),
-        EntitySchema::RecordV1,
+        EntitySchema::Record,
         Vec::new(),
         vec![digest(0xa0)],
         2_000,
         nonce(8),
-        OperationBody::Put {
-            document: value.clone(),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public {
+                document: value.clone(),
+            },
         },
         &key(7),
     )
     .expect("sign complete record");
 
-    let recovered = SignedOperationEnvelope::from_cose_sign1(&operation.cose_sign1)
-        .expect("decode canonical record");
-    assert_eq!(recovered.body, OperationBody::Put { document: value });
+    let recovered =
+        OperationEnvelope::from_cose_sign1(&operation.cose_sign1).expect("decode canonical record");
+    assert_eq!(
+        recovered.body,
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public { document: value }
+        }
+    );
 }
 
 #[test]
@@ -611,10 +620,10 @@ fn genesis_grant_and_revocation_have_typed_signed_mappings() {
     let controller = key(7);
     let subject = key(9);
     let space_id = space(2);
-    let genesis = SignedOperationEnvelope::sign(
+    let genesis = OperationEnvelope::sign(
         space_id,
         entity(10),
-        EntitySchema::SpaceGenesisV1,
+        EntitySchema::SpaceGenesis,
         Vec::new(),
         Vec::new(),
         1_000,
@@ -626,10 +635,10 @@ fn genesis_grant_and_revocation_have_typed_signed_mappings() {
     )
     .expect("sign genesis");
 
-    let grant = SignedOperationEnvelope::sign(
+    let grant = OperationEnvelope::sign(
         space_id,
         entity(11),
-        EntitySchema::CapabilityGrantV1,
+        EntitySchema::CapabilityGrant,
         Vec::new(),
         vec![genesis.operation_id],
         1_100,
@@ -641,10 +650,10 @@ fn genesis_grant_and_revocation_have_typed_signed_mappings() {
     )
     .expect("sign capability grant");
 
-    let revocation = SignedOperationEnvelope::sign(
+    let revocation = OperationEnvelope::sign(
         space_id,
         entity(12),
-        EntitySchema::CapabilityRevokeV1,
+        EntitySchema::CapabilityRevoke,
         Vec::new(),
         vec![genesis.operation_id],
         1_200,
@@ -663,7 +672,7 @@ fn genesis_grant_and_revocation_have_typed_signed_mappings() {
     for operation in [genesis, grant, revocation] {
         operation.verify().expect("verify system operation");
         let json = serde_json::to_vec(&operation).expect("serialize system projection");
-        let decoded: SignedOperationEnvelope =
+        let decoded: OperationEnvelope =
             serde_json::from_slice(&json).expect("deserialize system projection");
         assert_eq!(decoded, operation);
     }
@@ -688,10 +697,10 @@ fn system_schema_pairing_and_capability_bounds_are_enforced() {
     ));
 
     assert!(matches!(
-        SignedOperationEnvelope::sign(
+        OperationEnvelope::sign(
             space(1),
             entity(1),
-            EntitySchema::SpaceGenesisV1,
+            EntitySchema::SpaceGenesis,
             Vec::new(),
             Vec::new(),
             1_000,
@@ -705,10 +714,10 @@ fn system_schema_pairing_and_capability_bounds_are_enforced() {
     ));
 
     assert!(matches!(
-        SignedOperationEnvelope::sign(
+        OperationEnvelope::sign(
             space(1),
             entity(1),
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             Vec::new(),
             Vec::new(),
             1_000,
@@ -720,10 +729,10 @@ fn system_schema_pairing_and_capability_bounds_are_enforced() {
     ));
 
     assert!(matches!(
-        SignedOperationEnvelope::sign(
+        OperationEnvelope::sign(
             space(1),
             entity(1),
-            EntitySchema::CapabilityGrantV1,
+            EntitySchema::CapabilityGrant,
             Vec::new(),
             vec![digest(1)],
             1_000,
@@ -738,10 +747,10 @@ fn system_schema_pairing_and_capability_bounds_are_enforced() {
 #[test]
 fn constructor_normalizes_parent_and_authorization_sets() {
     let signing_key = key(7);
-    let operation = SignedOperationEnvelope::sign(
+    let operation = OperationEnvelope::sign(
         space(1),
         entity(1),
-        EntitySchema::RecordV1,
+        EntitySchema::Record,
         vec![digest(3), digest(1), digest(2)],
         vec![digest(9), digest(7), digest(8)],
         2_000,
@@ -804,7 +813,7 @@ fn reducer_preserves_linear_concurrent_merge_and_tombstone_semantics() {
     let reduced = reduce_entity(
         space_id,
         entity_id,
-        EntitySchema::RecordV1,
+        EntitySchema::Record,
         [root, branch_a, branch_b, merge, deleted],
     )
     .expect("reduce signed graph");
@@ -818,7 +827,7 @@ fn reducer_is_space_scoped_and_requires_topological_parents() {
     let signing_key = key(7);
     let entity_id = entity(1);
     let foreign = put(&signing_key, space(2), entity_id, Vec::new(), 20, "foreign");
-    let mut reducer = EntityReducer::new(space(1), entity_id, EntitySchema::RecordV1);
+    let mut reducer = EntityReducer::new(space(1), entity_id, EntitySchema::Record);
     assert!(matches!(
         reducer.apply(foreign),
         Err(DataModelError::ForeignSpace { .. })
@@ -843,10 +852,10 @@ fn fixed_seed_record_has_stable_operation_and_cose_vectors() {
     let operation = put(&key(7), space(1), entity(1), Vec::new(), 3, "created");
     assert_eq!(
         operation.operation_id.to_string(),
-        "sha-256:97184131cac96c99cf9cb8543387d4cf956bcdffffa6963e1501ac3479a66d75"
+        "sha-256:878007f7b84f15b052f908509fbbaf1dc12945692afef223ab94913818b83acf"
     );
     assert_eq!(
         operation.cose_sign1_base64url(),
-        "0oRDoQEnoFjYi3gbb3JnLmZyYWN0b25pY2Eub3BlcmF0aW9uLnYyAlggAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQFYIOpKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIsUAAAAAAAAAAAAAAAAAAAAAFpcmVjb3JkLnYxgIFYIKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgGQfTUAMDAwMDAwMDAwMDAwMDAwOIARkD6PYAZPCfjJJnY3JlYXRlZKFmc291cmNlZHRlc3SAWECaMvTr65C7ZA8lOhzpbxU6IxVAtxgPl5EQubU3Y6W1uI-DigNSC6vCWJ9SkFMRsAGtW4GxO0QDKjOemTdW-cEH"
+        "0oRDoQEnoFjWi3gYb3JnLmZyYWN0b25pY2Eub3BlcmF0aW9uAVggAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQFYIOpKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIsUAAAAAAAAAAAAAAAAAAAAAFmcmVjb3JkgIFYIKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgGQfTUAMDAwMDAwMDAwMDAwMDAwOCAYMAhxkD6PZk8J-MkmdjcmVhdGVkoWZzb3VyY2VkdGVzdICAgFhAEc8Y6ljCCUgPeXrFHefXdaF1WiWAu5mvAFIA5x4a4yqPuw62UZ9TrhABbpin_Tq2lNHaumOAfOyaaeNBBvl3Aw"
     );
 }

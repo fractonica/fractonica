@@ -45,8 +45,8 @@ input, helper output, and replicated data are untrusted until the node validates
 them.
 
 The cryptographic trust kernel distinguishes local `InstallationId`, transport
-`NodeId`, authorization namespace `SpaceId`, and signing `ActorId`. Version 2
-operations are a deterministic-CBOR Merkle DAG signed with COSE Sign1/Ed25519.
+`NodeId`, authorization namespace `SpaceId`, and signing `ActorId`. Operations
+form a deterministic-CBOR Merkle DAG signed with COSE Sign1/Ed25519.
 Signature validity is necessary but not sufficient: an operation also requires
 a space capability chain. See the [threat model](threat-model.md),
 [signed-operation ADR](adr/0009-signed-operation-trust-kernel.md), and
@@ -97,23 +97,18 @@ its immutable content resources. This statement does not enable replication:
 peer discovery, graph exchange, revocation races, and transport security still
 require a dedicated protocol decision.
 
-## Compatibility and releases
+## Contracts and releases
 
-Public HTTP descriptions are checked in under `contracts/openapi`. Device
-messages use explicit versions and hard bounds. Breaking changes require a new
-contract version and a rollout plan; implementations must reject unsupported
-versions predictably instead of guessing. Because Fractonica is pre-release,
-operation protocol version 2 intentionally replaces unsigned version 1 without
-a dual-read compatibility mode; migration re-encodes and signs logical data.
-The v2 space-scoped operation routes are the primary stateful API. The old v1
-operation and entity routes return `410`, while stateless Saros/glyph and
-loopback content-transfer mechanics remain on v1 until their respective
-contracts advance.
+Public HTTP descriptions are checked in under `contracts/openapi`. Signed and
+device messages retain explicit wire discriminators and hard bounds so corrupt
+or unsupported bytes fail closed. Fractonica has one current API and one
+current application schema vocabulary; pre-release experiments are not kept as
+compatibility surfaces.
 
 Ed25519 actor and node identities, SHA-256 operation IDs, deterministic CBOR,
 COSE Sign1, capability semantics, and the QR bootstrap boundary are selected by
 the Phase 3 security decisions. Local trusted-space bootstrap, capability
-grants, revocations, and v2 write admission are implemented. The authenticated
+grants, revocations, and signed write admission are implemented. The authenticated
 Noise pairing handshake, local QR/confirmation UI, controller-signed grant
 issuance, and dual-signed `readSpace` change pages with durable replay
 protection are implemented on loopback. Space-authorized content transfer,

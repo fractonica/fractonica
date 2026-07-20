@@ -15,29 +15,26 @@ The durable representation must remain independent of SQLite and HTTP. It also
 must be deterministic so every node reduces the same accepted history to the
 same heads without consulting a clock or relying on database row order.
 
-## Phase 3 amendment
+## Cryptographic amendment
 
-[ADR 0009](0009-signed-operation-trust-kernel.md) replaces the pre-release
-version 1 UUID operation identity and installation-derived actor with version 2
+[ADR 0009](0009-signed-operation-trust-kernel.md) replaces the early prototype
+UUID operation identity and installation-derived actor with
 SHA-256 operation digests, Ed25519-public-key actor identities, deterministic
 CBOR, and COSE Sign1 signatures. [ADR 0010](0010-space-capabilities-and-pairing.md)
-adds spaces and explicit capability admission. Version 1 is not retained as a
-compatible wire format. The causal reduction, concurrent-head, merge,
+adds spaces and explicit capability admission. The causal reduction, concurrent-head, merge,
 tombstone, projection, and node-local cursor decisions below remain in force.
 
 ## Decision
 
-The original version 1 canonical unit was a versioned immutable
-`OperationEnvelope`. It identifies
+The canonical unit is an immutable `OperationEnvelope`. It identifies
 an operation, entity, schema and actor; carries a nonnegative occurrence time;
 retains an ordered, duplicate-free list of direct causal parent operation IDs;
-and contains a schema-specific body. Version 1 defines `record.v1`, whose body
-is either a complete document `put` or a tombstone.
+and contains a schema-specific body.
 
 Entity history is a directed acyclic graph. An operation is accepted only after
 all of its parents have been accepted for the same entity. This topological
 requirement rejects missing and forward/cyclic parent references without a
-graph search. In version 2, parent digests are strictly sorted only to produce
+graph search. Parent digests are strictly sorted only to produce
 one canonical encoding; their order has no semantic meaning. The materialized
 head list is sorted by operation ID for deterministic output.
 
@@ -77,8 +74,8 @@ metadata all have explicit bounds. Unsupported protocol or schema versions are
 rejected; they are never guessed or reinterpreted. Breaking semantic changes
 require a new version and conformance fixtures.
 
-Operations use millisecond Unix timestamps in version 1 because that matches
-the initial client data contract. Saros phase and glyph values are derived from
+Operations use millisecond Unix timestamps at the protocol boundary. Saros
+phase and glyph values are derived from
 an explicit instant by the temporal engine; they are not duplicated as
 independent canonical clocks in the operation envelope.
 

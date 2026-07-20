@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply migrations 0001-0004 and probe protocol-v2 SQLite invariants."""
+"""Apply migrations 0001-0004 and probe signed-operation SQLite invariants."""
 
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def insert_space(
         space_id=space_id,
         operation_id=genesis_id,
         entity_id=ENTITY_GENESIS_A if space_id == space(1) else ENTITY_GENESIS_B,
-        schema_id="space.genesis.v1",
+        schema_id="space.genesis",
     )
     insert_operation(
         connection,
@@ -82,7 +82,7 @@ def insert_space(
         entity_id=(
             ENTITY_INITIAL_GRANT_A if space_id == space(1) else ENTITY_INITIAL_GRANT_B
         ),
-        schema_id="capability.grant.v1",
+        schema_id="capability.grant",
     )
     connection.execute(
         "INSERT INTO operation_authorization_refs VALUES (?, ?, ?, 0)",
@@ -102,7 +102,7 @@ def insert_space(
         (space_id, initial_grant_id),
     )
     connection.execute(
-        "INSERT INTO capability_grant_schema_scopes VALUES (?, ?, 0, 'record.v1')",
+        "INSERT INTO capability_grant_schema_scopes VALUES (?, ?, 0, 'record')",
         (space_id, initial_grant_id),
     )
     connection.executemany(
@@ -121,7 +121,7 @@ def insert_operation(
     space_id: str,
     operation_id: str,
     entity_id: str,
-    schema_id: str = "record.v1",
+    schema_id: str = "record",
 ) -> None:
     connection.execute(
         """
@@ -242,14 +242,14 @@ def test_empty_upgrade_and_constraints() -> None:
         space_id=mismatch_space,
         operation_id=mismatch_genesis,
         entity_id=ENTITY_MISMATCH_GENESIS,
-        schema_id="space.genesis.v1",
+        schema_id="space.genesis",
     )
     insert_operation(
         connection,
         space_id=mismatch_space,
         operation_id=mismatch_grant,
         entity_id=ENTITY_MISMATCH_GRANT,
-        schema_id="capability.grant.v1",
+        schema_id="capability.grant",
     )
     connection.execute(
         """
@@ -301,36 +301,36 @@ def test_empty_upgrade_and_constraints() -> None:
     connection.commit()
 
     connection.execute(
-        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record.v1', ?, 'public')",
+        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record', ?, 'public')",
         (space_one, ENTITY_A, parent_one),
     )
     expect_integrity_error(
         connection,
         "ambiguous visibility",
-        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record.v1', ?, 'private')",
+        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record', ?, 'private')",
         (space_one, ENTITY_A, child_one),
     )
     expect_integrity_error(
         connection,
         "cross-entity visibility origin",
-        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record.v1', ?, 'public')",
+        "INSERT INTO client_entity_visibility VALUES (?, ?, 'record', ?, 'public')",
         (space_one, ENTITY_A, other_entity_parent),
     )
 
     connection.execute(
-        "INSERT INTO operation_parents VALUES (?, ?, 'record.v1', ?, ?, 0)",
+        "INSERT INTO operation_parents VALUES (?, ?, 'record', ?, ?, 0)",
         (space_one, ENTITY_A, child_one, parent_one),
     )
     expect_integrity_error(
         connection,
         "cross-space parent",
-        "INSERT INTO operation_parents VALUES (?, ?, 'record.v1', ?, ?, 1)",
+        "INSERT INTO operation_parents VALUES (?, ?, 'record', ?, ?, 1)",
         (space_one, ENTITY_A, child_one, cross_space_parent),
     )
     expect_integrity_error(
         connection,
         "cross-entity parent",
-        "INSERT INTO operation_parents VALUES (?, ?, 'record.v1', ?, ?, 1)",
+        "INSERT INTO operation_parents VALUES (?, ?, 'record', ?, ?, 1)",
         (space_one, ENTITY_A, child_one, other_entity_parent),
     )
     expect_integrity_error(
@@ -342,7 +342,7 @@ def test_empty_upgrade_and_constraints() -> None:
     expect_integrity_error(
         connection,
         "cross-space entity head",
-        "INSERT INTO entity_heads VALUES (?, ?, 'record.v1', ?)",
+        "INSERT INTO entity_heads VALUES (?, ?, 'record', ?)",
         (space_one, ENTITY_A, cross_space_parent),
     )
     expect_integrity_error(
@@ -369,7 +369,7 @@ def test_empty_upgrade_and_constraints() -> None:
         space_id=space_two,
         operation_id=grant_id,
         entity_id=ENTITY_GRANT,
-        schema_id="capability.grant.v1",
+        schema_id="capability.grant",
     )
     connection.execute(
         """
@@ -392,7 +392,7 @@ def test_empty_upgrade_and_constraints() -> None:
         ),
     )
     connection.execute(
-        "INSERT INTO capability_grant_schema_scopes VALUES (?, ?, 0, 'record.v1')",
+        "INSERT INTO capability_grant_schema_scopes VALUES (?, ?, 0, 'record')",
         (space_two, grant_id),
     )
     connection.execute(
@@ -437,7 +437,7 @@ def test_empty_upgrade_and_constraints() -> None:
         space_id=space_two,
         operation_id=revocation_id,
         entity_id=ENTITY_REVOCATION,
-        schema_id="capability.revoke.v1",
+        schema_id="capability.revoke",
     )
     connection.execute(
         "INSERT INTO operation_authorization_refs VALUES (?, ?, ?, 0)",
@@ -469,7 +469,7 @@ def test_empty_upgrade_and_constraints() -> None:
         space_id=space_one,
         operation_id=cross_revocation_id,
         entity_id=ENTITY_CROSS_REVOCATION,
-        schema_id="capability.revoke.v1",
+        schema_id="capability.revoke",
     )
     expect_integrity_error(
         connection,
@@ -498,7 +498,7 @@ def test_nonempty_legacy_upgrade_is_rejected() -> None:
         INSERT INTO operations (
             operation_id, protocol_version, entity_id, schema_id, actor_id,
             kind, occurred_at_unix_ms, received_at_unix_ms, payload
-        ) VALUES (?, 1, ?, 'record.v1', ?, 'tombstone', 1, 1, X'7B7D')
+        ) VALUES (?, 1, ?, 'record', ?, 'tombstone', 1, 1, X'7B7D')
         """,
         (
             "00000000-0000-0000-0000-000000000001",

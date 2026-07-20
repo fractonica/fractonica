@@ -34,7 +34,7 @@ export const READY_SNAPSHOT: NodeSnapshot = {
     version: "0.1.0",
     startedAt: "2026-07-17T08:00:00.000Z",
     uptimeSeconds: 90_125,
-    capabilities: ["records", "replication", "media", "noise-pairing-v1"],
+    capabilities: ["records", "replication", "media", "noise-pairing"],
   },
 };
 

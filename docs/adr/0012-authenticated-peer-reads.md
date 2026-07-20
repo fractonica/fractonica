@@ -29,7 +29,7 @@ exposure.
 The first peer operation is a bounded page read:
 
 ```text
-POST /api/v2/peer/spaces/{spaceId}/changes
+POST /api/peer/spaces/{spaceId}/changes
 ```
 
 Its JSON body is a strict projection of one `PeerReadChangesProofV1`. The

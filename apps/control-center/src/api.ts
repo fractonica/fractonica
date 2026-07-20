@@ -48,7 +48,7 @@ export interface NodeSnapshot {
 
 export interface PairingCapabilityTemplate {
   actions: Array<"appendOperation" | "readSpace" | "writeContent">;
-  schemas: Array<"record.v1">;
+  schemas: Array<"record" | "event" | "tag" | "profile">;
   visibilities: Array<"public" | "private">;
   contentRoles: string[];
   maxResourceByteLength?: number;
@@ -446,7 +446,7 @@ function createResolvingNodeClient(
       execute(async (connection, requestSignal) => {
         const [readinessValue, nodeValue] = await Promise.all([
           requestJson(fetcher, connection, "/health/ready", requestSignal),
-          requestJson(fetcher, connection, "/api/v1/node", requestSignal),
+          requestJson(fetcher, connection, "/api/node", requestSignal),
         ]);
         const readiness = decodeReadyResponse(readinessValue);
         const node = decodeNodeResponse(nodeValue);
@@ -462,7 +462,7 @@ function createResolvingNodeClient(
             await requestJson(
               fetcher,
               connection,
-              "/api/v2/pairing/invitations",
+              "/api/pairing/invitations",
               requestSignal,
               "POST",
               request,
@@ -477,7 +477,7 @@ function createResolvingNodeClient(
             await requestJson(
               fetcher,
               connection,
-              `/api/v2/pairing/invitations/${invitationId}`,
+              `/api/pairing/invitations/${invitationId}`,
               requestSignal,
             ),
           ),
@@ -490,7 +490,7 @@ function createResolvingNodeClient(
             await requestJson(
               fetcher,
               connection,
-              `/api/v2/pairing/invitations/${invitationId}/confirm`,
+              `/api/pairing/invitations/${invitationId}/confirm`,
               requestSignal,
               "POST",
               { confirmationOctal },
@@ -505,7 +505,7 @@ function createResolvingNodeClient(
             await requestJson(
               fetcher,
               connection,
-              `/api/v2/pairing/invitations/${invitationId}`,
+              `/api/pairing/invitations/${invitationId}`,
               requestSignal,
               "DELETE",
             ),

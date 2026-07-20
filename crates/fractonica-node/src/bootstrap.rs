@@ -89,7 +89,7 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
     let genesis = OperationEnvelope::sign(
         identity.space_id(),
         genesis_entity_id,
-        EntitySchema::SpaceGenesisV1,
+        EntitySchema::SpaceGenesis,
         Vec::new(),
         Vec::new(),
         trusted_current_unix_ms,
@@ -103,7 +103,7 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
     let initial_grant = OperationEnvelope::sign(
         identity.space_id(),
         grant_entity_id,
-        EntitySchema::CapabilityGrantV1,
+        EntitySchema::CapabilityGrant,
         Vec::new(),
         vec![genesis.operation_id],
         trusted_current_unix_ms,
@@ -116,11 +116,10 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
                     CapabilityAction::ReadSpace,
                 ],
                 schemas: vec![
-                    EntitySchema::EventV1,
-                    EntitySchema::ProfileV1,
-                    EntitySchema::RecordV1,
-                    EntitySchema::RecordV2,
-                    EntitySchema::TagV1,
+                    EntitySchema::Event,
+                    EntitySchema::Profile,
+                    EntitySchema::Record,
+                    EntitySchema::Tag,
                 ],
                 visibilities: vec![Visibility::Public, Visibility::Private],
                 content_roles: Vec::new(),
@@ -278,7 +277,7 @@ mod tests {
         assert_eq!(request.received_at_unix_ms, NOW);
         assert_eq!(request.genesis.space_id, identity.space_id());
         assert_eq!(request.genesis.entity_id, genesis_entity);
-        assert_eq!(request.genesis.schema, EntitySchema::SpaceGenesisV1);
+        assert_eq!(request.genesis.schema, EntitySchema::SpaceGenesis);
         assert_eq!(
             request.genesis.actor_id,
             identity.space_controller_actor_id()
@@ -297,10 +296,7 @@ mod tests {
         assert_eq!(request.initial_grant.space_id, identity.space_id());
         assert_eq!(request.initial_grant.entity_id, grant_entity);
         assert_ne!(request.initial_grant.entity_id, request.genesis.entity_id);
-        assert_eq!(
-            request.initial_grant.schema,
-            EntitySchema::CapabilityGrantV1
-        );
+        assert_eq!(request.initial_grant.schema, EntitySchema::CapabilityGrant);
         assert_eq!(
             request.initial_grant.actor_id,
             identity.space_controller_actor_id()
@@ -332,11 +328,10 @@ mod tests {
         assert_eq!(
             grant.schemas,
             vec![
-                EntitySchema::EventV1,
-                EntitySchema::ProfileV1,
-                EntitySchema::RecordV1,
-                EntitySchema::RecordV2,
-                EntitySchema::TagV1,
+                EntitySchema::Event,
+                EntitySchema::Profile,
+                EntitySchema::Record,
+                EntitySchema::Tag,
             ]
         );
         assert_eq!(

@@ -102,7 +102,7 @@ straight alpha in `R, G, B, A` order; it uses a fixed 4×4 coverage grid for
 deterministic antialiasing. The matching node endpoint is:
 
 ```text
-GET /api/v1/glyphs/{octal}/raster.rgba?depth=5&width=128&height=128
+GET /api/glyphs/{octal}/raster.rgba?depth=5&width=128&height=128
 ```
 
 It returns `application/vnd.fractonica.rgba8` plus width, height, stride, pixel
@@ -111,7 +111,7 @@ response headers. Use the geometry endpoint when a renderer needs to draw its
 own vector form:
 
 ```text
-GET /api/v1/glyphs/{octal}/geometry?depth=5
+GET /api/glyphs/{octal}/geometry?depth=5
 ```
 
 The JSON geometry response repeats the grammar and font identity and returns

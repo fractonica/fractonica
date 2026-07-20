@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-18
 - Implementation: Local trusted-space bootstrap, grant-chain evaluation, and
-  revocation admission are implemented for signed v2 operations. The QR
+  revocation admission are implemented for signed operations. The QR
   handshake, non-loopback transport, caller-authenticated `readSpace`, and
   space-authorized content transfer remain disabled.
 
@@ -30,7 +30,7 @@ It never transfers an existing actor or node private key.
 
 A new space is assigned 32 cryptographically random bytes and encoded as
 `space:<64 lowercase hex>`. Its first operation uses schema
-`space.genesis.v1`, has no causal parents or authorization references, and is
+`space.genesis`, has no causal parents or authorization references, and is
 signed by the initial controller actor named by its body. This is the only
 self-authorized operation form.
 
@@ -47,7 +47,7 @@ not turn the controller into an implicit signer for other actors.
 
 ### Capability grants
 
-`capability.grant.v1` is an immutable operation in the space it authorizes. Its
+`capability.grant` is an immutable operation in the space it authorizes. Its
 body names:
 
 - one subject `ActorId`;
@@ -59,14 +59,14 @@ body names:
 - a nonnegative delegation depth; and
 - a human-readable label that is descriptive only and never used for policy.
 
-Version 1 grants use enumerated actions and exact schema names; receivers MUST
+Grants use enumerated actions and exact schema names; receivers MUST
 reject unknown actions and MUST NOT interpret wildcards or name prefixes.
 Omitted scope means no authority for that dimension, not unlimited authority.
 An issuer may delegate only actions and limits it possesses, and a delegated
 grant must be no broader than the intersection of its complete issuer chain.
 Delegation depth decreases at every grant and cannot be reset by another actor.
 The locally anchored genesis controller is the one special root: it may issue
-any bounded v1 grant and revoke grants, but it has no ambient application-data
+any bounded grant and revoke grants, but it has no ambient application-data
 write authority.
 
 Every non-genesis signed operation carries a canonical, sorted
@@ -99,7 +99,7 @@ grant chain and MUST NOT be replicated as authority.
 
 ### Revocation and time
 
-`capability.revoke.v1` is a signed, authorized operation naming one exact grant
+`capability.revoke` is a signed, authorized operation naming one exact grant
 operation digest and a machine-readable reason. It never edits or deletes the
 grant. After a node accepts a revocation, it rejects later local admissions
 that rely on that grant. Previously admitted operations and their signatures

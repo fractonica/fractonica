@@ -63,7 +63,7 @@ pub const MAX_ENCRYPTED_PAYLOAD_BYTES: usize = 1_048_576;
 pub const MAX_CAPABILITY_SCHEMAS: usize = 32;
 /// Maximum number of content roles in one capability grant.
 pub const MAX_CAPABILITY_CONTENT_ROLES: usize = 64;
-/// Maximum delegation chain length permitted by a version 1 grant.
+/// Maximum delegation chain length permitted by a grant.
 pub const MAX_DELEGATION_DEPTH: u8 = 16;
 /// Maximum number of Unicode scalar values in a capability label.
 pub const MAX_CAPABILITY_LABEL_CHARS: usize = 128;
@@ -140,52 +140,48 @@ impl<'de> Deserialize<'de> for EntityId {
     }
 }
 
-/// Versioned schema interpreted by an operation body.
+/// Closed schema vocabulary interpreted by operation bodies.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum EntitySchema {
-    #[serde(rename = "event.v1")]
-    EventV1,
-    #[serde(rename = "profile.v1")]
-    ProfileV1,
-    #[serde(rename = "record.v1")]
-    RecordV1,
-    #[serde(rename = "record.v2")]
-    RecordV2,
-    #[serde(rename = "space.genesis.v1")]
-    SpaceGenesisV1,
-    #[serde(rename = "capability.grant.v1")]
-    CapabilityGrantV1,
-    #[serde(rename = "capability.revoke.v1")]
-    CapabilityRevokeV1,
-    #[serde(rename = "tag.v1")]
-    TagV1,
+    #[serde(rename = "event")]
+    Event,
+    #[serde(rename = "profile")]
+    Profile,
+    #[serde(rename = "record")]
+    Record,
+    #[serde(rename = "space.genesis")]
+    SpaceGenesis,
+    #[serde(rename = "capability.grant")]
+    CapabilityGrant,
+    #[serde(rename = "capability.revoke")]
+    CapabilityRevoke,
+    #[serde(rename = "tag")]
+    Tag,
 }
 
 impl EntitySchema {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::EventV1 => "event.v1",
-            Self::ProfileV1 => "profile.v1",
-            Self::RecordV1 => "record.v1",
-            Self::RecordV2 => "record.v2",
-            Self::SpaceGenesisV1 => "space.genesis.v1",
-            Self::CapabilityGrantV1 => "capability.grant.v1",
-            Self::CapabilityRevokeV1 => "capability.revoke.v1",
-            Self::TagV1 => "tag.v1",
+            Self::Event => "event",
+            Self::Profile => "profile",
+            Self::Record => "record",
+            Self::SpaceGenesis => "space.genesis",
+            Self::CapabilityGrant => "capability.grant",
+            Self::CapabilityRevoke => "capability.revoke",
+            Self::Tag => "tag",
         }
     }
 
     pub fn parse(value: &str) -> Result<Self, DataModelError> {
         match value {
-            "event.v1" => Ok(Self::EventV1),
-            "profile.v1" => Ok(Self::ProfileV1),
-            "record.v1" => Ok(Self::RecordV1),
-            "record.v2" => Ok(Self::RecordV2),
-            "space.genesis.v1" => Ok(Self::SpaceGenesisV1),
-            "capability.grant.v1" => Ok(Self::CapabilityGrantV1),
-            "capability.revoke.v1" => Ok(Self::CapabilityRevokeV1),
-            "tag.v1" => Ok(Self::TagV1),
+            "event" => Ok(Self::Event),
+            "profile" => Ok(Self::Profile),
+            "record" => Ok(Self::Record),
+            "space.genesis" => Ok(Self::SpaceGenesis),
+            "capability.grant" => Ok(Self::CapabilityGrant),
+            "capability.revoke" => Ok(Self::CapabilityRevoke),
+            "tag" => Ok(Self::Tag),
             _ => Err(DataModelError::UnsupportedSchema(value.to_owned())),
         }
     }
@@ -205,104 +201,9 @@ pub enum Visibility {
     Private,
 }
 
-/// Materialized contents written by a `put` operation for `record.v1`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RecordDocument {
-    pub start_at_unix_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_at_unix_ms: Option<i64>,
-    pub visibility: Visibility,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub emoji: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    pub metadata: BTreeMap<String, Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resources: Vec<ResourceRef>,
-}
-
-impl RecordDocument {
-    /// Validates all record, metadata, and resource bounds without external I/O.
-    pub fn validate(&self) -> Result<(), DataModelError> {
-        if self.start_at_unix_ms < 0 {
-            return Err(DataModelError::NegativeRecordStart(self.start_at_unix_ms));
-        }
-        if let Some(end) = self.end_at_unix_ms
-            && end < self.start_at_unix_ms
-        {
-            return Err(DataModelError::RecordEndBeforeStart {
-                start: self.start_at_unix_ms,
-                end,
-            });
-        }
-
-        if let Some(emoji) = &self.emoji {
-            let length = emoji.chars().count();
-            if length == 0 || length > MAX_EMOJI_CHARS || emoji.chars().any(char::is_control) {
-                return Err(DataModelError::InvalidEmoji {
-                    length,
-                    maximum: MAX_EMOJI_CHARS,
-                });
-            }
-        }
-
-        if let Some(text) = &self.text {
-            let length = text.chars().count();
-            if length > MAX_TEXT_CHARS {
-                return Err(DataModelError::TextTooLong {
-                    length,
-                    maximum: MAX_TEXT_CHARS,
-                });
-            }
-        }
-
-        if self.metadata.len() > MAX_METADATA_ENTRIES {
-            return Err(DataModelError::TooManyMetadataEntries {
-                count: self.metadata.len(),
-                maximum: MAX_METADATA_ENTRIES,
-            });
-        }
-        for (key, value) in &self.metadata {
-            validate_metadata_key(key)?;
-            validate_metadata_value(value, 1)?;
-        }
-
-        let encoded_size = serde_json::to_vec(&self.metadata)
-            .map_err(|error| DataModelError::MetadataSerialization(error.to_string()))?
-            .len();
-        if encoded_size > MAX_METADATA_JSON_BYTES {
-            return Err(DataModelError::MetadataTooLarge {
-                bytes: encoded_size,
-                maximum: MAX_METADATA_JSON_BYTES,
-            });
-        }
-
-        if self.resources.len() > MAX_RECORD_RESOURCES {
-            return Err(DataModelError::TooManyResources {
-                count: self.resources.len(),
-                maximum: MAX_RECORD_RESOURCES,
-            });
-        }
-        let mut content_ids = BTreeSet::new();
-        for (index, resource) in self.resources.iter().enumerate() {
-            resource
-                .validate()
-                .map_err(|source| DataModelError::InvalidResource { index, source })?;
-            if !content_ids.insert(resource.content_id) {
-                return Err(DataModelError::DuplicateResourceContentId(
-                    resource.content_id,
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ReferenceTargetV1 {
+pub enum ReferenceTarget {
     Actor {
         actor_id: ActorId,
     },
@@ -316,12 +217,12 @@ pub enum ReferenceTargetV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EntityReferenceV1 {
+pub struct EntityReference {
     pub relation: String,
-    pub target: ReferenceTargetV1,
+    pub target: ReferenceTarget,
 }
 
-impl EntityReferenceV1 {
+impl EntityReference {
     pub fn validate(&self) -> Result<(), DataModelError> {
         let valid_relation = !self.relation.is_empty()
             && self.relation.len() <= MAX_RELATION_BYTES
@@ -334,10 +235,10 @@ impl EntityReferenceV1 {
             return Err(DataModelError::InvalidRelation(self.relation.clone()));
         }
         match self.target {
-            ReferenceTargetV1::Actor { actor_id } => {
+            ReferenceTarget::Actor { actor_id } => {
                 actor_id.public_key()?;
             }
-            ReferenceTargetV1::Entity {
+            ReferenceTarget::Entity {
                 space_id,
                 entity_id,
                 ..
@@ -354,14 +255,14 @@ impl EntityReferenceV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum EncryptionAlgorithmV1 {
+pub enum EncryptionAlgorithm {
     Aes256Gcm,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EncryptedPayloadV1 {
-    pub algorithm: EncryptionAlgorithmV1,
+pub struct EncryptedPayload {
+    pub algorithm: EncryptionAlgorithm,
     /// `key:aes256:` plus 64 lowercase hexadecimal digits.
     pub key_id: String,
     /// Canonical unpadded base64url encoding of exactly 12 random bytes.
@@ -370,7 +271,7 @@ pub struct EncryptedPayloadV1 {
     pub ciphertext_base64url: String,
 }
 
-impl EncryptedPayloadV1 {
+impl EncryptedPayload {
     pub fn validate(&self) -> Result<(), DataModelError> {
         let key_hex = self
             .key_id
@@ -404,18 +305,18 @@ impl EncryptedPayloadV1 {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "visibility", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ProtectedDocumentV1<T> {
+pub enum ProtectedDocument<T> {
     Public {
         document: T,
     },
     Private {
-        envelope: EncryptedPayloadV1,
+        envelope: EncryptedPayload,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         resources: Vec<ResourceRef>,
     },
 }
 
-impl<T> ProtectedDocumentV1<T> {
+impl<T> ProtectedDocument<T> {
     #[must_use]
     pub const fn visibility(&self) -> Visibility {
         match self {
@@ -427,7 +328,7 @@ impl<T> ProtectedDocumentV1<T> {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RecordDocumentV2 {
+pub struct RecordDocument {
     pub start_at_unix_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_at_unix_ms: Option<i64>,
@@ -439,12 +340,12 @@ pub struct RecordDocumentV2 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<EntityReferenceV1>,
+    pub references: Vec<EntityReference>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TagDocumentV1 {
+pub struct TagDocument {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emoji: Option<String>,
@@ -454,12 +355,12 @@ pub struct TagDocumentV1 {
     pub color_hex: Option<String>,
     pub metadata: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<EntityReferenceV1>,
+    pub references: Vec<EntityReference>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EventDocumentV1 {
+pub struct EventDocument {
     pub start_at_unix_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_at_unix_ms: Option<i64>,
@@ -467,12 +368,12 @@ pub struct EventDocumentV1 {
     pub type_number: i64,
     pub metadata: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<EntityReferenceV1>,
+    pub references: Vec<EntityReference>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProfileDocumentV1 {
+pub struct ProfileDocument {
     pub handle: String,
     pub display_name: String,
     pub saros_anchor: u16,
@@ -484,7 +385,7 @@ pub struct ProfileDocumentV1 {
 #[must_use]
 pub fn profile_entity_id(actor_id: ActorId) -> EntityId {
     let mut digest = Sha256::new();
-    digest.update(b"fractonica-profile-entity-v1\0");
+    digest.update(b"fractonica-profile-entity\0");
     digest.update(actor_id.as_bytes());
     let mut bytes: [u8; 16] = digest.finalize()[..16]
         .try_into()
@@ -529,7 +430,7 @@ fn validate_metadata(values: &BTreeMap<String, Value>) -> Result<(), DataModelEr
     Ok(())
 }
 
-fn validate_references(references: &[EntityReferenceV1]) -> Result<(), DataModelError> {
+fn validate_references(references: &[EntityReference]) -> Result<(), DataModelError> {
     if references.len() > MAX_ENTITY_REFERENCES {
         return Err(DataModelError::TooManyEntityReferences {
             count: references.len(),
@@ -587,7 +488,7 @@ fn decode_canonical_base64url(value: &str) -> Option<Vec<u8>> {
     (URL_SAFE_NO_PAD.encode(&decoded) == value).then_some(decoded)
 }
 
-impl RecordDocumentV2 {
+impl RecordDocument {
     pub fn validate(&self) -> Result<(), DataModelError> {
         validate_client_times(self.start_at_unix_ms, self.end_at_unix_ms)?;
         if let Some(emoji) = &self.emoji {
@@ -607,7 +508,7 @@ impl RecordDocumentV2 {
     }
 }
 
-impl TagDocumentV1 {
+impl TagDocument {
     pub fn validate(&self) -> Result<(), DataModelError> {
         validate_bounded_label("tag name", &self.name, MAX_TAG_NAME_CHARS, false)?;
         if let Some(emoji) = &self.emoji {
@@ -628,7 +529,7 @@ impl TagDocumentV1 {
     }
 }
 
-impl EventDocumentV1 {
+impl EventDocument {
     pub fn validate(&self) -> Result<(), DataModelError> {
         validate_client_times(self.start_at_unix_ms, self.end_at_unix_ms)?;
         validate_bounded_label("event label", &self.label, MAX_EVENT_LABEL_CHARS, false)?;
@@ -637,7 +538,7 @@ impl EventDocumentV1 {
     }
 }
 
-impl ProfileDocumentV1 {
+impl ProfileDocument {
     pub fn validate(&self) -> Result<(), DataModelError> {
         let handle_valid = !self.handle.is_empty()
             && self.handle.len() <= MAX_PROFILE_HANDLE_BYTES
@@ -672,13 +573,13 @@ impl ProfileDocumentV1 {
 }
 
 fn validate_protected<T>(
-    payload: &ProtectedDocumentV1<T>,
+    payload: &ProtectedDocument<T>,
     validate_public: impl FnOnce(&T) -> Result<(), DataModelError>,
     allow_private_resources: bool,
 ) -> Result<(), DataModelError> {
     match payload {
-        ProtectedDocumentV1::Public { document } => validate_public(document),
-        ProtectedDocumentV1::Private {
+        ProtectedDocument::Public { document } => validate_public(document),
+        ProtectedDocument::Private {
             envelope,
             resources,
         } => {
@@ -779,7 +680,7 @@ pub enum CapabilityAction {
     WriteContent,
 }
 
-/// Bounded capability statement carried by `capability.grant.v1`.
+/// Bounded capability statement carried by `capability.grant`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityGrant {
@@ -862,11 +763,10 @@ impl CapabilityGrant {
         let visibility_scoped = self.schemas.iter().any(|schema| {
             matches!(
                 schema,
-                EntitySchema::RecordV1
-                    | EntitySchema::RecordV2
-                    | EntitySchema::TagV1
-                    | EntitySchema::EventV1
-                    | EntitySchema::ProfileV1
+                EntitySchema::Record
+                    | EntitySchema::Tag
+                    | EntitySchema::Event
+                    | EntitySchema::Profile
             )
         });
         if visibility_scoped != !self.visibilities.is_empty() {
@@ -906,7 +806,7 @@ pub enum CapabilityRevocationReason {
     Administrative,
 }
 
-/// Bounded revocation carried by `capability.revoke.v1`.
+/// Bounded revocation carried by `capability.revoke`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityRevocation {
@@ -934,20 +834,17 @@ impl CapabilityRevocation {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum OperationBody {
-    Put {
-        document: RecordDocument,
+    PutRecord {
+        payload: ProtectedDocument<RecordDocument>,
     },
-    PutRecordV2 {
-        payload: ProtectedDocumentV1<RecordDocumentV2>,
+    PutTag {
+        payload: ProtectedDocument<TagDocument>,
     },
-    PutTagV1 {
-        payload: ProtectedDocumentV1<TagDocumentV1>,
+    PutEvent {
+        payload: ProtectedDocument<EventDocument>,
     },
-    PutEventV1 {
-        payload: ProtectedDocumentV1<EventDocumentV1>,
-    },
-    PutProfileV1 {
-        document: ProfileDocumentV1,
+    PutProfile {
+        document: ProfileDocument,
     },
     Tombstone,
     SpaceGenesis {
@@ -965,11 +862,10 @@ impl OperationBody {
     #[must_use]
     pub const fn declared_visibility(&self) -> Option<Visibility> {
         match self {
-            Self::Put { document } => Some(document.visibility),
-            Self::PutRecordV2 { payload } => Some(payload.visibility()),
-            Self::PutTagV1 { payload } => Some(payload.visibility()),
-            Self::PutEventV1 { payload } => Some(payload.visibility()),
-            Self::PutProfileV1 { .. } => Some(Visibility::Public),
+            Self::PutRecord { payload } => Some(payload.visibility()),
+            Self::PutTag { payload } => Some(payload.visibility()),
+            Self::PutEvent { payload } => Some(payload.visibility()),
+            Self::PutProfile { .. } => Some(Visibility::Public),
             _ => None,
         }
     }
@@ -977,12 +873,11 @@ impl OperationBody {
     #[must_use]
     pub fn resources(&self) -> &[ResourceRef] {
         match self {
-            Self::Put { document } => &document.resources,
-            Self::PutRecordV2 { payload } => match payload {
-                ProtectedDocumentV1::Public { document } => &document.resources,
-                ProtectedDocumentV1::Private { resources, .. } => resources,
+            Self::PutRecord { payload } => match payload {
+                ProtectedDocument::Public { document } => &document.resources,
+                ProtectedDocument::Private { resources, .. } => resources,
             },
-            Self::PutProfileV1 { document } => document.avatar.as_slice(),
+            Self::PutProfile { document } => document.avatar.as_slice(),
             _ => &[],
         }
     }
@@ -995,40 +890,38 @@ impl OperationBody {
         causal_parents: &[OperationId],
         authorization: &[OperationId],
     ) -> Result<(), DataModelError> {
-        if schema != EntitySchema::SpaceGenesisV1 && authorization.is_empty() {
+        if schema != EntitySchema::SpaceGenesis && authorization.is_empty() {
             return Err(DataModelError::MissingAuthorization);
         }
         match (schema, self) {
-            (EntitySchema::RecordV1, Self::Put { document }) => document.validate(),
-            (EntitySchema::RecordV2, Self::PutRecordV2 { payload }) => {
-                validate_protected(payload, RecordDocumentV2::validate, true)
+            (EntitySchema::Record, Self::PutRecord { payload }) => {
+                validate_protected(payload, RecordDocument::validate, true)
             }
-            (EntitySchema::TagV1, Self::PutTagV1 { payload }) => {
-                validate_protected(payload, TagDocumentV1::validate, false)
+            (EntitySchema::Tag, Self::PutTag { payload }) => {
+                validate_protected(payload, TagDocument::validate, false)
             }
-            (EntitySchema::EventV1, Self::PutEventV1 { payload }) => {
-                validate_protected(payload, EventDocumentV1::validate, false)
+            (EntitySchema::Event, Self::PutEvent { payload }) => {
+                validate_protected(payload, EventDocument::validate, false)
             }
-            (EntitySchema::ProfileV1, Self::PutProfileV1 { document }) => {
+            (EntitySchema::Profile, Self::PutProfile { document }) => {
                 if entity_id != profile_entity_id(actor_id) {
                     return Err(DataModelError::ProfileEntityMismatch);
                 }
                 document.validate()
             }
             (
-                EntitySchema::RecordV1
-                | EntitySchema::RecordV2
-                | EntitySchema::TagV1
-                | EntitySchema::EventV1
-                | EntitySchema::ProfileV1,
+                EntitySchema::Record
+                | EntitySchema::Tag
+                | EntitySchema::Event
+                | EntitySchema::Profile,
                 Self::Tombstone,
             ) => {
-                if schema == EntitySchema::ProfileV1 && entity_id != profile_entity_id(actor_id) {
+                if schema == EntitySchema::Profile && entity_id != profile_entity_id(actor_id) {
                     return Err(DataModelError::ProfileEntityMismatch);
                 }
                 Ok(())
             }
-            (EntitySchema::SpaceGenesisV1, Self::SpaceGenesis { controller }) => {
+            (EntitySchema::SpaceGenesis, Self::SpaceGenesis { controller }) => {
                 controller.public_key()?;
                 if *controller != actor_id {
                     return Err(DataModelError::GenesisControllerMismatch {
@@ -1041,8 +934,8 @@ impl OperationBody {
                 }
                 Ok(())
             }
-            (EntitySchema::CapabilityGrantV1, Self::CapabilityGrant { grant }) => grant.validate(),
-            (EntitySchema::CapabilityRevokeV1, Self::CapabilityRevoke { revocation }) => {
+            (EntitySchema::CapabilityGrant, Self::CapabilityGrant { grant }) => grant.validate(),
+            (EntitySchema::CapabilityRevoke, Self::CapabilityRevoke { revocation }) => {
                 revocation.validate()
             }
             _ => Err(DataModelError::SchemaBodyMismatch { schema }),
@@ -1053,7 +946,7 @@ impl OperationBody {
 /// Strict JSON projection of one authoritative signed operation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SignedOperationEnvelope {
+pub struct OperationEnvelope {
     pub protocol_version: u16,
     pub operation_id: OperationId,
     pub space_id: SpaceId,
@@ -1070,11 +963,8 @@ pub struct SignedOperationEnvelope {
     pub cose_sign1: Vec<u8>,
 }
 
-/// Compatibility name for the version 2 signed envelope within this crate.
-pub type OperationEnvelope = SignedOperationEnvelope;
-
-impl SignedOperationEnvelope {
-    /// Builds, signs, verifies, and projects one version 2 operation.
+impl OperationEnvelope {
+    /// Builds, signs, verifies, and projects one operation.
     #[allow(clippy::too_many_arguments)]
     pub fn sign(
         space_id: SpaceId,
@@ -1253,7 +1143,7 @@ pub struct EntityReducer {
     space_id: SpaceId,
     entity_id: EntityId,
     schema: EntitySchema,
-    operations: BTreeMap<OperationId, SignedOperationEnvelope>,
+    operations: BTreeMap<OperationId, OperationEnvelope>,
     heads: BTreeSet<OperationId>,
 }
 
@@ -1270,7 +1160,7 @@ impl EntityReducer {
     }
 
     /// Verifies and applies one operation after all parents have been applied.
-    pub fn apply(&mut self, operation: SignedOperationEnvelope) -> Result<(), DataModelError> {
+    pub fn apply(&mut self, operation: OperationEnvelope) -> Result<(), DataModelError> {
         operation.verify()?;
         if operation.space_id != self.space_id {
             return Err(DataModelError::ForeignSpace {
@@ -1353,7 +1243,7 @@ pub fn reduce_entity(
     space_id: SpaceId,
     entity_id: EntityId,
     schema: EntitySchema,
-    operations: impl IntoIterator<Item = SignedOperationEnvelope>,
+    operations: impl IntoIterator<Item = OperationEnvelope>,
 ) -> Result<ReducedEntity, DataModelError> {
     let mut reducer = EntityReducer::new(space_id, entity_id, schema);
     for operation in operations {

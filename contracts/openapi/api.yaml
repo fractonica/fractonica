@@ -1,18 +1,16 @@
 openapi: 3.1.0
 info:
   title: Fractonica Node API
-  version: 2.0.0
+  version: 1.0.0
   license:
     name: AGPL-3.0-or-later
     url: https://www.gnu.org/licenses/agpl-3.0.html
   description: >-
-    Version 2 of the loopback Fractonica node API. Stateful operations are
+    The loopback Fractonica node API. Stateful operations are
     immutable, digest-addressed, Ed25519-authored COSE Sign1 objects scoped to
     one authorization space. JSON is a strict projection of the signed
     deterministic-CBOR payload; it is never the signed representation. The
-    `saros` profile remains stateless and continues to use the v1 temporal and
-    glyph routes. Existing tus and blob-transfer routes also remain v1 until
-    space capability enforcement is implemented. This contract defines no
+    `saros` profile remains stateless. This contract defines no
     generic signing endpoint: clients retain their private keys and submit
     complete signed operations.
     When this contract is served by a running node, its top-level `security`
@@ -22,6 +20,8 @@ servers:
   - url: http://127.0.0.1:8789
     description: Local node
 tags:
+  - name: Client
+    description: Rebuildable record, event, tag, profile, and statistics projections.
   - name: Operations
     description: Signed, space-scoped causal operation admission and reads.
   - name: Pairing
@@ -31,7 +31,7 @@ tags:
 security:
   - bootstrapBearer: []
 paths:
-  /api/v2/spaces/{spaceId}/operations:
+  /api/spaces/{spaceId}/operations:
     post:
       tags: [Operations]
       summary: Admit a complete signed operation
@@ -43,7 +43,7 @@ paths:
         `spaceId` values must be identical. Replaying the same valid operation
         is idempotent without an Idempotency-Key. The server never signs on a
         client's behalf.
-      operationId: admitSignedOperationV2
+      operationId: admitSignedOperation
       parameters:
         - $ref: "#/components/parameters/SpaceId"
       requestBody:
@@ -51,14 +51,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/AdmissibleSignedOperationV2"
+              $ref: "#/components/schemas/AdmissibleSignedOperation"
       responses:
         "201":
           description: The signed operation was admitted for the first time.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StoredSignedOperationV2"
+                $ref: "#/components/schemas/StoredSignedOperation"
         "200":
           description: >-
             The exact operation digest was already admitted; the original
@@ -66,7 +66,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StoredSignedOperationV2"
+                $ref: "#/components/schemas/StoredSignedOperation"
         "400":
           $ref: "#/components/responses/MalformedSignedOperation"
         "413":
@@ -83,7 +83,7 @@ paths:
           $ref: "#/components/responses/UnverifiableSignedOperation"
         "503":
           $ref: "#/components/responses/ProfileUnavailable"
-  /api/v2/spaces/{spaceId}/operations/{operationId}:
+  /api/spaces/{spaceId}/operations/{operationId}:
     get:
       tags: [Operations]
       summary: Read one admitted signed operation
@@ -91,7 +91,7 @@ paths:
         Local control-plane read, optionally protected by the node-wide
         loopback bearer token. It does not evaluate `readSpace`; authenticated
         peer/session reads are reserved for a later protocol.
-      operationId: getSignedOperationV2
+      operationId: getSignedOperation
       parameters:
         - $ref: "#/components/parameters/SpaceId"
         - $ref: "#/components/parameters/OperationId"
@@ -101,7 +101,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StoredSignedOperationV2"
+                $ref: "#/components/schemas/StoredSignedOperation"
         "401":
           $ref: "#/components/responses/TransportUnauthorized"
         "404":
@@ -110,7 +110,7 @@ paths:
           $ref: "#/components/responses/InvalidPathIdentifier"
         "503":
           $ref: "#/components/responses/ProfileUnavailable"
-  /api/v2/spaces/{spaceId}/entities/{entityId}:
+  /api/spaces/{spaceId}/entities/{entityId}:
     get:
       tags: [Operations]
       summary: Resolve the current causal heads of one entity in one space
@@ -119,7 +119,7 @@ paths:
         An entity identifier in another space is never consulted. This is a
         local control-plane read, optionally protected by the node-wide
         loopback bearer token; it is not peer capability authorization.
-      operationId: getSpaceEntityV2
+      operationId: getSpaceEntity
       parameters:
         - $ref: "#/components/parameters/SpaceId"
         - $ref: "#/components/parameters/EntityId"
@@ -129,7 +129,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/EntityStateV2"
+                $ref: "#/components/schemas/EntityState"
         "401":
           $ref: "#/components/responses/TransportUnauthorized"
         "404":
@@ -138,7 +138,7 @@ paths:
           $ref: "#/components/responses/InvalidPathIdentifier"
         "503":
           $ref: "#/components/responses/ProfileUnavailable"
-  /api/v2/spaces/{spaceId}/changes:
+  /api/spaces/{spaceId}/changes:
     get:
       tags: [Operations]
       summary: Read an incremental page of admitted space operations
@@ -149,7 +149,7 @@ paths:
         local control-plane read, optionally protected by the node-wide
         loopback bearer token. Paired actors use the separate peer endpoint,
         which evaluates `readSpace` and consumes a durable replay nonce.
-      operationId: listSpaceChangesV2
+      operationId: listSpaceChanges
       parameters:
         - $ref: "#/components/parameters/SpaceId"
         - $ref: "#/components/parameters/ChangesAfter"
@@ -160,7 +160,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/OperationPageV2"
+                $ref: "#/components/schemas/OperationPage"
         "401":
           $ref: "#/components/responses/TransportUnauthorized"
         "404":
@@ -169,11 +169,86 @@ paths:
           $ref: "#/components/responses/InvalidPathIdentifier"
         "503":
           $ref: "#/components/responses/ProfileUnavailable"
-  /api/v2/peer/spaces/{spaceId}/changes:
+  /api/spaces/{spaceId}/records:
+    get:
+      tags: [Client]
+      summary: List current record heads in descending start-time order
+      operationId: listRecords
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+        - $ref: "#/components/parameters/ClientLimit"
+        - $ref: "#/components/parameters/CursorSortNumber"
+        - $ref: "#/components/parameters/CursorEntityId"
+        - $ref: "#/components/parameters/CursorOperationId"
+      responses:
+        "200": { description: Bounded current record page, content: { application/json: { schema: { $ref: "#/components/schemas/ClientEntityPage" } } } }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/SpaceNotFound" }
+        "422": { $ref: "#/components/responses/InvalidPathIdentifier" }
+  /api/spaces/{spaceId}/events:
+    get:
+      tags: [Client]
+      summary: List current event heads in descending start-time order
+      operationId: listEvents
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+        - $ref: "#/components/parameters/ClientLimit"
+        - $ref: "#/components/parameters/CursorSortNumber"
+        - $ref: "#/components/parameters/CursorEntityId"
+        - $ref: "#/components/parameters/CursorOperationId"
+      responses:
+        "200": { description: Bounded current event page, content: { application/json: { schema: { $ref: "#/components/schemas/ClientEntityPage" } } } }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/SpaceNotFound" }
+        "422": { $ref: "#/components/responses/InvalidPathIdentifier" }
+  /api/spaces/{spaceId}/tags:
+    get:
+      tags: [Client]
+      summary: List current tag heads in normalized-name order
+      operationId: listTags
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+        - $ref: "#/components/parameters/ClientLimit"
+        - $ref: "#/components/parameters/CursorSortText"
+        - $ref: "#/components/parameters/CursorEntityId"
+        - $ref: "#/components/parameters/CursorOperationId"
+      responses:
+        "200": { description: Bounded current tag page, content: { application/json: { schema: { $ref: "#/components/schemas/ClientEntityPage" } } } }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/SpaceNotFound" }
+        "422": { $ref: "#/components/responses/InvalidPathIdentifier" }
+  /api/spaces/{spaceId}/profiles:
+    get:
+      tags: [Client]
+      summary: List current profiles in handle order
+      operationId: listProfiles
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+        - $ref: "#/components/parameters/ClientLimit"
+        - $ref: "#/components/parameters/CursorSortText"
+        - $ref: "#/components/parameters/CursorEntityId"
+        - $ref: "#/components/parameters/CursorOperationId"
+      responses:
+        "200": { description: Bounded current profile page, content: { application/json: { schema: { $ref: "#/components/schemas/ClientEntityPage" } } } }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/SpaceNotFound" }
+        "422": { $ref: "#/components/responses/InvalidPathIdentifier" }
+  /api/spaces/{spaceId}/stats:
+    get:
+      tags: [Client]
+      summary: Read current client entity and media totals
+      operationId: getClientStats
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+      responses:
+        "200": { description: Current projection totals, content: { application/json: { schema: { $ref: "#/components/schemas/ClientStats" } } } }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/SpaceNotFound" }
+  /api/peer/spaces/{spaceId}/changes:
     post:
       tags: [Peer]
       summary: Read an incremental page using a paired actor proof
-      operationId: listPairedSpaceChangesV2
+      operationId: listPairedSpaceChanges
       security: []
       description: >-
         Verifies node and actor signatures over one canonical request bound to
@@ -189,22 +264,22 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/PeerReadChangesRequestV1" }
+            schema: { $ref: "#/components/schemas/PeerReadChangesRequest" }
       responses:
         "200":
           description: A bounded page read under the paired actor's current grant.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/OperationPageV2" }
+              schema: { $ref: "#/components/schemas/OperationPage" }
         "400": { $ref: "#/components/responses/MalformedPeerRequest" }
         "403": { $ref: "#/components/responses/PeerUnauthorized" }
         "413": { $ref: "#/components/responses/PeerRequestTooLarge" }
         "503": { $ref: "#/components/responses/ProfileUnavailable" }
-  /api/v2/pairing/invitations:
+  /api/pairing/invitations:
     post:
       tags: [Pairing]
       summary: Create a short-lived pairing invitation
-      operationId: createPairingInvitationV1
+      operationId: createPairingInvitation
       requestBody:
         required: true
         content:
@@ -222,13 +297,13 @@ paths:
         "401": { $ref: "#/components/responses/TransportUnauthorized" }
         "413": { $ref: "#/components/responses/PairingTooLarge" }
         "503": { $ref: "#/components/responses/ProfileUnavailable" }
-  /api/v2/pairing/invitations/{invitationId}:
+  /api/pairing/invitations/{invitationId}:
     parameters:
       - $ref: "#/components/parameters/InvitationId"
     get:
       tags: [Pairing]
       summary: Inspect non-secret pairing state
-      operationId: getPairingInvitationV1
+      operationId: getPairingInvitation
       responses:
         "200":
           description: Current durable lifecycle projection.
@@ -241,7 +316,7 @@ paths:
     delete:
       tags: [Pairing]
       summary: Cancel an unconfirmed pairing invitation
-      operationId: cancelPairingInvitationV1
+      operationId: cancelPairingInvitation
       responses:
         "200":
           description: Invitation is durably cancelled before secret deletion.
@@ -251,11 +326,11 @@ paths:
         "401": { $ref: "#/components/responses/TransportUnauthorized" }
         "404": { $ref: "#/components/responses/PairingNotFound" }
         "410": { $ref: "#/components/responses/PairingUnavailable" }
-  /api/v2/pairing/handshake:
+  /api/pairing/handshake:
     post:
       tags: [Pairing]
       summary: Consume an invitation with the first Noise handshake frame
-      operationId: claimPairingInvitationV1
+      operationId: claimPairingInvitation
       security: []
       description: >-
         This route intentionally bypasses the bootstrap bearer. Authentication
@@ -277,11 +352,11 @@ paths:
         "410": { $ref: "#/components/responses/PairingUnavailable" }
         "413": { $ref: "#/components/responses/PairingTooLarge" }
         "503": { $ref: "#/components/responses/ProfileUnavailable" }
-  /api/v2/pairing/invitations/{invitationId}/confirm:
+  /api/pairing/invitations/{invitationId}/confirm:
     post:
       tags: [Pairing]
       summary: Confirm the transcript and issue the requested capability
-      operationId: confirmPairingInvitationV1
+      operationId: confirmPairingInvitation
       parameters:
         - $ref: "#/components/parameters/InvitationId"
       requestBody:
@@ -354,6 +429,31 @@ components:
         minimum: 1
         maximum: 200
         default: 100
+    ClientLimit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    CursorSortNumber:
+      name: sortNumber
+      in: query
+      required: false
+      schema: { type: integer, format: int64 }
+    CursorSortText:
+      name: sortText
+      in: query
+      required: false
+      schema: { type: string }
+    CursorEntityId:
+      name: entityId
+      in: query
+      required: false
+      schema: { $ref: "#/components/schemas/EntityId" }
+    CursorOperationId:
+      name: operationId
+      in: query
+      required: false
+      schema: { $ref: "#/components/schemas/OperationId" }
     InvitationId:
       name: invitationId
       in: path
@@ -514,14 +614,13 @@ components:
     EntitySchema:
       type: string
       enum:
-        - event.v1
-        - profile.v1
-        - record.v1
-        - record.v2
-        - space.genesis.v1
-        - capability.grant.v1
-        - capability.revoke.v1
-        - tag.v1
+        - event
+        - profile
+        - record
+        - space.genesis
+        - capability.grant
+        - capability.revoke
+        - tag
       pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
       description: Exact bounded schema codec known to this protocol version.
     OperationNonce:
@@ -540,7 +639,7 @@ components:
         The protected header is exactly `{1: -8}`, the unprotected header is
         empty, payload is embedded deterministic operation CBOR, signature is
         64-byte Ed25519, and external AAD is empty.
-    SignedOperationV2:
+    SignedOperation:
       type: object
       additionalProperties: false
       required:
@@ -559,7 +658,7 @@ components:
       properties:
         protocolVersion:
           type: integer
-          const: 2
+          const: 1
         operationId:
           $ref: "#/components/schemas/OperationId"
         spaceId:
@@ -585,7 +684,7 @@ components:
           uniqueItems: true
           description: >-
             Grant-operation IDs sorted strictly by raw digest bytes. Empty is
-            valid only for the locally anchored `space.genesis.v1` bootstrap.
+            valid only for the locally anchored `space.genesis` bootstrap.
           items:
             $ref: "#/components/schemas/OperationId"
         occurredAtUnixMs:
@@ -603,14 +702,14 @@ components:
         Complete JSON projection of one signed operation. Every field other
         than `operationId` and `coseSign1` is projected from the embedded
         unsigned payload. The server rejects any projection/payload mismatch.
-    AdmissibleSignedOperationV2:
+    AdmissibleSignedOperation:
       allOf:
-        - $ref: "#/components/schemas/SignedOperationV2"
+        - $ref: "#/components/schemas/SignedOperation"
         - not:
             required: [schema]
             properties:
               schema:
-                const: space.genesis.v1
+                const: space.genesis
       description: >-
         Signed operation accepted at the HTTP admission boundary. Space
         genesis is excluded because a node creates and anchors it only during
@@ -618,31 +717,20 @@ components:
         by a remote or control-plane POST.
     CanonicalBodyProjection:
       oneOf:
-        - $ref: "#/components/schemas/RecordPutBodyV1"
-        - $ref: "#/components/schemas/RecordPutBodyV2"
-        - $ref: "#/components/schemas/TagPutBodyV1"
-        - $ref: "#/components/schemas/EventPutBodyV1"
-        - $ref: "#/components/schemas/ProfilePutBodyV1"
-        - $ref: "#/components/schemas/RecordTombstoneBodyV1"
-        - $ref: "#/components/schemas/SpaceGenesisBodyV1"
-        - $ref: "#/components/schemas/CapabilityGrantBodyV1"
-        - $ref: "#/components/schemas/CapabilityRevokeBodyV1"
+        - $ref: "#/components/schemas/RecordPutBody"
+        - $ref: "#/components/schemas/TagPutBody"
+        - $ref: "#/components/schemas/EventPutBody"
+        - $ref: "#/components/schemas/ProfilePutBody"
+        - $ref: "#/components/schemas/TombstoneBody"
+        - $ref: "#/components/schemas/SpaceGenesisBody"
+        - $ref: "#/components/schemas/CapabilityGrantBody"
+        - $ref: "#/components/schemas/CapabilityRevokeBody"
       description: >-
         Exact schema-defined JSON projection of canonical CBOR. The selected
         body variant must agree with the outer `schema`; the server also
         enforces canonical set ordering, metadata nesting and encoded-size
         bounds which JSON Schema cannot fully express.
-    RecordPutBodyV1:
-      type: object
-      additionalProperties: false
-      required: [kind, document]
-      properties:
-        kind:
-          type: string
-          const: put
-        document:
-          $ref: "#/components/schemas/RecordDocumentV1"
-    RecordTombstoneBodyV1:
+    TombstoneBody:
       type: object
       additionalProperties: false
       required: [kind]
@@ -650,44 +738,44 @@ components:
         kind:
           type: string
           const: tombstone
-    RecordPutBodyV2:
+    RecordPutBody:
       type: object
       additionalProperties: false
       required: [kind, payload]
       properties:
-        kind: { type: string, const: putRecordV2 }
+        kind: { type: string, const: putRecord }
         payload:
           oneOf:
-            - $ref: "#/components/schemas/PublicRecordPayloadV2"
-            - $ref: "#/components/schemas/PrivatePayloadV1"
-    TagPutBodyV1:
+            - $ref: "#/components/schemas/PublicRecordPayload"
+            - $ref: "#/components/schemas/PrivatePayload"
+    TagPutBody:
       type: object
       additionalProperties: false
       required: [kind, payload]
       properties:
-        kind: { type: string, const: putTagV1 }
+        kind: { type: string, const: putTag }
         payload:
           oneOf:
-            - $ref: "#/components/schemas/PublicTagPayloadV1"
-            - $ref: "#/components/schemas/PrivatePayloadV1"
-    EventPutBodyV1:
+            - $ref: "#/components/schemas/PublicTagPayload"
+            - $ref: "#/components/schemas/PrivatePayload"
+    EventPutBody:
       type: object
       additionalProperties: false
       required: [kind, payload]
       properties:
-        kind: { type: string, const: putEventV1 }
+        kind: { type: string, const: putEvent }
         payload:
           oneOf:
-            - $ref: "#/components/schemas/PublicEventPayloadV1"
-            - $ref: "#/components/schemas/PrivatePayloadV1"
-    ProfilePutBodyV1:
+            - $ref: "#/components/schemas/PublicEventPayload"
+            - $ref: "#/components/schemas/PrivatePayload"
+    ProfilePutBody:
       type: object
       additionalProperties: false
       required: [kind, document]
       properties:
-        kind: { type: string, const: putProfileV1 }
-        document: { $ref: "#/components/schemas/ProfileDocumentV1" }
-    SpaceGenesisBodyV1:
+        kind: { type: string, const: putProfile }
+        document: { $ref: "#/components/schemas/ProfileDocument" }
+    SpaceGenesisBody:
       type: object
       additionalProperties: false
       required: [kind, controller]
@@ -697,7 +785,7 @@ components:
           const: spaceGenesis
         controller:
           $ref: "#/components/schemas/ActorId"
-    CapabilityGrantBodyV1:
+    CapabilityGrantBody:
       type: object
       additionalProperties: false
       required: [kind, grant]
@@ -706,8 +794,8 @@ components:
           type: string
           const: capabilityGrant
         grant:
-          $ref: "#/components/schemas/CapabilityGrantV1"
-    CapabilityRevokeBodyV1:
+          $ref: "#/components/schemas/CapabilityGrant"
+    CapabilityRevokeBody:
       type: object
       additionalProperties: false
       required: [kind, revocation]
@@ -716,88 +804,42 @@ components:
           type: string
           const: capabilityRevoke
         revocation:
-          $ref: "#/components/schemas/CapabilityRevocationV1"
-    RecordDocumentV1:
-      type: object
-      additionalProperties: false
-      required: [startAtUnixMs, visibility, metadata]
-      properties:
-        startAtUnixMs:
-          type: integer
-          format: int64
-          minimum: 0
-        endAtUnixMs:
-          type: integer
-          format: int64
-          minimum: 0
-          description: Must be greater than or equal to `startAtUnixMs`.
-        visibility:
-          $ref: "#/components/schemas/Visibility"
-          description: >-
-            Fixed by the entity's initial put. Revisions must retain it and a
-            tombstone is authorized against the inherited visibility.
-        emoji:
-          type: string
-          minLength: 1
-          maxLength: 32
-          description: Non-control Unicode label.
-        text:
-          type: string
-          maxLength: 262144
-        metadata:
-          type: object
-          maxProperties: 128
-          propertyNames:
-            $ref: "#/components/schemas/MetadataKeyV1"
-          additionalProperties:
-            $ref: "#/components/schemas/MetadataValueV1"
-          description: >-
-            JSON metadata bounded at runtime to 64 KiB encoded, 16 levels,
-            256 entries per nested container, 128-character non-control keys,
-            and 16,384-character strings. The depth and aggregate encoded-size
-            limits are additionally enforced after JSON decoding.
-        resources:
-          type: array
-          maxItems: 64
-          uniqueItems: true
-          description: Content IDs must also be unique across the array.
-          items:
-            $ref: "#/components/schemas/ResourceRefV1"
-    PublicRecordPayloadV2:
+          $ref: "#/components/schemas/CapabilityRevocation"
+    PublicRecordPayload:
       type: object
       additionalProperties: false
       required: [visibility, document]
       properties:
         visibility: { type: string, const: public }
-        document: { $ref: "#/components/schemas/RecordDocumentV2" }
-    PublicTagPayloadV1:
+        document: { $ref: "#/components/schemas/RecordDocument" }
+    PublicTagPayload:
       type: object
       additionalProperties: false
       required: [visibility, document]
       properties:
         visibility: { type: string, const: public }
-        document: { $ref: "#/components/schemas/TagDocumentV1" }
-    PublicEventPayloadV1:
+        document: { $ref: "#/components/schemas/TagDocument" }
+    PublicEventPayload:
       type: object
       additionalProperties: false
       required: [visibility, document]
       properties:
         visibility: { type: string, const: public }
-        document: { $ref: "#/components/schemas/EventDocumentV1" }
-    PrivatePayloadV1:
+        document: { $ref: "#/components/schemas/EventDocument" }
+    PrivatePayload:
       type: object
       additionalProperties: false
       required: [visibility, envelope]
       properties:
         visibility: { type: string, const: private }
-        envelope: { $ref: "#/components/schemas/EncryptedPayloadV1" }
+        envelope: { $ref: "#/components/schemas/EncryptedPayload" }
         resources:
           type: array
           maxItems: 64
           uniqueItems: true
-          items: { $ref: "#/components/schemas/ResourceRefV1" }
+          items: { $ref: "#/components/schemas/ResourceRef" }
           description: Opaque encrypted descriptors; tags and events require an empty array.
-    EncryptedPayloadV1:
+    EncryptedPayload:
       type: object
       additionalProperties: false
       required: [algorithm, keyId, nonceBase64url, ciphertextBase64url]
@@ -810,7 +852,7 @@ components:
           minLength: 22
           maxLength: 1398102
           pattern: '^[A-Za-z0-9_-]+$'
-    EntityReferenceV1:
+    EntityReference:
       type: object
       additionalProperties: false
       required: [relation, target]
@@ -818,16 +860,16 @@ components:
         relation: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9._-]+$' }
         target:
           oneOf:
-            - $ref: "#/components/schemas/ActorReferenceTargetV1"
-            - $ref: "#/components/schemas/EntityReferenceTargetV1"
-    ActorReferenceTargetV1:
+            - $ref: "#/components/schemas/ActorReferenceTarget"
+            - $ref: "#/components/schemas/EntityReferenceTarget"
+    ActorReferenceTarget:
       type: object
       additionalProperties: false
       required: [kind, actorId]
       properties:
         kind: { type: string, const: actor }
         actorId: { $ref: "#/components/schemas/ActorId" }
-    EntityReferenceTargetV1:
+    EntityReferenceTarget:
       type: object
       additionalProperties: false
       required: [kind, spaceId, entityId]
@@ -836,7 +878,7 @@ components:
         spaceId: { $ref: "#/components/schemas/SpaceId" }
         entityId: { $ref: "#/components/schemas/EntityId" }
         operationId: { $ref: "#/components/schemas/OperationId" }
-    RecordDocumentV2:
+    RecordDocument:
       type: object
       additionalProperties: false
       required: [startAtUnixMs, metadata]
@@ -848,18 +890,18 @@ components:
         metadata:
           type: object
           maxProperties: 128
-          additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" }
+          additionalProperties: { $ref: "#/components/schemas/MetadataValue" }
         resources:
           type: array
           maxItems: 64
           uniqueItems: true
-          items: { $ref: "#/components/schemas/ResourceRefV1" }
+          items: { $ref: "#/components/schemas/ResourceRef" }
         references:
           type: array
           maxItems: 256
           uniqueItems: true
-          items: { $ref: "#/components/schemas/EntityReferenceV1" }
-    TagDocumentV1:
+          items: { $ref: "#/components/schemas/EntityReference" }
+    TagDocument:
       type: object
       additionalProperties: false
       required: [name, metadata]
@@ -868,9 +910,9 @@ components:
         emoji: { type: string, minLength: 1, maxLength: 32 }
         notes: { type: string, maxLength: 262144 }
         colorHex: { type: string, pattern: '^#[0-9A-Fa-f]{6}$' }
-        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" } }
-        references: { type: array, maxItems: 256, uniqueItems: true, items: { $ref: "#/components/schemas/EntityReferenceV1" } }
-    EventDocumentV1:
+        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValue" } }
+        references: { type: array, maxItems: 256, uniqueItems: true, items: { $ref: "#/components/schemas/EntityReference" } }
+    EventDocument:
       type: object
       additionalProperties: false
       required: [startAtUnixMs, label, typeNumber, metadata]
@@ -879,9 +921,9 @@ components:
         endAtUnixMs: { type: integer, format: int64, minimum: 0 }
         label: { type: string, minLength: 1, maxLength: 256 }
         typeNumber: { type: integer, format: int64 }
-        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" } }
-        references: { type: array, maxItems: 256, uniqueItems: true, items: { $ref: "#/components/schemas/EntityReferenceV1" } }
-    ProfileDocumentV1:
+        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValue" } }
+        references: { type: array, maxItems: 256, uniqueItems: true, items: { $ref: "#/components/schemas/EntityReference" } }
+    ProfileDocument:
       type: object
       additionalProperties: false
       required: [handle, displayName, sarosAnchor, metadata]
@@ -889,14 +931,14 @@ components:
         handle: { type: string, minLength: 1, maxLength: 32, pattern: '^[a-z0-9._-]+$' }
         displayName: { type: string, minLength: 1, maxLength: 128 }
         sarosAnchor: { type: integer, minimum: 101, maximum: 161 }
-        avatar: { $ref: "#/components/schemas/ResourceRefV1" }
-        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValueV1" } }
-    MetadataKeyV1:
+        avatar: { $ref: "#/components/schemas/ResourceRef" }
+        metadata: { type: object, maxProperties: 128, additionalProperties: { $ref: "#/components/schemas/MetadataValue" } }
+    MetadataKey:
       type: string
       minLength: 1
       maxLength: 128
       pattern: '^[^\u0000-\u001f\u007f]+$'
-    MetadataValueV1:
+    MetadataValue:
       oneOf:
         - type: 'null'
         - type: boolean
@@ -906,17 +948,17 @@ components:
         - type: array
           maxItems: 256
           items:
-            $ref: "#/components/schemas/MetadataValueV1"
+            $ref: "#/components/schemas/MetadataValue"
         - type: object
           maxProperties: 256
           propertyNames:
-            $ref: "#/components/schemas/MetadataKeyV1"
+            $ref: "#/components/schemas/MetadataKey"
           additionalProperties:
-            $ref: "#/components/schemas/MetadataValueV1"
+            $ref: "#/components/schemas/MetadataValue"
     Visibility:
       type: string
       enum: [public, private]
-    ResourceRefV1:
+    ResourceRef:
       type: object
       additionalProperties: false
       required: [contentId, byteLength, mediaType, role]
@@ -944,7 +986,7 @@ components:
           minLength: 1
           maxLength: 255
           description: Path-free, non-control label other than `.` or `..`.
-    CapabilityGrantV1:
+    CapabilityGrant:
       type: object
       additionalProperties: false
       required:
@@ -1021,7 +1063,7 @@ components:
         - revokeCapability
         - readSpace
         - writeContent
-    CapabilityRevocationV1:
+    CapabilityRevocation:
       type: object
       additionalProperties: false
       required: [grantId, reason]
@@ -1043,7 +1085,7 @@ components:
         - keyRotated
         - scopeChanged
         - administrative
-    StoredSignedOperationV2:
+    StoredSignedOperation:
       type: object
       additionalProperties: false
       required:
@@ -1062,8 +1104,8 @@ components:
           minimum: 0
           description: Node-local receipt time excluded from the signed payload.
         operation:
-          $ref: "#/components/schemas/SignedOperationV2"
-    OperationPageV2:
+          $ref: "#/components/schemas/SignedOperation"
+    OperationPage:
       type: object
       additionalProperties: false
       required: [spaceId, operations, nextAfter, hasMore]
@@ -1074,7 +1116,7 @@ components:
           type: array
           maxItems: 200
           items:
-            $ref: "#/components/schemas/StoredSignedOperationV2"
+            $ref: "#/components/schemas/StoredSignedOperation"
         nextAfter:
           type: integer
           format: int64
@@ -1082,7 +1124,7 @@ components:
           maximum: 9223372036854775807
         hasMore:
           type: boolean
-    EntityStateV2:
+    EntityState:
       type: object
       additionalProperties: false
       required:
@@ -1110,7 +1152,52 @@ components:
           minItems: 1
           maxItems: 64
           items:
-            $ref: "#/components/schemas/StoredSignedOperationV2"
+            $ref: "#/components/schemas/StoredSignedOperation"
+    ClientProjectionCursor:
+      type: object
+      additionalProperties: false
+      required: [entityId, operationId]
+      properties:
+        sortNumber: { type: integer, format: int64 }
+        sortText: { type: string }
+        entityId: { $ref: "#/components/schemas/EntityId" }
+        operationId: { $ref: "#/components/schemas/OperationId" }
+    ClientEntitySummary:
+      type: object
+      additionalProperties: false
+      required: [operation, visibility, conflicted, resourceCount, mediaBytes]
+      properties:
+        operation: { $ref: "#/components/schemas/StoredSignedOperation" }
+        visibility: { $ref: "#/components/schemas/Visibility" }
+        conflicted: { type: boolean }
+        startAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        endAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        sortText: { type: string }
+        resourceCount: { type: integer, format: int64, minimum: 0 }
+        mediaBytes: { type: integer, format: int64, minimum: 0 }
+    ClientEntityPage:
+      type: object
+      additionalProperties: false
+      required: [spaceId, schema, items]
+      properties:
+        spaceId: { $ref: "#/components/schemas/SpaceId" }
+        schema: { $ref: "#/components/schemas/EntitySchema" }
+        items:
+          type: array
+          maxItems: 200
+          items: { $ref: "#/components/schemas/ClientEntitySummary" }
+        nextCursor: { $ref: "#/components/schemas/ClientProjectionCursor" }
+    ClientStats:
+      type: object
+      additionalProperties: false
+      required: [records, events, tags, profiles, mediaFiles, mediaBytes]
+      properties:
+        records: { type: integer, format: int64, minimum: 0 }
+        events: { type: integer, format: int64, minimum: 0 }
+        tags: { type: integer, format: int64, minimum: 0 }
+        profiles: { type: integer, format: int64, minimum: 0 }
+        mediaFiles: { type: integer, format: int64, minimum: 0 }
+        mediaBytes: { type: integer, format: int64, minimum: 0 }
     ProblemCode:
       type: string
       enum:
@@ -1147,7 +1234,7 @@ components:
         - malformed_peer_request
         - peer_request_too_large
         - peer_unauthorized
-    PeerReadChangesRequestV1:
+    PeerReadChangesRequest:
       type: object
       additionalProperties: false
       required:

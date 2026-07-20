@@ -3,10 +3,8 @@
 Fractonica is a local-first personal data network. This directory records the
 system boundaries and the decisions that implementations must preserve.
 
-The current stateful contract is the signed, space-scoped operation protocol
-v2. Unsigned v1 operation routes are obsolete and return `410`; v1 Saros,
-glyph, and content-transfer routes remain active local surfaces. Capability
-grants and revocations are enforced for v2 operation admission. The first
+The current stateful contract is the signed, space-scoped operation protocol.
+Capability grants and revocations are enforced for operation admission. The first
 loopback-only Noise pairing ceremony is implemented through explicit human
 confirmation. Confirmation atomically converges on one controller-signed
 capability grant, and the local control center renders its QR and complete
@@ -35,8 +33,8 @@ space-authorized content transfer remain deferred.
 - [ADR 0011: Noise pairing handshake](adr/0011-noise-pairing-handshake.md)
 - [ADR 0012: Authenticated peer reads](adr/0012-authenticated-peer-reads.md)
 - [ADR 0013: Client domain and projections](adr/0013-client-domain-and-projection-contract.md)
-- [OpenAPI v1 contract](../contracts/openapi/v1.yaml)
-- [OpenAPI v2 contract](../contracts/openapi/v2.yaml)
+- [OpenAPI API contract](../contracts/openapi/api.yaml)
+- [OpenAPI foundation contract](../contracts/openapi/services.yaml)
 - [Device protocol principles](../contracts/protocol/README.md)
 
 Architecture changes that alter a trust boundary, public contract, persistence

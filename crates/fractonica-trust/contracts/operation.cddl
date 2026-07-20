@@ -1,9 +1,9 @@
-; Fractonica operation protocol v2.
+; Fractonica operation protocol.
 ; RFC 8610 notation plus deterministic-encoding requirements from RFC 8949.
 
-operation-payload-v2 = [
-  domain: "org.fractonica.operation.v2",
-  protocol-version: 2,
+operation-payload = [
+  domain: "org.fractonica.operation",
+  protocol-version: 1,
   ; All-zero is invalid; CDDL cannot express the nonzero predicate itself.
   space-id: bytes .size 32,
   ; Must decode as a non-weak Ed25519 verification key.
@@ -26,12 +26,12 @@ operation-digest-set = [0*64 (bytes .size 32)]
 
 ; A schema replaces this open slot with its bounded deterministic CBOR value.
 ; Tags, indefinite lengths, non-finite floats, and duplicate map keys are not
-; admitted by the v2 trust decoder.
+; admitted by the trust decoder.
 canonical-body = any
 
 ; Exact wire envelope. The protected bytes decode to { 1: -8 } (EdDSA), the
 ; unprotected map is empty, and the payload is embedded rather than detached.
-cose-sign1-v2 = #6.18([
+cose-sign1 = #6.18([
   protected: h'a10127',
   unprotected: {},
   payload: bytes,

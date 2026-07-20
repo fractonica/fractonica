@@ -7,21 +7,19 @@ use uuid::Uuid;
 
 use super::{
     ActorId, CapabilityAction, CapabilityGrant, CapabilityRevocation, CapabilityRevocationReason,
-    DataModelError, EncryptedPayloadV1, EncryptionAlgorithmV1, EntityId, EntityReferenceV1,
-    EntitySchema, EventDocumentV1, OperationBody, OperationId, ProfileDocumentV1,
-    ProtectedDocumentV1, RecordDocument, RecordDocumentV2, ReferenceTargetV1, SpaceId,
-    TagDocumentV1, Visibility,
+    DataModelError, EncryptedPayload, EncryptionAlgorithm, EntityId, EntityReference, EntitySchema,
+    EventDocument, OperationBody, OperationId, ProfileDocument, ProtectedDocument, RecordDocument,
+    ReferenceTarget, SpaceId, TagDocument, Visibility,
 };
 
 const BODY_TOMBSTONE: u64 = 0;
 const BODY_RECORD_PUT: u64 = 1;
-const BODY_SPACE_GENESIS: u64 = 2;
-const BODY_CAPABILITY_GRANT: u64 = 3;
-const BODY_CAPABILITY_REVOKE: u64 = 4;
-const BODY_RECORD_V2_PUT: u64 = 5;
-const BODY_TAG_V1_PUT: u64 = 6;
-const BODY_EVENT_V1_PUT: u64 = 7;
-const BODY_PROFILE_V1_PUT: u64 = 8;
+const BODY_TAG_PUT: u64 = 2;
+const BODY_EVENT_PUT: u64 = 3;
+const BODY_PROFILE_PUT: u64 = 4;
+const BODY_SPACE_GENESIS: u64 = 5;
+const BODY_CAPABILITY_GRANT: u64 = 6;
+const BODY_CAPABILITY_REVOKE: u64 = 7;
 
 pub(super) fn encode_body(
     schema: EntitySchema,
@@ -29,50 +27,43 @@ pub(super) fn encode_body(
 ) -> Result<CanonicalValue, DataModelError> {
     match (schema, body) {
         (
-            EntitySchema::RecordV1
-            | EntitySchema::RecordV2
-            | EntitySchema::TagV1
-            | EntitySchema::EventV1
-            | EntitySchema::ProfileV1,
+            EntitySchema::Record | EntitySchema::Tag | EntitySchema::Event | EntitySchema::Profile,
             OperationBody::Tombstone,
         ) => Ok(CanonicalValue::Array(vec![CanonicalValue::Unsigned(
             BODY_TOMBSTONE,
         )])),
-        (EntitySchema::RecordV1, OperationBody::Put { document }) => encode_record_put(document),
-        (EntitySchema::RecordV2, OperationBody::PutRecordV2 { payload }) => {
+        (EntitySchema::Record, OperationBody::PutRecord { payload }) => {
             Ok(CanonicalValue::Array(vec![
-                CanonicalValue::Unsigned(BODY_RECORD_V2_PUT),
-                encode_protected(payload, encode_record_v2_document)?,
+                CanonicalValue::Unsigned(BODY_RECORD_PUT),
+                encode_protected(payload, encode_record_document)?,
             ]))
         }
-        (EntitySchema::TagV1, OperationBody::PutTagV1 { payload }) => {
+        (EntitySchema::Tag, OperationBody::PutTag { payload }) => Ok(CanonicalValue::Array(vec![
+            CanonicalValue::Unsigned(BODY_TAG_PUT),
+            encode_protected(payload, encode_tag_document)?,
+        ])),
+        (EntitySchema::Event, OperationBody::PutEvent { payload }) => {
             Ok(CanonicalValue::Array(vec![
-                CanonicalValue::Unsigned(BODY_TAG_V1_PUT),
-                encode_protected(payload, encode_tag_document)?,
-            ]))
-        }
-        (EntitySchema::EventV1, OperationBody::PutEventV1 { payload }) => {
-            Ok(CanonicalValue::Array(vec![
-                CanonicalValue::Unsigned(BODY_EVENT_V1_PUT),
+                CanonicalValue::Unsigned(BODY_EVENT_PUT),
                 encode_protected(payload, encode_event_document)?,
             ]))
         }
-        (EntitySchema::ProfileV1, OperationBody::PutProfileV1 { document }) => {
+        (EntitySchema::Profile, OperationBody::PutProfile { document }) => {
             Ok(CanonicalValue::Array(vec![
-                CanonicalValue::Unsigned(BODY_PROFILE_V1_PUT),
+                CanonicalValue::Unsigned(BODY_PROFILE_PUT),
                 encode_profile_document(document)?,
             ]))
         }
-        (EntitySchema::SpaceGenesisV1, OperationBody::SpaceGenesis { controller }) => {
+        (EntitySchema::SpaceGenesis, OperationBody::SpaceGenesis { controller }) => {
             Ok(CanonicalValue::Array(vec![
                 CanonicalValue::Unsigned(BODY_SPACE_GENESIS),
                 CanonicalValue::Bytes(controller.as_bytes().to_vec()),
             ]))
         }
-        (EntitySchema::CapabilityGrantV1, OperationBody::CapabilityGrant { grant }) => {
+        (EntitySchema::CapabilityGrant, OperationBody::CapabilityGrant { grant }) => {
             encode_capability_grant(grant)
         }
-        (EntitySchema::CapabilityRevokeV1, OperationBody::CapabilityRevoke { revocation }) => {
+        (EntitySchema::CapabilityRevoke, OperationBody::CapabilityRevoke { revocation }) => {
             encode_capability_revocation(revocation)
         }
         _ => Err(DataModelError::SchemaBodyMismatch { schema }),
@@ -87,113 +78,52 @@ pub(super) fn decode_body(
     let kind = unsigned(schema, fields.first(), "body kind")?;
     match (schema, kind) {
         (
-            EntitySchema::RecordV1
-            | EntitySchema::RecordV2
-            | EntitySchema::TagV1
-            | EntitySchema::EventV1
-            | EntitySchema::ProfileV1,
+            EntitySchema::Record | EntitySchema::Tag | EntitySchema::Event | EntitySchema::Profile,
             BODY_TOMBSTONE,
         ) if fields.len() == 1 => Ok(OperationBody::Tombstone),
-        (EntitySchema::RecordV1, BODY_RECORD_PUT) => decode_record_put(schema, fields),
-        (EntitySchema::RecordV2, BODY_RECORD_V2_PUT) if fields.len() == 2 => {
-            Ok(OperationBody::PutRecordV2 {
-                payload: decode_protected(schema, fields.get(1), decode_record_v2_document)?,
+        (EntitySchema::Record, BODY_RECORD_PUT) if fields.len() == 2 => {
+            Ok(OperationBody::PutRecord {
+                payload: decode_protected(schema, fields.get(1), decode_record_document)?,
             })
         }
-        (EntitySchema::TagV1, BODY_TAG_V1_PUT) if fields.len() == 2 => {
-            Ok(OperationBody::PutTagV1 {
-                payload: decode_protected(schema, fields.get(1), decode_tag_document)?,
-            })
-        }
-        (EntitySchema::EventV1, BODY_EVENT_V1_PUT) if fields.len() == 2 => {
-            Ok(OperationBody::PutEventV1 {
-                payload: decode_protected(schema, fields.get(1), decode_event_document)?,
-            })
-        }
-        (EntitySchema::ProfileV1, BODY_PROFILE_V1_PUT) if fields.len() == 2 => {
-            Ok(OperationBody::PutProfileV1 {
+        (EntitySchema::Tag, BODY_TAG_PUT) if fields.len() == 2 => Ok(OperationBody::PutTag {
+            payload: decode_protected(schema, fields.get(1), decode_tag_document)?,
+        }),
+        (EntitySchema::Event, BODY_EVENT_PUT) if fields.len() == 2 => Ok(OperationBody::PutEvent {
+            payload: decode_protected(schema, fields.get(1), decode_event_document)?,
+        }),
+        (EntitySchema::Profile, BODY_PROFILE_PUT) if fields.len() == 2 => {
+            Ok(OperationBody::PutProfile {
                 document: decode_profile_document(schema, fields.get(1))?,
             })
         }
-        (EntitySchema::SpaceGenesisV1, BODY_SPACE_GENESIS) if fields.len() == 2 => {
+        (EntitySchema::SpaceGenesis, BODY_SPACE_GENESIS) if fields.len() == 2 => {
             let controller =
                 ActorId::from_bytes(fixed_bytes(schema, fields.get(1), "genesis controller")?);
             controller.public_key()?;
             Ok(OperationBody::SpaceGenesis { controller })
         }
-        (EntitySchema::CapabilityGrantV1, BODY_CAPABILITY_GRANT) => {
+        (EntitySchema::CapabilityGrant, BODY_CAPABILITY_GRANT) => {
             decode_capability_grant(schema, fields)
         }
-        (EntitySchema::CapabilityRevokeV1, BODY_CAPABILITY_REVOKE) => {
+        (EntitySchema::CapabilityRevoke, BODY_CAPABILITY_REVOKE) => {
             decode_capability_revocation(schema, fields)
         }
         _ => invalid(schema, "body kind does not match schema"),
     }
 }
 
-fn encode_record_put(document: &RecordDocument) -> Result<CanonicalValue, DataModelError> {
-    let resources = document
-        .resources
-        .iter()
-        .map(encode_resource)
-        .collect::<Vec<_>>();
-    Ok(CanonicalValue::Array(vec![
-        CanonicalValue::Unsigned(BODY_RECORD_PUT),
-        nonnegative_integer(document.start_at_unix_ms)?,
-        optional_nonnegative_integer(document.end_at_unix_ms)?,
-        CanonicalValue::Unsigned(visibility_code(document.visibility)),
-        optional_text(document.emoji.as_deref()),
-        optional_text(document.text.as_deref()),
-        encode_metadata_object(&document.metadata)?,
-        CanonicalValue::Array(resources),
-    ]))
-}
-
-fn decode_record_put(
-    schema: EntitySchema,
-    fields: &[CanonicalValue],
-) -> Result<OperationBody, DataModelError> {
-    if fields.len() != 8 {
-        return invalid(schema, "record put must contain exactly eight fields");
-    }
-    let start_at_unix_ms = nonnegative_i64(schema, fields.get(1), "record start")?;
-    let end_at_unix_ms = optional_nonnegative_i64(schema, fields.get(2), "record end")?;
-    let visibility = decode_visibility(schema, fields.get(3), "visibility")?;
-    let emoji = decode_optional_text(schema, fields.get(4), "record emoji")?;
-    let text = decode_optional_text(schema, fields.get(5), "record text")?;
-    let metadata = decode_metadata_object(schema, fields.get(6))?;
-    let CanonicalValue::Array(resources) = required(schema, fields.get(7), "record resources")?
-    else {
-        return invalid(schema, "record resources must be an array");
-    };
-    let resources = resources
-        .iter()
-        .map(|resource| decode_resource(schema, resource))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(OperationBody::Put {
-        document: RecordDocument {
-            start_at_unix_ms,
-            end_at_unix_ms,
-            visibility,
-            emoji,
-            text,
-            metadata,
-            resources,
-        },
-    })
-}
-
 fn encode_protected<T>(
-    payload: &ProtectedDocumentV1<T>,
+    payload: &ProtectedDocument<T>,
     encode_public: impl FnOnce(&T) -> Result<CanonicalValue, DataModelError>,
 ) -> Result<CanonicalValue, DataModelError> {
     match payload {
-        ProtectedDocumentV1::Public { document } => Ok(CanonicalValue::Array(vec![
+        ProtectedDocument::Public { document } => Ok(CanonicalValue::Array(vec![
             CanonicalValue::Unsigned(0),
             encode_public(document)?,
             CanonicalValue::Array(vec![]),
         ])),
-        ProtectedDocumentV1::Private {
+        ProtectedDocument::Private {
             envelope,
             resources,
         } => Ok(CanonicalValue::Array(vec![
@@ -208,7 +138,7 @@ fn decode_protected<T>(
     schema: EntitySchema,
     value: Option<&CanonicalValue>,
     decode_public: impl FnOnce(EntitySchema, &CanonicalValue) -> Result<T, DataModelError>,
-) -> Result<ProtectedDocumentV1<T>, DataModelError> {
+) -> Result<ProtectedDocument<T>, DataModelError> {
     let CanonicalValue::Array(fields) = required(schema, value, "protected document")? else {
         return invalid(schema, "protected document must be an array");
     };
@@ -220,10 +150,10 @@ fn decode_protected<T>(
         return invalid(schema, "protected resources must be an array");
     };
     match unsigned(schema, fields.first(), "document visibility")? {
-        0 if resources.is_empty() => Ok(ProtectedDocumentV1::Public {
+        0 if resources.is_empty() => Ok(ProtectedDocument::Public {
             document: decode_public(schema, required(schema, fields.get(1), "public document")?)?,
         }),
-        1 => Ok(ProtectedDocumentV1::Private {
+        1 => Ok(ProtectedDocument::Private {
             envelope: decode_encrypted_payload(schema, fields.get(1))?,
             resources: resources
                 .iter()
@@ -234,9 +164,9 @@ fn decode_protected<T>(
     }
 }
 
-fn encode_encrypted_payload(envelope: &EncryptedPayloadV1) -> CanonicalValue {
+fn encode_encrypted_payload(envelope: &EncryptedPayload) -> CanonicalValue {
     let algorithm = match envelope.algorithm {
-        EncryptionAlgorithmV1::Aes256Gcm => 0,
+        EncryptionAlgorithm::Aes256Gcm => 0,
     };
     CanonicalValue::Array(vec![
         CanonicalValue::Unsigned(algorithm),
@@ -249,24 +179,22 @@ fn encode_encrypted_payload(envelope: &EncryptedPayloadV1) -> CanonicalValue {
 fn decode_encrypted_payload(
     schema: EntitySchema,
     value: Option<&CanonicalValue>,
-) -> Result<EncryptedPayloadV1, DataModelError> {
+) -> Result<EncryptedPayload, DataModelError> {
     let CanonicalValue::Array(fields) = required(schema, value, "encrypted payload")? else {
         return invalid(schema, "encrypted payload must be an array");
     };
     if fields.len() != 4 || unsigned(schema, fields.first(), "encryption algorithm")? != 0 {
         return invalid(schema, "unsupported encrypted payload");
     }
-    Ok(EncryptedPayloadV1 {
-        algorithm: EncryptionAlgorithmV1::Aes256Gcm,
+    Ok(EncryptedPayload {
+        algorithm: EncryptionAlgorithm::Aes256Gcm,
         key_id: text(schema, fields.get(1), "encryption key ID")?,
         nonce_base64url: text(schema, fields.get(2), "encryption nonce")?,
         ciphertext_base64url: text(schema, fields.get(3), "encrypted ciphertext")?,
     })
 }
 
-fn encode_record_v2_document(
-    document: &RecordDocumentV2,
-) -> Result<CanonicalValue, DataModelError> {
+fn encode_record_document(document: &RecordDocument) -> Result<CanonicalValue, DataModelError> {
     Ok(CanonicalValue::Array(vec![
         nonnegative_integer(document.start_at_unix_ms)?,
         optional_nonnegative_integer(document.end_at_unix_ms)?,
@@ -278,12 +206,12 @@ fn encode_record_v2_document(
     ]))
 }
 
-fn decode_record_v2_document(
+fn decode_record_document(
     schema: EntitySchema,
     value: &CanonicalValue,
-) -> Result<RecordDocumentV2, DataModelError> {
-    let fields = exact_array(schema, value, 7, "record.v2 document")?;
-    Ok(RecordDocumentV2 {
+) -> Result<RecordDocument, DataModelError> {
+    let fields = exact_array(schema, value, 7, "record document")?;
+    Ok(RecordDocument {
         start_at_unix_ms: nonnegative_i64(schema, fields.first(), "record start")?,
         end_at_unix_ms: optional_nonnegative_i64(schema, fields.get(1), "record end")?,
         emoji: decode_optional_text(schema, fields.get(2), "record emoji")?,
@@ -294,7 +222,7 @@ fn decode_record_v2_document(
     })
 }
 
-fn encode_tag_document(document: &TagDocumentV1) -> Result<CanonicalValue, DataModelError> {
+fn encode_tag_document(document: &TagDocument) -> Result<CanonicalValue, DataModelError> {
     Ok(CanonicalValue::Array(vec![
         CanonicalValue::Text(document.name.clone()),
         optional_text(document.emoji.as_deref()),
@@ -308,9 +236,9 @@ fn encode_tag_document(document: &TagDocumentV1) -> Result<CanonicalValue, DataM
 fn decode_tag_document(
     schema: EntitySchema,
     value: &CanonicalValue,
-) -> Result<TagDocumentV1, DataModelError> {
+) -> Result<TagDocument, DataModelError> {
     let fields = exact_array(schema, value, 6, "tag document")?;
-    Ok(TagDocumentV1 {
+    Ok(TagDocument {
         name: text(schema, fields.first(), "tag name")?,
         emoji: decode_optional_text(schema, fields.get(1), "tag emoji")?,
         notes: decode_optional_text(schema, fields.get(2), "tag notes")?,
@@ -320,7 +248,7 @@ fn decode_tag_document(
     })
 }
 
-fn encode_event_document(document: &EventDocumentV1) -> Result<CanonicalValue, DataModelError> {
+fn encode_event_document(document: &EventDocument) -> Result<CanonicalValue, DataModelError> {
     Ok(CanonicalValue::Array(vec![
         nonnegative_integer(document.start_at_unix_ms)?,
         optional_nonnegative_integer(document.end_at_unix_ms)?,
@@ -334,9 +262,9 @@ fn encode_event_document(document: &EventDocumentV1) -> Result<CanonicalValue, D
 fn decode_event_document(
     schema: EntitySchema,
     value: &CanonicalValue,
-) -> Result<EventDocumentV1, DataModelError> {
+) -> Result<EventDocument, DataModelError> {
     let fields = exact_array(schema, value, 6, "event document")?;
-    Ok(EventDocumentV1 {
+    Ok(EventDocument {
         start_at_unix_ms: nonnegative_i64(schema, fields.first(), "event start")?,
         end_at_unix_ms: optional_nonnegative_i64(schema, fields.get(1), "event end")?,
         label: text(schema, fields.get(2), "event label")?,
@@ -346,7 +274,7 @@ fn decode_event_document(
     })
 }
 
-fn encode_profile_document(document: &ProfileDocumentV1) -> Result<CanonicalValue, DataModelError> {
+fn encode_profile_document(document: &ProfileDocument) -> Result<CanonicalValue, DataModelError> {
     Ok(CanonicalValue::Array(vec![
         CanonicalValue::Text(document.handle.clone()),
         CanonicalValue::Text(document.display_name.clone()),
@@ -362,7 +290,7 @@ fn encode_profile_document(document: &ProfileDocumentV1) -> Result<CanonicalValu
 fn decode_profile_document(
     schema: EntitySchema,
     value: Option<&CanonicalValue>,
-) -> Result<ProfileDocumentV1, DataModelError> {
+) -> Result<ProfileDocument, DataModelError> {
     let fields = exact_array(
         schema,
         required(schema, value, "profile document")?,
@@ -373,7 +301,7 @@ fn decode_profile_document(
         CanonicalValue::Null => None,
         value => Some(decode_resource(schema, value)?),
     };
-    Ok(ProfileDocumentV1 {
+    Ok(ProfileDocument {
         handle: text(schema, fields.first(), "profile handle")?,
         display_name: text(schema, fields.get(1), "profile display name")?,
         saros_anchor: u16::try_from(unsigned(schema, fields.get(2), "profile Saros anchor")?)
@@ -386,17 +314,17 @@ fn decode_profile_document(
     })
 }
 
-fn encode_references(references: &[EntityReferenceV1]) -> CanonicalValue {
+fn encode_references(references: &[EntityReference]) -> CanonicalValue {
     CanonicalValue::Array(
         references
             .iter()
             .map(|reference| {
                 let target = match &reference.target {
-                    ReferenceTargetV1::Actor { actor_id } => CanonicalValue::Array(vec![
+                    ReferenceTarget::Actor { actor_id } => CanonicalValue::Array(vec![
                         CanonicalValue::Unsigned(0),
                         CanonicalValue::Bytes(actor_id.as_bytes().to_vec()),
                     ]),
-                    ReferenceTargetV1::Entity {
+                    ReferenceTarget::Entity {
                         space_id,
                         entity_id,
                         operation_id,
@@ -421,14 +349,14 @@ fn encode_references(references: &[EntityReferenceV1]) -> CanonicalValue {
 fn decode_references(
     schema: EntitySchema,
     value: Option<&CanonicalValue>,
-) -> Result<Vec<EntityReferenceV1>, DataModelError> {
+) -> Result<Vec<EntityReference>, DataModelError> {
     decode_array(schema, value, "entity references", |value| {
         let fields = exact_array(schema, value, 2, "entity reference")?;
         let relation = text(schema, fields.first(), "reference relation")?;
         let target_fields =
             body_array(schema, required(schema, fields.get(1), "reference target")?)?;
         let target = match unsigned(schema, target_fields.first(), "reference target kind")? {
-            0 if target_fields.len() == 2 => ReferenceTargetV1::Actor {
+            0 if target_fields.len() == 2 => ReferenceTarget::Actor {
                 actor_id: ActorId::from_bytes(fixed_bytes(
                     schema,
                     target_fields.get(1),
@@ -445,7 +373,7 @@ fn decode_references(
                             "referenced operation",
                         )?)),
                     };
-                ReferenceTargetV1::Entity {
+                ReferenceTarget::Entity {
                     space_id: SpaceId::from_bytes(fixed_bytes(
                         schema,
                         target_fields.get(1),
@@ -461,7 +389,7 @@ fn decode_references(
             }
             _ => return invalid(schema, "invalid reference target"),
         };
-        Ok(EntityReferenceV1 { relation, target })
+        Ok(EntityReference { relation, target })
     })
 }
 

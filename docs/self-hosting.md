@@ -28,9 +28,9 @@ cargo run -p fractonica-node -- \
   --display-name "Development node"
 ```
 
-Use a new directory for this signed-v2 milestone. A database or identity from
-an earlier unsigned prototype has no installation binding and is deliberately
-not adopted; migrate it explicitly or retain it under a separate path.
+Use a dedicated directory for each node installation. Fractonica database
+schema migrations are internal storage maintenance, not application protocol
+versions or compatibility with another product.
 
 The standalone default is `http://127.0.0.1:8789`. Confirm the process and
 database are ready from a second terminal:
@@ -38,7 +38,7 @@ database are ready from a second terminal:
 ```sh
 curl --fail --silent --show-error http://127.0.0.1:8789/health/live
 curl --fail --silent --show-error http://127.0.0.1:8789/health/ready
-curl --fail --silent --show-error http://127.0.0.1:8789/api/v1/node
+curl --fail --silent --show-error http://127.0.0.1:8789/api/node
 ```
 
 The currently implemented endpoints are:
@@ -47,33 +47,33 @@ The currently implemented endpoints are:
 | --- | --- |
 | `GET /health/live` | Confirms that the HTTP process is alive. |
 | `GET /health/ready` | Confirms that the local SQLite store is available and reports its schema version. |
-| `GET /api/v1/node` | Returns local node metadata, public `NodeId`, spaces, and advertised capabilities. |
-| `POST /api/v2/spaces/{spaceId}/operations` | Verifies, authorizes, and atomically admits one complete client-signed operation. |
-| `GET /api/v2/spaces/{spaceId}/operations/{operationId}` | Returns one admitted signed operation and node-local receipt metadata. |
-| `GET /api/v2/spaces/{spaceId}/changes` | Pages one space's admitted-operation feed by node-local cursor. |
-| `GET /api/v2/spaces/{spaceId}/entities/{entityId}` | Returns the current signed heads and conflict state for one entity in one space. |
-| `/api/v1/operations` and `/api/v1/entities/{entityId}` | Obsolete unsigned surfaces; all supported methods return `410 operation_v1_obsolete`. |
-| `/api/v1/uploads` | Discovers and creates resumable tus uploads. |
-| `/api/v1/uploads/{uploadId}` | Inspects or appends to one resumable upload. |
-| `/api/v1/blobs/{contentId}` | Streams immutable content, including one byte range. |
-| `POST /api/v1/blobs/availability` | Separates locally available and missing content IDs. |
-| `/api/v1/saros` and `/api/v1/glyphs` | Serve stateless Saros and glyph calculations; detailed routes are in the v1 contract. |
-| `/api/docs` | Serves Swagger with signed operations v2 as the primary contract and local temporal/glyph/content v1 as the secondary contract. |
-| `GET /api/openapi.json` | Serves the primary signed-operation v2 contract as JSON. |
-| `GET /api/openapi-v1.json` | Serves the remaining v1/local contract as JSON. |
+| `GET /api/node` | Returns local node metadata, public `NodeId`, spaces, and advertised capabilities. |
+| `POST /api/spaces/{spaceId}/operations` | Verifies, authorizes, and atomically admits one complete client-signed operation. |
+| `GET /api/spaces/{spaceId}/operations/{operationId}` | Returns one admitted signed operation and node-local receipt metadata. |
+| `GET /api/spaces/{spaceId}/changes` | Pages one space's admitted-operation feed by node-local cursor. |
+| `GET /api/spaces/{spaceId}/entities/{entityId}` | Returns the current signed heads and conflict state for one entity in one space. |
+| `GET /api/spaces/{spaceId}/records`, `/events`, `/tags`, `/profiles` | Bounded, cursor-based client projections rebuilt from admitted operations. |
+| `GET /api/spaces/{spaceId}/stats` | Aggregate client entity and media statistics. |
+| `/api/uploads` | Discovers and creates resumable tus uploads. |
+| `/api/uploads/{uploadId}` | Inspects or appends to one resumable upload. |
+| `/api/blobs/{contentId}` | Streams immutable content, including one byte range. |
+| `POST /api/blobs/availability` | Separates locally available and missing content IDs. |
+| `/api/saros` and `/api/glyphs` | Serve stateless Saros and glyph calculations. |
+| `/api/docs` | Serves Swagger for the complete Fractonica API. |
+| `GET /api/openapi.json` | Serves the complete contract as JSON. |
 
-Signed operation v2 is the authoritative stateful surface. Clients retain
+The signed operation log is the authoritative stateful surface. Clients retain
 their actor keys and submit a complete strict JSON projection plus embedded
 COSE Sign1 envelope; the node has no generic sign-on-behalf endpoint. The full
 node enforces the locally anchored genesis, grant chains, admission windows,
 and accepted revocations before changing heads or projections.
 
-The ordinary graph read and v1 content routes are deliberately local
+The ordinary graph and content routes are deliberately local
 control-plane building blocks protected by the optional node-wide loopback
-bearer. Paired actors instead use `POST /api/v2/peer/spaces/{spaceId}/changes`,
+bearer. Paired actors instead use `POST /api/peer/spaces/{spaceId}/changes`,
 which verifies dual signatures, the completed pairing, the exact `readSpace`
 grant, and a durable one-use nonce. This authenticates a peer request but does
-not encrypt it or authorize non-loopback exposure. V1 upload/blob routes do
+not encrypt it or authorize non-loopback exposure. Upload/blob routes do
 not yet enforce space content capabilities, and the node does not yet
 replicate with peers or publish data. See
 [operation-log semantics](operation-log.md), the
@@ -100,11 +100,11 @@ Verify the engine from a second terminal:
 ```sh
 curl --fail --silent --show-error http://127.0.0.1:8790/health/live
 curl --fail --silent --show-error http://127.0.0.1:8790/health/ready
-curl --fail --silent --show-error http://127.0.0.1:8790/api/v1/saros
+curl --fail --silent --show-error http://127.0.0.1:8790/api/saros
 curl --fail --silent --show-error \
-  'http://127.0.0.1:8790/api/v1/saros/pulse?atUnixSeconds=0'
+  'http://127.0.0.1:8790/api/saros/pulse?atUnixSeconds=0'
 curl --fail --silent --show-error \
-  'http://127.0.0.1:8790/api/v1/saros/series/141/reading?atUnixSeconds=0&precisionBits=30'
+  'http://127.0.0.1:8790/api/saros/series/141/reading?atUnixSeconds=0&precisionBits=30'
 ```
 
 The Saros profile reports that no storage is configured in its readiness
@@ -226,7 +226,7 @@ this conservative procedure:
    state and must be kept together.
 5. Test a backup by restoring it into a *different* data directory, starting a
    standalone node with that directory, and checking `/health/ready` and
-   `/api/v1/node`. The returned public `NodeId`, `SpaceId`, genesis digest,
+   `/api/node`. The returned public `NodeId`, `SpaceId`, genesis digest,
    controller, and local writer must match the backed-up installation.
 
 Never replace an active data directory in place. Stop the node first, retain
@@ -289,7 +289,7 @@ The following are not implemented and must not be inferred from the word
   replication;
 - encrypted/resumable peer sessions and multi-page replication orchestration
   beyond the bounded, dual-signed `readSpace` change-page primitive;
-- space-capability enforcement for v1 content upload, availability, metadata,
+- space-capability enforcement for content upload, availability, metadata,
   and blob reads;
 - user accounts, remote API keys, higher-level event/tag CRUD facades, or
   public feed distribution;
@@ -299,7 +299,7 @@ The following are not implemented and must not be inferred from the word
 The [trust-kernel threat model](threat-model.md) and Phase 3 security ADRs fix
 the signed-operation, capability, key-lifecycle, and QR-bootstrap boundaries.
 The node now implements local trusted-space bootstrap, grant/revocation
-admission, signed-v2 operation storage, the bounded Noise pairing handshake,
+admission, signed operation storage, the bounded Noise pairing handshake,
 explicit local confirmation, and replay-safe paired reads; that does not
 implement or authorize a network service. Before any deferred capability is enabled, Fractonica still
 needs the applicable versioned wire contract, abuse bounds, interoperability

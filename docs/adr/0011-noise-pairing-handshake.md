@@ -149,7 +149,7 @@ created ----------------> expired
 - Explicit local confirmation must match the session, peer fingerprints,
   effective capability summary, and complete ten-octal-digit code.
 - Only after confirmation may the controller create a separate signed
-  `capability.grant.v1` operation for the joining `ActorId`.
+  `capability.grant` operation for the joining `ActorId`.
 - Completion persists the paired `NodeId`, actor, space, grant digest, and
   transcript digest. It never persists Noise transport keys as graph
   authority.

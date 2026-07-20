@@ -23,10 +23,10 @@ use zeroize::Zeroize;
 
 /// Signed-operation protocol implemented by this crate.
 ///
-/// Version 1 operations are intentionally not accepted or reinterpreted.
-pub const OPERATION_PROTOCOL_VERSION: u64 = 2;
-/// Domain value encoded into every version 2 operation payload.
-pub const OPERATION_DOMAIN: &str = "org.fractonica.operation.v2";
+/// Wire discriminator for the first Fractonica operation format.
+pub const OPERATION_PROTOCOL_VERSION: u64 = 1;
+/// Domain separation value encoded into every operation payload.
+pub const OPERATION_DOMAIN: &str = "org.fractonica.operation";
 /// Maximum direct causal parents carried by one operation.
 pub const MAX_CAUSAL_PARENTS: usize = 64;
 /// Maximum capability-grant operation references carried by one operation.
@@ -160,7 +160,7 @@ fixed_hex_id!(
 fixed_hex_id!(
     OperationId,
     OPERATION_PREFIX,
-    "SHA-256 identity of one canonical version 2 operation payload."
+    "SHA-256 identity of one canonical Fractonica operation payload."
 );
 fixed_hex_id!(
     Ed25519PublicKey,
@@ -419,7 +419,7 @@ impl OperationNonce {
     }
 }
 
-/// Version 2 fields which are signed for one immutable operation.
+/// Fields signed for one immutable operation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationPayload {
     space_id: SpaceId,
@@ -1320,7 +1320,7 @@ pub enum TrustError {
     SignatureVerificationFailed,
     #[error("signed payload uses the wrong protocol domain")]
     WrongOperationDomain,
-    #[error("signed payload does not use operation protocol version 2")]
+    #[error("signed payload uses an unsupported operation protocol version")]
     UnsupportedOperationVersion,
     #[error("invalid operation payload: {0}")]
     InvalidOperationPayload(&'static str),
@@ -1358,7 +1358,7 @@ mod tests {
             SpaceId::from_bytes([0x11; 32]),
             key.actor_id(),
             Uuid::parse_str("018f3e7a-5b6c-7d8e-9fab-102030405060").unwrap(),
-            "record.v1",
+            "record",
             vec![
                 OperationId::from_bytes([0xfe; 32]),
                 OperationId::from_bytes([0x01; 32]),
@@ -1558,7 +1558,7 @@ mod tests {
         let CanonicalValue::Array(mut fields) = value else {
             unreachable!();
         };
-        fields[0] = CanonicalValue::Text("org.example.operation.v2".into());
+        fields[0] = CanonicalValue::Text("org.example.operation".into());
         let wrong_domain = manually_sign(CanonicalValue::Array(fields.clone()), &key);
         assert!(matches!(
             wrong_domain.verify(),
@@ -1566,10 +1566,10 @@ mod tests {
         ));
 
         fields[0] = CanonicalValue::Text(OPERATION_DOMAIN.into());
-        fields[1] = CanonicalValue::Unsigned(1);
-        let version_one = manually_sign(CanonicalValue::Array(fields), &key);
+        fields[1] = CanonicalValue::Unsigned(2);
+        let unsupported_version = manually_sign(CanonicalValue::Array(fields), &key);
         assert!(matches!(
-            version_one.verify(),
+            unsupported_version.verify(),
             Err(TrustError::UnsupportedOperationVersion)
         ));
     }
@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn fixed_cross_platform_conformance_vector() {
         let fixture: ConformanceFixture =
-            serde_json::from_str(include_str!("../fixtures/operation-v2.json")).unwrap();
+            serde_json::from_str(include_str!("../fixtures/operation.json")).unwrap();
         let seed: [u8; 32] = hex_bytes(&fixture.seed_hex).try_into().unwrap();
         let key = Ed25519SigningKey::from_seed(seed);
         assert_eq!(fixture.domain, OPERATION_DOMAIN);

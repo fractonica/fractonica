@@ -200,7 +200,7 @@ impl SqliteStore {
         operation
             .verify()
             .map_err(fractonica_pairing::PairingError::from)?;
-        if now < 0 || operation.schema != EntitySchema::CapabilityGrantV1 {
+        if now < 0 || operation.schema != EntitySchema::CapabilityGrant {
             return Err(PairingStoreError::InvalidGrantPlan);
         }
         let OperationBody::CapabilityGrant { grant } = &operation.body else {

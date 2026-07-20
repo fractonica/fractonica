@@ -5,7 +5,8 @@ use std::sync::{
 
 use fractonica_core::{InstallationId, InstallationMetadata};
 use fractonica_data_model::{
-    CapabilityAction, CapabilityGrant, OperationNonce, RecordDocument, SigningKey, Visibility,
+    CapabilityAction, CapabilityGrant, OperationNonce, ProtectedDocument, RecordDocument,
+    SigningKey,
 };
 use serde_json::json;
 
@@ -193,20 +194,22 @@ fn record_operation(space_id: SpaceId) -> OperationEnvelope {
     OperationEnvelope::sign(
         space_id,
         entity(1),
-        EntitySchema::RecordV1,
+        EntitySchema::Record,
         Vec::new(),
         vec![digest(0xa0)],
         2_000,
         nonce(1),
-        OperationBody::Put {
-            document: RecordDocument {
-                start_at_unix_ms: 1_000,
-                end_at_unix_ms: None,
-                visibility: Visibility::Public,
-                emoji: Some("🌒".into()),
-                text: Some("signed".into()),
-                metadata: std::collections::BTreeMap::from([("source".into(), json!("test"))]),
-                resources: Vec::new(),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public {
+                document: RecordDocument {
+                    start_at_unix_ms: 1_000,
+                    end_at_unix_ms: None,
+                    emoji: Some("🌒".into()),
+                    text: Some("signed".into()),
+                    metadata: std::collections::BTreeMap::from([("source".into(), json!("test"))]),
+                    resources: Vec::new(),
+                    references: Vec::new(),
+                },
             },
         },
         &signing_key,
@@ -221,7 +224,7 @@ fn bootstrap() -> TrustedSpaceBootstrapRequest {
     let genesis = OperationEnvelope::sign(
         space_id,
         entity(10),
-        EntitySchema::SpaceGenesisV1,
+        EntitySchema::SpaceGenesis,
         Vec::new(),
         Vec::new(),
         1_000,
@@ -235,7 +238,7 @@ fn bootstrap() -> TrustedSpaceBootstrapRequest {
     let initial_grant = OperationEnvelope::sign(
         space_id,
         entity(11),
-        EntitySchema::CapabilityGrantV1,
+        EntitySchema::CapabilityGrant,
         Vec::new(),
         vec![genesis.operation_id],
         1_001,
@@ -248,11 +251,10 @@ fn bootstrap() -> TrustedSpaceBootstrapRequest {
                     CapabilityAction::ReadSpace,
                 ],
                 schemas: vec![
-                    EntitySchema::EventV1,
-                    EntitySchema::ProfileV1,
-                    EntitySchema::RecordV1,
-                    EntitySchema::RecordV2,
-                    EntitySchema::TagV1,
+                    EntitySchema::Event,
+                    EntitySchema::Profile,
+                    EntitySchema::Record,
+                    EntitySchema::Tag,
                 ],
                 visibilities: vec![Visibility::Public, Visibility::Private],
                 content_roles: Vec::new(),
@@ -275,23 +277,23 @@ fn bootstrap() -> TrustedSpaceBootstrapRequest {
 }
 
 #[test]
-fn rejects_v1_and_projection_drift_before_repository_submission() {
+fn rejects_unsupported_version_and_projection_drift_before_repository_submission() {
     let repository = Arc::new(StubRepository::default());
     let service = ApplicationService::new(repository.clone());
     let space_id = space(1);
 
-    let mut version_one = record_operation(space_id);
-    version_one.protocol_version = 1;
+    let mut unsupported_version = record_operation(space_id);
+    unsupported_version.protocol_version = 2;
     assert!(matches!(
         service.submit_operation(
             space_id,
             SubmitOperationRequest {
-                operation: version_one,
+                operation: unsupported_version,
                 received_at_unix_ms: 2_100,
             },
         ),
         Err(ApplicationError::InvalidOperation(
-            DataModelError::UnsupportedProtocolVersion { found: 1, .. }
+            DataModelError::UnsupportedProtocolVersion { found: 2, .. }
         ))
     ));
 
@@ -430,7 +432,7 @@ fn trusted_bootstrap_requires_controller_signature_and_distinct_writer() {
     request.initial_grant = OperationEnvelope::sign(
         request.genesis.space_id,
         entity(11),
-        EntitySchema::CapabilityGrantV1,
+        EntitySchema::CapabilityGrant,
         Vec::new(),
         vec![request.genesis.operation_id],
         1_001,
@@ -476,7 +478,7 @@ fn trusted_bootstrap_rejects_a_broader_writer_scope() {
     request.initial_grant = OperationEnvelope::sign(
         request.genesis.space_id,
         request.initial_grant.entity_id,
-        EntitySchema::CapabilityGrantV1,
+        EntitySchema::CapabilityGrant,
         Vec::new(),
         vec![request.genesis.operation_id],
         1_001,
@@ -489,7 +491,7 @@ fn trusted_bootstrap_rejects_a_broader_writer_scope() {
                     CapabilityAction::IssueCapability,
                     CapabilityAction::ReadSpace,
                 ],
-                schemas: vec![EntitySchema::RecordV1],
+                schemas: vec![EntitySchema::Record],
                 visibilities: vec![Visibility::Public, Visibility::Private],
                 content_roles: Vec::new(),
                 max_resource_byte_length: None,

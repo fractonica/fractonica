@@ -236,7 +236,7 @@ function PairingPanel({ client, snapshot }: PairingPanelProps) {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const pairingAvailable = snapshot.node.capabilities.includes("noise-pairing-v1");
+  const pairingAvailable = snapshot.node.capabilities.includes("noise-pairing");
   const session = invitation?.session;
   const qr = invitation?.qr ?? "";
   const terminal = session && ["completed", "cancelled", "expired"].includes(session.state);
@@ -280,7 +280,7 @@ function PairingPanel({ client, snapshot }: PairingPanelProps) {
           expiresInMs: 5 * 60 * 1_000,
           capability: {
             actions: ["appendOperation", "readSpace", "writeContent"],
-            schemas: ["record.v1"],
+            schemas: ["record", "event", "tag", "profile"],
             visibilities: ["public", "private"],
             contentRoles: ["record.media"],
             maxResourceByteLength: 1_073_741_824,
@@ -364,7 +364,7 @@ function PairingPanel({ client, snapshot }: PairingPanelProps) {
             after five minutes and can be claimed once.
           </p>
         </div>
-        {pairingAvailable ? <StatusBadge tone="ready">Noise v1 ready</StatusBadge> : null}
+        {pairingAvailable ? <StatusBadge tone="ready">Noise ready</StatusBadge> : null}
       </header>
 
       {!pairingAvailable || snapshot.node.profile !== "node" ? (

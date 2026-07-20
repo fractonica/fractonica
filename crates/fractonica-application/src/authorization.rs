@@ -6,12 +6,12 @@
 
 use std::collections::BTreeSet;
 
-#[cfg(test)]
-use fractonica_data_model::RecordDocument;
 use fractonica_data_model::{
     ActorId, CapabilityAction, CapabilityGrant, EntitySchema, OperationBody, OperationEnvelope,
     OperationId, SpaceId, Visibility,
 };
+#[cfg(test)]
+use fractonica_data_model::{ProtectedDocument, RecordDocument};
 use thiserror::Error;
 
 /// Bounds hostile or corrupt grant graphs independently of signed CBOR bounds.
@@ -210,16 +210,14 @@ impl<'a> RequiredAuthority<'a> {
     ) -> Result<Self, AuthorizationError> {
         match (&operation.schema, &operation.body) {
             (
-                EntitySchema::RecordV1
-                | EntitySchema::RecordV2
-                | EntitySchema::TagV1
-                | EntitySchema::EventV1
-                | EntitySchema::ProfileV1,
-                OperationBody::Put { .. }
-                | OperationBody::PutRecordV2 { .. }
-                | OperationBody::PutTagV1 { .. }
-                | OperationBody::PutEventV1 { .. }
-                | OperationBody::PutProfileV1 { .. }
+                EntitySchema::Record
+                | EntitySchema::Tag
+                | EntitySchema::Event
+                | EntitySchema::Profile,
+                OperationBody::PutRecord { .. }
+                | OperationBody::PutTag { .. }
+                | OperationBody::PutEvent { .. }
+                | OperationBody::PutProfile { .. }
                 | OperationBody::Tombstone,
             ) => {
                 let Some(visibility) = visibility else {
@@ -230,13 +228,13 @@ impl<'a> RequiredAuthority<'a> {
                     visibility,
                 })
             }
-            (EntitySchema::CapabilityGrantV1, OperationBody::CapabilityGrant { grant }) => {
+            (EntitySchema::CapabilityGrant, OperationBody::CapabilityGrant { grant }) => {
                 Ok(Self::Issue(grant))
             }
-            (EntitySchema::CapabilityRevokeV1, OperationBody::CapabilityRevoke { .. }) => {
+            (EntitySchema::CapabilityRevoke, OperationBody::CapabilityRevoke { .. }) => {
                 Ok(Self::Revoke)
             }
-            (EntitySchema::SpaceGenesisV1, OperationBody::SpaceGenesis { .. }) => {
+            (EntitySchema::SpaceGenesis, OperationBody::SpaceGenesis { .. }) => {
                 Err(AuthorizationError::Denied)
             }
             _ => Err(AuthorizationError::Denied),
@@ -246,7 +244,7 @@ impl<'a> RequiredAuthority<'a> {
 
 #[derive(Clone)]
 enum EffectiveAuthority {
-    /// The locally anchored genesis controller may issue any bounded v1 grant
+    /// The locally anchored genesis controller may issue any bounded grant
     /// and revoke grants, but it is not an implicit application-data writer.
     RootController,
     Grant(Box<CapabilityGrant>),
@@ -348,7 +346,7 @@ impl<V: CapabilityView> EvaluationContext<'_, V> {
         }
 
         match (&operation.schema, &operation.body) {
-            (EntitySchema::SpaceGenesisV1, OperationBody::SpaceGenesis { controller }) => {
+            (EntitySchema::SpaceGenesis, OperationBody::SpaceGenesis { controller }) => {
                 if self.view.trusted_genesis(space_id)? != Some(operation_id) {
                     return Err(AuthorizationError::UntrustedGenesis(operation_id));
                 }
@@ -361,7 +359,7 @@ impl<V: CapabilityView> EvaluationContext<'_, V> {
                 }
                 Ok(EffectiveAuthority::RootController)
             }
-            (EntitySchema::CapabilityGrantV1, OperationBody::CapabilityGrant { grant }) => {
+            (EntitySchema::CapabilityGrant, OperationBody::CapabilityGrant { grant }) => {
                 if grant.subject != expected_subject {
                     return Err(AuthorizationError::SubjectMismatch {
                         grant_id: operation_id,
@@ -477,8 +475,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use fractonica_data_model::{
-        CapabilityRevocation, CapabilityRevocationReason, EntityId, OperationNonce,
-        SignedOperationEnvelope, SigningKey, Visibility,
+        CapabilityRevocation, CapabilityRevocationReason, EntityId, OperationEnvelope,
+        OperationNonce, SigningKey, Visibility,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -496,7 +494,7 @@ mod tests {
 
     impl MemoryView {
         fn insert(&mut self, operation: OperationEnvelope) {
-            if operation.schema == EntitySchema::SpaceGenesisV1 {
+            if operation.schema == EntitySchema::SpaceGenesis {
                 self.trusted_genesis
                     .insert(operation.space_id, operation.operation_id);
             }
@@ -546,10 +544,10 @@ mod tests {
     }
 
     fn genesis(space_id: SpaceId, controller: &SigningKey) -> OperationEnvelope {
-        SignedOperationEnvelope::sign(
+        OperationEnvelope::sign(
             space_id,
             entity(1),
-            EntitySchema::SpaceGenesisV1,
+            EntitySchema::SpaceGenesis,
             Vec::new(),
             Vec::new(),
             1,
@@ -570,10 +568,10 @@ mod tests {
         nonce_byte: u8,
         grant: CapabilityGrant,
     ) -> OperationEnvelope {
-        SignedOperationEnvelope::sign(
+        OperationEnvelope::sign(
             space_id,
             entity(entity_value),
-            EntitySchema::CapabilityGrantV1,
+            EntitySchema::CapabilityGrant,
             Vec::new(),
             authorization,
             2,
@@ -591,23 +589,36 @@ mod tests {
         visibility: Visibility,
         occurred_at_unix_ms: i64,
     ) -> OperationEnvelope {
-        SignedOperationEnvelope::sign(
+        OperationEnvelope::sign(
             space_id,
             entity(100),
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             Vec::new(),
             authorization,
             occurred_at_unix_ms,
             nonce(100),
-            OperationBody::Put {
-                document: RecordDocument {
-                    start_at_unix_ms: 5,
-                    end_at_unix_ms: None,
-                    visibility,
-                    emoji: Some("🌒".into()),
-                    text: Some("signed".into()),
-                    metadata: BTreeMap::from([("source".into(), json!("test"))]),
-                    resources: Vec::new(),
+            OperationBody::PutRecord {
+                payload: match visibility {
+                    Visibility::Public => ProtectedDocument::Public {
+                        document: RecordDocument {
+                            start_at_unix_ms: 5,
+                            end_at_unix_ms: None,
+                            emoji: Some("🌒".into()),
+                            text: Some("signed".into()),
+                            metadata: BTreeMap::from([("source".into(), json!("test"))]),
+                            resources: Vec::new(),
+                            references: Vec::new(),
+                        },
+                    },
+                    Visibility::Private => ProtectedDocument::Private {
+                        envelope: fractonica_data_model::EncryptedPayload {
+                            algorithm: fractonica_data_model::EncryptionAlgorithm::Aes256Gcm,
+                            key_id: format!("key:aes256:{}", "ab".repeat(32)),
+                            nonce_base64url: "AAAAAAAAAAAAAAAA".into(),
+                            ciphertext_base64url: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                        },
+                        resources: Vec::new(),
+                    },
                 },
             },
             actor,
@@ -619,7 +630,7 @@ mod tests {
         CapabilityGrant {
             subject,
             actions: vec![CapabilityAction::AppendOperation],
-            schemas: vec![EntitySchema::RecordV1],
+            schemas: vec![EntitySchema::Record],
             visibilities: vec![Visibility::Public],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
@@ -726,10 +737,10 @@ mod tests {
         let attacker = key(21);
         let worker = key(22);
         let trusted = genesis(space_id, &trusted_controller);
-        let untrusted = SignedOperationEnvelope::sign(
+        let untrusted = OperationEnvelope::sign(
             space_id,
             entity(90),
-            EntitySchema::SpaceGenesisV1,
+            EntitySchema::SpaceGenesis,
             Vec::new(),
             Vec::new(),
             1,
@@ -780,7 +791,7 @@ mod tests {
                 CapabilityAction::AppendOperation,
                 CapabilityAction::IssueCapability,
             ],
-            schemas: vec![EntitySchema::RecordV1],
+            schemas: vec![EntitySchema::Record],
             visibilities: vec![Visibility::Public],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
@@ -800,7 +811,7 @@ mod tests {
         let child = CapabilityGrant {
             subject: sensor.actor_id(),
             actions: vec![CapabilityAction::AppendOperation],
-            schemas: vec![EntitySchema::RecordV1],
+            schemas: vec![EntitySchema::Record],
             visibilities: vec![Visibility::Public],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
@@ -863,7 +874,7 @@ mod tests {
         let broader = CapabilityGrant {
             subject: sensor.actor_id(),
             actions: vec![CapabilityAction::AppendOperation],
-            schemas: vec![EntitySchema::RecordV1],
+            schemas: vec![EntitySchema::Record],
             visibilities: vec![Visibility::Public, Visibility::Private],
             content_roles: Vec::new(),
             max_resource_byte_length: None,
@@ -918,10 +929,10 @@ mod tests {
             2,
             writer_grant(writer.actor_id()),
         );
-        let revocation = SignedOperationEnvelope::sign(
+        let revocation = OperationEnvelope::sign(
             space_id,
             entity(3),
-            EntitySchema::CapabilityRevokeV1,
+            EntitySchema::CapabilityRevoke,
             Vec::new(),
             vec![writer_grant.operation_id],
             NOW,

@@ -1,8 +1,9 @@
 use fractonica_application::{
-    EntityState, MAX_CHANGE_LIMIT, MAX_ENTITY_HEADS, OperationChangePage, OperationRepository,
-    PeerReadChangesRequest, RepositoryError, RepositoryReadiness, SpaceDescriptor, StoredOperation,
-    SubmitOperationRequest, SubmitOperationResult, TrustedSpaceBootstrapRequest,
-    TrustedSpaceBootstrapResult,
+    ClientEntityPage, ClientEntitySummary, ClientProjectionCursor, ClientStats, EntityState,
+    MAX_CHANGE_LIMIT, MAX_CLIENT_QUERY_LIMIT, MAX_ENTITY_HEADS, OperationChangePage,
+    OperationRepository, PeerReadChangesRequest, RepositoryError, RepositoryReadiness,
+    SpaceDescriptor, StoredOperation, SubmitOperationRequest, SubmitOperationResult,
+    TrustedSpaceBootstrapRequest, TrustedSpaceBootstrapResult,
     authorization::{
         CapabilityView, CapabilityViewError, authorize_capability_action, authorize_operation,
         authorize_operation_for_visibility,
@@ -16,7 +17,9 @@ use fractonica_data_model::{
 use fractonica_trust::SignedOperation as TrustSignedOperation;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
-use super::{SqliteStore, positive_u64, repository_sqlite, repository_unavailable};
+use super::{
+    SqliteStore, nonnegative_u64, positive_u64, repository_sqlite, repository_unavailable,
+};
 
 const STORED_COLUMNS: &str = "local_sequence, operation_id, protocol_version, space_id, entity_id, \
     schema_id, actor_id, occurred_at_unix_ms, received_at_unix_ms, nonce, canonical_payload, \
@@ -338,6 +341,29 @@ impl OperationRepository for SqliteStore {
         load_changes(&connection, space_id, after_local_sequence, limit)
     }
 
+    fn client_entities(
+        &self,
+        space_id: SpaceId,
+        schema: EntitySchema,
+        cursor: Option<&ClientProjectionCursor>,
+        limit: usize,
+    ) -> Result<ClientEntityPage, RepositoryError> {
+        if !(1..=MAX_CLIENT_QUERY_LIMIT).contains(&limit) {
+            return Err(RepositoryError::InvalidTopology(format!(
+                "client query limit must be between 1 and {MAX_CLIENT_QUERY_LIMIT}"
+            )));
+        }
+        let connection = lock(self)?;
+        require_space(&connection, space_id)?;
+        load_client_entities(&connection, space_id, schema, cursor, limit)
+    }
+
+    fn client_stats(&self, space_id: SpaceId) -> Result<ClientStats, RepositoryError> {
+        let connection = lock(self)?;
+        require_space(&connection, space_id)?;
+        load_client_stats(&connection, space_id)
+    }
+
     fn peer_changes(
         &self,
         request: &PeerReadChangesRequest,
@@ -447,6 +473,205 @@ impl OperationRepository for SqliteStore {
         transaction.commit().map_err(repository_sqlite)?;
         Ok(page)
     }
+}
+
+impl SqliteStore {
+    /// Recreates the disposable client read model from admitted operations.
+    ///
+    /// The signed operation log remains authoritative. This operation is safe
+    /// to run after projection code changes or after detecting projection
+    /// corruption; it never changes operations, heads, capabilities, or
+    /// content metadata.
+    pub fn rebuild_client_projections(&self) -> Result<u64, RepositoryError> {
+        let mut connection = lock_mut(self)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(repository_sqlite)?;
+        let operations = {
+            let mut statement = transaction
+                .prepare(&format!(
+                    "SELECT {STORED_COLUMNS} FROM operations ORDER BY local_sequence"
+                ))
+                .map_err(repository_sqlite)?;
+            let mut rows = statement.query([]).map_err(repository_sqlite)?;
+            let mut operations = Vec::new();
+            while let Some(row) = rows.next().map_err(repository_sqlite)? {
+                operations.push(decode_stored(row)?.operation);
+            }
+            operations
+        };
+        transaction
+            .execute("DELETE FROM client_operation_projections", [])
+            .map_err(repository_sqlite)?;
+        let mut rebuilt = 0_u64;
+        for operation in &operations {
+            insert_client_projection(&transaction, operation)?;
+            if matches!(
+                operation.schema,
+                EntitySchema::Record
+                    | EntitySchema::Event
+                    | EntitySchema::Tag
+                    | EntitySchema::Profile
+            ) {
+                rebuilt = rebuilt
+                    .checked_add(1)
+                    .ok_or_else(|| corrupt("client projection count overflow"))?;
+            }
+        }
+        transaction.commit().map_err(repository_sqlite)?;
+        Ok(rebuilt)
+    }
+}
+
+fn load_client_entities(
+    connection: &Connection,
+    space_id: SpaceId,
+    schema: EntitySchema,
+    cursor: Option<&ClientProjectionCursor>,
+    limit: usize,
+) -> Result<ClientEntityPage, RepositoryError> {
+    let temporal = matches!(schema, EntitySchema::Record | EntitySchema::Event);
+    let predicate = if temporal {
+        "(?3 IS NULL OR COALESCE(p.start_at_unix_ms, -1) < ?3 OR
+          (COALESCE(p.start_at_unix_ms, -1) = ?3 AND
+           (p.entity_id > ?5 OR (p.entity_id = ?5 AND p.operation_id > ?6))))"
+    } else {
+        "(?4 IS NULL OR COALESCE(p.sort_text, '') > ?4 OR
+          (COALESCE(p.sort_text, '') = ?4 AND
+           (p.entity_id > ?5 OR (p.entity_id = ?5 AND p.operation_id > ?6))))"
+    };
+    let order = if temporal {
+        "COALESCE(p.start_at_unix_ms, -1) DESC, p.entity_id, p.operation_id"
+    } else {
+        "COALESCE(p.sort_text, ''), p.entity_id, p.operation_id"
+    };
+    let sql = format!(
+        "SELECT p.operation_id, p.visibility, p.start_at_unix_ms, p.end_at_unix_ms,
+                p.sort_text, p.resource_count, p.media_bytes,
+                (SELECT count(*) FROM entity_heads h2
+                 WHERE h2.space_id = p.space_id AND h2.entity_id = p.entity_id) > 1
+         FROM client_operation_projections p
+         JOIN entity_heads h ON h.space_id = p.space_id
+              AND h.entity_id = p.entity_id AND h.schema_id = p.schema_id
+              AND h.operation_id = p.operation_id
+         WHERE p.space_id = ?1 AND p.schema_id = ?2 AND p.tombstone = 0
+           AND {predicate}
+         ORDER BY {order}
+         LIMIT ?7"
+    );
+    let sort_number = cursor.and_then(|value| value.sort_number);
+    let sort_text = cursor.and_then(|value| value.sort_text.as_deref());
+    let cursor_entity = cursor.map(|value| value.entity_id.to_string());
+    let cursor_operation = cursor.map(|value| value.operation_id.to_string());
+    let fetch_limit = i64::try_from(limit.saturating_add(1))
+        .map_err(|_| RepositoryError::InvalidTopology("client query limit overflow".into()))?;
+    let mut statement = connection.prepare(&sql).map_err(repository_sqlite)?;
+    let mut rows = statement
+        .query(params![
+            space_id.to_string(),
+            schema.as_str(),
+            sort_number,
+            sort_text,
+            cursor_entity,
+            cursor_operation,
+            fetch_limit,
+        ])
+        .map_err(repository_sqlite)?;
+    let mut projected = Vec::new();
+    while let Some(row) = rows.next().map_err(repository_sqlite)? {
+        projected.push((
+            row.get::<_, String>(0).map_err(repository_sqlite)?,
+            row.get::<_, String>(1).map_err(repository_sqlite)?,
+            row.get::<_, Option<i64>>(2).map_err(repository_sqlite)?,
+            row.get::<_, Option<i64>>(3).map_err(repository_sqlite)?,
+            row.get::<_, Option<String>>(4).map_err(repository_sqlite)?,
+            row.get::<_, i64>(5).map_err(repository_sqlite)?,
+            row.get::<_, i64>(6).map_err(repository_sqlite)?,
+            row.get::<_, bool>(7).map_err(repository_sqlite)?,
+        ));
+    }
+    drop(rows);
+    drop(statement);
+    let has_more = projected.len() > limit;
+    if has_more {
+        projected.pop();
+    }
+    let mut items = Vec::with_capacity(projected.len());
+    for (operation_id, visibility, start, end, sort_text, resources, media_bytes, conflicted) in
+        projected
+    {
+        let operation_id = OperationId::parse(&operation_id)
+            .map_err(|error| corrupt(format!("invalid projected operation ID: {error}")))?;
+        let operation = load_stored(connection, operation_id)?
+            .ok_or_else(|| corrupt("projected operation is missing"))?;
+        items.push(ClientEntitySummary {
+            operation,
+            visibility: parse_visibility(&visibility)?,
+            conflicted,
+            start_at_unix_ms: start,
+            end_at_unix_ms: end,
+            sort_text,
+            resource_count: nonnegative_u64(resources)?,
+            media_bytes: nonnegative_u64(media_bytes)?,
+        });
+    }
+    let next_cursor = has_more && !items.is_empty();
+    let next_cursor = next_cursor.then(|| {
+        let last = items.last().expect("checked nonempty client page");
+        ClientProjectionCursor {
+            sort_number: temporal.then_some(last.start_at_unix_ms.unwrap_or(-1)),
+            sort_text: (!temporal).then(|| last.sort_text.clone().unwrap_or_default()),
+            entity_id: last.operation.operation.entity_id,
+            operation_id: last.operation.operation.operation_id,
+        }
+    });
+    Ok(ClientEntityPage {
+        space_id,
+        schema,
+        items,
+        next_cursor,
+    })
+}
+
+fn load_client_stats(
+    connection: &Connection,
+    space_id: SpaceId,
+) -> Result<ClientStats, RepositoryError> {
+    let values: (i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                count(DISTINCT CASE WHEN p.schema_id = 'record' THEN p.entity_id END),
+                count(DISTINCT CASE WHEN p.schema_id = 'event' THEN p.entity_id END),
+                count(DISTINCT CASE WHEN p.schema_id = 'tag' THEN p.entity_id END),
+                count(DISTINCT CASE WHEN p.schema_id = 'profile' THEN p.entity_id END),
+                coalesce(sum(p.resource_count), 0),
+                coalesce(sum(p.media_bytes), 0)
+             FROM client_operation_projections p
+             JOIN entity_heads h ON h.space_id = p.space_id
+                  AND h.entity_id = p.entity_id AND h.schema_id = p.schema_id
+                  AND h.operation_id = p.operation_id
+             WHERE p.space_id = ?1 AND p.tombstone = 0",
+            params![space_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(repository_sqlite)?;
+    Ok(ClientStats {
+        records: nonnegative_u64(values.0)?,
+        events: nonnegative_u64(values.1)?,
+        tags: nonnegative_u64(values.2)?,
+        profiles: nonnegative_u64(values.3)?,
+        media_files: nonnegative_u64(values.4)?,
+        media_bytes: nonnegative_u64(values.5)?,
+    })
 }
 
 fn load_changes(
@@ -598,11 +823,10 @@ fn validate_bootstrap(request: &TrustedSpaceBootstrapRequest) -> Result<(), Repo
             ]
         && grant.schemas
             == [
-                EntitySchema::EventV1,
-                EntitySchema::ProfileV1,
-                EntitySchema::RecordV1,
-                EntitySchema::RecordV2,
-                EntitySchema::TagV1,
+                EntitySchema::Event,
+                EntitySchema::Profile,
+                EntitySchema::Record,
+                EntitySchema::Tag,
             ]
         && grant.visibilities == [Visibility::Public, Visibility::Private]
         && grant.content_roles.is_empty()
@@ -614,7 +838,7 @@ fn validate_bootstrap(request: &TrustedSpaceBootstrapRequest) -> Result<(), Repo
         || request.initial_grant.actor_id != controller
         || !request.initial_grant.causal_parents.is_empty()
         || request.initial_grant.authorization != [request.genesis.operation_id]
-        || request.initial_grant.schema != EntitySchema::CapabilityGrantV1
+        || request.initial_grant.schema != EntitySchema::CapabilityGrant
         || request.initial_grant.entity_id == request.genesis.entity_id
         || !exact_grant
     {
@@ -871,6 +1095,8 @@ fn insert_operation(
             .map_err(repository_sqlite)?;
     }
 
+    insert_client_projection(transaction, operation)?;
+
     for (position, parent) in operation.causal_parents.iter().enumerate() {
         transaction
             .execute(
@@ -972,6 +1198,121 @@ fn insert_operation(
         received_at_unix_ms,
         operation: operation.clone(),
     })
+}
+
+fn insert_client_projection(
+    transaction: &Transaction<'_>,
+    operation: &OperationEnvelope,
+) -> Result<(), RepositoryError> {
+    use fractonica_data_model::ProtectedDocument;
+
+    let (start_at_unix_ms, end_at_unix_ms, sort_text, resources) = match &operation.body {
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public { document },
+        } => (
+            Some(document.start_at_unix_ms),
+            document.end_at_unix_ms,
+            None,
+            document.resources.as_slice(),
+        ),
+        OperationBody::PutEvent {
+            payload: ProtectedDocument::Public { document },
+        } => (
+            Some(document.start_at_unix_ms),
+            document.end_at_unix_ms,
+            Some(document.label.to_lowercase()),
+            &[] as &[fractonica_content::ResourceRef],
+        ),
+        OperationBody::PutTag {
+            payload: ProtectedDocument::Public { document },
+        } => (
+            None,
+            None,
+            Some(document.name.to_lowercase()),
+            &[] as &[fractonica_content::ResourceRef],
+        ),
+        OperationBody::PutProfile { document } => (
+            None,
+            None,
+            Some(document.handle.clone()),
+            document.avatar.as_slice(),
+        ),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Private { resources, .. },
+        } => (None, None, None, resources.as_slice()),
+        OperationBody::PutTag {
+            payload: ProtectedDocument::Private { .. },
+        }
+        | OperationBody::PutEvent {
+            payload: ProtectedDocument::Private { .. },
+        }
+        | OperationBody::Tombstone
+            if matches!(
+                operation.schema,
+                EntitySchema::Record
+                    | EntitySchema::Event
+                    | EntitySchema::Tag
+                    | EntitySchema::Profile
+            ) =>
+        {
+            (None, None, None, &[] as &[fractonica_content::ResourceRef])
+        }
+        _ => return Ok(()),
+    };
+    let visibility = if let Some(visibility) = operation.body.declared_visibility() {
+        visibility_key(visibility).to_owned()
+    } else {
+        transaction
+            .query_row(
+                "SELECT visibility FROM client_entity_visibility
+                 WHERE space_id = ?1 AND entity_id = ?2 AND schema_id = ?3",
+                params![
+                    operation.space_id.to_string(),
+                    operation.entity_id.to_string(),
+                    operation.schema.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(repository_sqlite)?
+            .ok_or_else(|| corrupt("client projection is missing immutable visibility"))?
+    };
+    let resource_count = i64::try_from(resources.len())
+        .map_err(|_| corrupt("client projection resource count exceeds SQLite"))?;
+    let media_bytes = resources.iter().try_fold(0_i64, |total, resource| {
+        let bytes = i64::try_from(resource.byte_length)
+            .map_err(|_| corrupt("client projection media bytes exceed SQLite"))?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| corrupt("client projection media byte total overflows"))
+    })?;
+    let body_json = serde_json::to_string(&operation.body)
+        .map_err(|error| corrupt(format!("client projection body is not JSON: {error}")))?;
+    transaction
+        .execute(
+            "INSERT INTO client_operation_projections (
+                space_id, operation_id, entity_id, schema_id, actor_id, visibility,
+                tombstone, start_at_unix_ms, end_at_unix_ms, sort_text,
+                resource_count, media_bytes, body_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                operation.space_id.to_string(),
+                operation.operation_id.to_string(),
+                operation.entity_id.to_string(),
+                operation.schema.as_str(),
+                operation.actor_id.to_string(),
+                visibility,
+                i64::from(matches!(operation.body, OperationBody::Tombstone)),
+                start_at_unix_ms,
+                end_at_unix_ms,
+                sort_text,
+                resource_count,
+                media_bytes,
+                body_json,
+            ],
+        )
+        .map_err(repository_sqlite)?;
+    Ok(())
 }
 
 fn insert_grant(
@@ -1184,11 +1525,7 @@ fn visibility_for_admission(
 ) -> Result<Option<Visibility>, RepositoryError> {
     if !matches!(
         operation.schema,
-        EntitySchema::RecordV1
-            | EntitySchema::RecordV2
-            | EntitySchema::TagV1
-            | EntitySchema::EventV1
-            | EntitySchema::ProfileV1
+        EntitySchema::Record | EntitySchema::Tag | EntitySchema::Event | EntitySchema::Profile
     ) {
         return Ok(None);
     }
@@ -1365,7 +1702,8 @@ mod tests {
 
     use fractonica_application::ContentRepository;
     use fractonica_data_model::{
-        CapabilityGrant, CapabilityRevocation, OperationNonce, RecordDocument, SigningKey,
+        CapabilityGrant, CapabilityRevocation, EncryptedPayload, EncryptionAlgorithm,
+        OperationNonce, ProtectedDocument, RecordDocument, SigningKey,
     };
     use fractonica_peer::{
         PeerReadChangesFields, PeerReadChangesProof, PeerRequestNonce, PeerSessionId,
@@ -1375,6 +1713,36 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    fn public_record(start_at_unix_ms: i64, text: impl Into<String>) -> OperationBody {
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public {
+                document: RecordDocument {
+                    start_at_unix_ms,
+                    end_at_unix_ms: None,
+                    emoji: None,
+                    text: Some(text.into()),
+                    metadata: BTreeMap::new(),
+                    resources: Vec::new(),
+                    references: Vec::new(),
+                },
+            },
+        }
+    }
+
+    fn private_record() -> OperationBody {
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Private {
+                envelope: EncryptedPayload {
+                    algorithm: EncryptionAlgorithm::Aes256Gcm,
+                    key_id: format!("key:aes256:{}", "ab".repeat(32)),
+                    nonce_base64url: "AAAAAAAAAAAAAAAA".into(),
+                    ciphertext_base64url: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                },
+                resources: Vec::new(),
+            },
+        }
+    }
 
     struct Fixture {
         store: SqliteStore,
@@ -1393,7 +1761,7 @@ mod tests {
             let writer = SigningKey::from_seed([2; 32]);
             let genesis = sign(
                 space_id,
-                EntitySchema::SpaceGenesisV1,
+                EntitySchema::SpaceGenesis,
                 vec![],
                 vec![],
                 OperationBody::SpaceGenesis {
@@ -1404,7 +1772,7 @@ mod tests {
             );
             let writer_grant = sign(
                 space_id,
-                EntitySchema::CapabilityGrantV1,
+                EntitySchema::CapabilityGrant,
                 vec![],
                 vec![genesis.operation_id],
                 OperationBody::CapabilityGrant {
@@ -1415,11 +1783,10 @@ mod tests {
                             CapabilityAction::ReadSpace,
                         ],
                         schemas: vec![
-                            EntitySchema::EventV1,
-                            EntitySchema::ProfileV1,
-                            EntitySchema::RecordV1,
-                            EntitySchema::RecordV2,
-                            EntitySchema::TagV1,
+                            EntitySchema::Event,
+                            EntitySchema::Profile,
+                            EntitySchema::Record,
+                            EntitySchema::Tag,
                         ],
                         visibilities: vec![Visibility::Public, Visibility::Private],
                         content_roles: vec![],
@@ -1461,22 +1828,12 @@ mod tests {
             OperationEnvelope::sign(
                 self.space_id,
                 entity_id,
-                EntitySchema::RecordV1,
+                EntitySchema::Record,
                 parents,
                 vec![self.writer_grant.operation_id],
                 100 + i64::from(seed),
                 OperationNonce::from_bytes([seed; 16]),
-                OperationBody::Put {
-                    document: RecordDocument {
-                        start_at_unix_ms: 100,
-                        end_at_unix_ms: None,
-                        visibility: Visibility::Public,
-                        emoji: None,
-                        text: Some(format!("record {seed}")),
-                        metadata: BTreeMap::new(),
-                        resources: vec![],
-                    },
-                },
+                public_record(100, format!("record {seed}")),
                 &self.writer,
             )
             .unwrap()
@@ -1568,7 +1925,7 @@ mod tests {
 
         let revocation = sign(
             fixture.space_id,
-            EntitySchema::CapabilityRevokeV1,
+            EntitySchema::CapabilityRevoke,
             vec![],
             vec![fixture.genesis.operation_id],
             OperationBody::CapabilityRevoke {
@@ -1668,7 +2025,7 @@ mod tests {
         let writer = SigningKey::from_seed([writer_seed; 32]);
         let genesis = sign(
             space_id,
-            EntitySchema::SpaceGenesisV1,
+            EntitySchema::SpaceGenesis,
             vec![],
             vec![],
             OperationBody::SpaceGenesis {
@@ -1679,7 +2036,7 @@ mod tests {
         );
         let grant = sign(
             space_id,
-            EntitySchema::CapabilityGrantV1,
+            EntitySchema::CapabilityGrant,
             vec![],
             vec![genesis.operation_id],
             OperationBody::CapabilityGrant {
@@ -1690,11 +2047,10 @@ mod tests {
                         CapabilityAction::ReadSpace,
                     ],
                     schemas: vec![
-                        EntitySchema::EventV1,
-                        EntitySchema::ProfileV1,
-                        EntitySchema::RecordV1,
-                        EntitySchema::RecordV2,
-                        EntitySchema::TagV1,
+                        EntitySchema::Event,
+                        EntitySchema::Profile,
+                        EntitySchema::Record,
+                        EntitySchema::Tag,
                     ],
                     visibilities: vec![Visibility::Public, Visibility::Private],
                     content_roles: vec![],
@@ -1792,6 +2148,66 @@ mod tests {
     }
 
     #[test]
+    fn client_projection_is_bounded_query_state_rebuildable_from_operations() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.store.client_stats(fixture.space_id).unwrap(),
+            ClientStats::default()
+        );
+
+        let entity_id = EntityId::new(Uuid::from_bytes([77; 16]));
+        let record = fixture.record(entity_id, vec![], 77);
+        fixture
+            .store
+            .submit_operation(
+                fixture.space_id,
+                &SubmitOperationRequest {
+                    operation: record.clone(),
+                    received_at_unix_ms: 500,
+                },
+            )
+            .unwrap();
+
+        let page = fixture
+            .store
+            .client_entities(fixture.space_id, EntitySchema::Record, None, 10)
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].operation.operation.operation_id,
+            record.operation_id
+        );
+        assert_eq!(page.items[0].start_at_unix_ms, Some(100));
+        assert_eq!(
+            fixture
+                .store
+                .client_stats(fixture.space_id)
+                .unwrap()
+                .records,
+            1
+        );
+
+        fixture
+            .store
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM client_operation_projections", [])
+            .unwrap();
+        assert_eq!(
+            fixture.store.client_stats(fixture.space_id).unwrap(),
+            ClientStats::default()
+        );
+
+        assert_eq!(fixture.store.rebuild_client_projections().unwrap(), 1);
+        let rebuilt = fixture
+            .store
+            .client_entities(fixture.space_id, EntitySchema::Record, None, 10)
+            .unwrap();
+        assert_eq!(rebuilt, page);
+    }
+
+    #[test]
     fn rejects_missing_and_mismatched_parents_without_partial_writes() {
         let fixture = Fixture::new();
         let entity_id = EntityId::new(Uuid::from_bytes([55; 16]));
@@ -1866,7 +2282,7 @@ mod tests {
         let worker = SigningKey::from_seed([8; 32]);
         let parent_grant = sign(
             fixture.space_id,
-            EntitySchema::CapabilityGrantV1,
+            EntitySchema::CapabilityGrant,
             vec![],
             vec![fixture.genesis.operation_id],
             OperationBody::CapabilityGrant {
@@ -1876,7 +2292,7 @@ mod tests {
                         CapabilityAction::AppendOperation,
                         CapabilityAction::IssueCapability,
                     ],
-                    schemas: vec![EntitySchema::RecordV1],
+                    schemas: vec![EntitySchema::Record],
                     visibilities: vec![Visibility::Public, Visibility::Private],
                     content_roles: vec![],
                     max_resource_byte_length: None,
@@ -1902,14 +2318,14 @@ mod tests {
 
         let child_grant = sign(
             fixture.space_id,
-            EntitySchema::CapabilityGrantV1,
+            EntitySchema::CapabilityGrant,
             vec![],
             vec![parent_grant.operation_id],
             OperationBody::CapabilityGrant {
                 grant: CapabilityGrant {
                     subject: worker.actor_id(),
                     actions: vec![CapabilityAction::AppendOperation],
-                    schemas: vec![EntitySchema::RecordV1],
+                    schemas: vec![EntitySchema::Record],
                     visibilities: vec![Visibility::Public],
                     content_roles: vec![],
                     max_resource_byte_length: None,
@@ -1937,22 +2353,12 @@ mod tests {
         let first = OperationEnvelope::sign(
             fixture.space_id,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             vec![],
             vec![child_grant.operation_id],
             702,
             OperationNonce::from_bytes([13; 16]),
-            OperationBody::Put {
-                document: RecordDocument {
-                    start_at_unix_ms: 702,
-                    end_at_unix_ms: None,
-                    visibility: Visibility::Public,
-                    emoji: None,
-                    text: Some("authorized through two grants".into()),
-                    metadata: BTreeMap::new(),
-                    resources: vec![],
-                },
-            },
+            public_record(702, "authorized through two grants"),
             &worker,
         )
         .unwrap();
@@ -1969,7 +2375,7 @@ mod tests {
 
         let revoke = sign(
             fixture.space_id,
-            EntitySchema::CapabilityRevokeV1,
+            EntitySchema::CapabilityRevoke,
             vec![],
             vec![fixture.genesis.operation_id],
             OperationBody::CapabilityRevoke {
@@ -1996,7 +2402,7 @@ mod tests {
         let second = OperationEnvelope::sign(
             fixture.space_id,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             vec![first.operation_id],
             vec![child_grant.operation_id],
             704,
@@ -2027,59 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_nonempty_legacy_log_without_destroying_it() {
-        let temporary = tempdir().unwrap();
-        let path = temporary.path().join("legacy.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        for migration in &super::super::MIGRATIONS[..2] {
-            connection.execute_batch(migration.sql).unwrap();
-        }
-        connection
-            .execute(
-                "INSERT INTO operations (
-                operation_id, protocol_version, entity_id, schema_id, actor_id,
-                kind, occurred_at_unix_ms, received_at_unix_ms, payload
-             ) VALUES ('legacy-op', 1, 'legacy-entity', 'record.v1', 'legacy-actor',
-                       'put', 1, 2, x'7b7d')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-        make_legacy_fixture_private(temporary.path(), &path);
-
-        assert!(matches!(
-            SqliteStore::open(&path),
-            Err(super::super::StoreError::LegacyMigrationRequired)
-        ));
-        let connection = Connection::open(&path).unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM operations", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master
-                     WHERE type = 'table' AND name = 'blobs'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn v4_migration_preserves_content_and_upload_metadata() {
+    fn schema_upgrade_preserves_content_and_upload_metadata() {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("content.sqlite3");
         let content_id = fractonica_content::hash_bytes(b"preserved");
@@ -2166,12 +2520,26 @@ mod tests {
                 .len(),
             2
         );
+        let conflicted = fixture
+            .store
+            .client_entities(fixture.space_id, EntitySchema::Record, None, 10)
+            .unwrap();
+        assert_eq!(conflicted.items.len(), 2);
+        assert!(conflicted.items.iter().all(|item| item.conflicted));
+        assert_eq!(
+            fixture
+                .store
+                .client_stats(fixture.space_id)
+                .unwrap()
+                .records,
+            1
+        );
         let mut parents = vec![left.operation_id, right.operation_id];
         parents.sort_unstable();
         let tombstone = OperationEnvelope::sign(
             fixture.space_id,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             parents,
             vec![fixture.writer_grant.operation_id],
             802,
@@ -2205,6 +2573,22 @@ mod tests {
             state.heads[0].operation.body,
             OperationBody::Tombstone
         ));
+        assert!(
+            fixture
+                .store
+                .client_entities(fixture.space_id, EntitySchema::Record, None, 10)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .client_stats(fixture.space_id)
+                .unwrap()
+                .records,
+            0
+        );
     }
 
     #[test]
@@ -2252,22 +2636,12 @@ mod tests {
             OperationEnvelope::sign(
                 space_id,
                 entity_id,
-                EntitySchema::RecordV1,
+                EntitySchema::Record,
                 vec![],
                 vec![authorization],
                 1_000,
                 OperationNonce::from_bytes([nonce; 16]),
-                OperationBody::Put {
-                    document: RecordDocument {
-                        start_at_unix_ms: 1_000,
-                        end_at_unix_ms: None,
-                        visibility: Visibility::Public,
-                        emoji: None,
-                        text: Some(format!("space {nonce}")),
-                        metadata: BTreeMap::new(),
-                        resources: vec![],
-                    },
-                },
+                public_record(1_000, format!("space {nonce}")),
                 key,
             )
             .unwrap()
@@ -2324,7 +2698,7 @@ mod tests {
         let cross_parent = OperationEnvelope::sign(
             space_b,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             vec![operation_a.operation_id],
             vec![grant_b.operation_id],
             1_001,
@@ -2348,14 +2722,14 @@ mod tests {
         let public_writer = SigningKey::from_seed([81; 32]);
         let public_grant = sign(
             fixture.space_id,
-            EntitySchema::CapabilityGrantV1,
+            EntitySchema::CapabilityGrant,
             vec![],
             vec![fixture.genesis.operation_id],
             OperationBody::CapabilityGrant {
                 grant: CapabilityGrant {
                     subject: public_writer.actor_id(),
                     actions: vec![CapabilityAction::AppendOperation],
-                    schemas: vec![EntitySchema::RecordV1],
+                    schemas: vec![EntitySchema::Record],
                     visibilities: vec![Visibility::Public],
                     content_roles: vec![],
                     max_resource_byte_length: None,
@@ -2383,22 +2757,12 @@ mod tests {
         let private = OperationEnvelope::sign(
             fixture.space_id,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             vec![],
             vec![fixture.writer_grant.operation_id],
             1_101,
             OperationNonce::from_bytes([83; 16]),
-            OperationBody::Put {
-                document: RecordDocument {
-                    start_at_unix_ms: 1_101,
-                    end_at_unix_ms: None,
-                    visibility: Visibility::Private,
-                    emoji: None,
-                    text: Some("private".into()),
-                    metadata: BTreeMap::new(),
-                    resources: vec![],
-                },
-            },
+            private_record(),
             &fixture.writer,
         )
         .unwrap();
@@ -2416,29 +2780,19 @@ mod tests {
         let public_put = OperationEnvelope::sign(
             fixture.space_id,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             vec![private.operation_id],
             vec![public_grant.operation_id],
             1_102,
             OperationNonce::from_bytes([84; 16]),
-            OperationBody::Put {
-                document: RecordDocument {
-                    start_at_unix_ms: 1_101,
-                    end_at_unix_ms: None,
-                    visibility: Visibility::Public,
-                    emoji: None,
-                    text: Some("visibility oracle attempt".into()),
-                    metadata: BTreeMap::new(),
-                    resources: vec![],
-                },
-            },
+            public_record(1_101, "visibility oracle attempt"),
             &public_writer,
         )
         .unwrap();
         let tombstone = OperationEnvelope::sign(
             fixture.space_id,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             vec![private.operation_id],
             vec![public_grant.operation_id],
             1_103,
@@ -2500,7 +2854,7 @@ mod tests {
         let tombstone = OperationEnvelope::sign(
             fixture.space_id,
             entity_id,
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             vec![record.operation_id],
             vec![fixture.writer_grant.operation_id],
             1_201,
@@ -2527,14 +2881,14 @@ mod tests {
         let expiring_writer = SigningKey::from_seed([88; 32]);
         let expiring_grant = sign(
             fixture.space_id,
-            EntitySchema::CapabilityGrantV1,
+            EntitySchema::CapabilityGrant,
             vec![],
             vec![fixture.genesis.operation_id],
             OperationBody::CapabilityGrant {
                 grant: CapabilityGrant {
                     subject: expiring_writer.actor_id(),
                     actions: vec![CapabilityAction::AppendOperation],
-                    schemas: vec![EntitySchema::RecordV1],
+                    schemas: vec![EntitySchema::Record],
                     visibilities: vec![Visibility::Public],
                     content_roles: vec![],
                     max_resource_byte_length: None,
@@ -2561,22 +2915,12 @@ mod tests {
             OperationEnvelope::sign(
                 fixture.space_id,
                 EntityId::new(Uuid::from_bytes([entity_byte; 16])),
-                EntitySchema::RecordV1,
+                EntitySchema::Record,
                 vec![],
                 vec![expiring_grant.operation_id],
                 900,
                 OperationNonce::from_bytes([nonce_byte; 16]),
-                OperationBody::Put {
-                    document: RecordDocument {
-                        start_at_unix_ms: 900,
-                        end_at_unix_ms: None,
-                        visibility: Visibility::Public,
-                        emoji: None,
-                        text: Some("clock rollback probe".into()),
-                        metadata: BTreeMap::new(),
-                        resources: vec![],
-                    },
-                },
+                public_record(900, "clock rollback probe"),
                 &expiring_writer,
             )
             .unwrap()

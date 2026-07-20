@@ -1,6 +1,5 @@
--- Protocol v2 is a clean replacement for the unsigned UUID operation log.
--- The Rust migration boundary verifies this condition before executing SQL;
--- this guard prevents accidental destructive application by another caller.
+-- Establish the signed, space-scoped operation store. Earlier migrations are
+-- development scaffolding only and contain no supported Fractonica data.
 CREATE TEMP TABLE _fractonica_v4_empty_legacy_guard (
     operation_count INTEGER NOT NULL CHECK (operation_count = 0)
 ) STRICT;
@@ -90,7 +89,7 @@ CREATE TABLE operations (
         AND substr(operation_id, 1, 8) = 'sha-256:'
         AND substr(operation_id, 9) NOT GLOB '*[^0-9a-f]*'
     ),
-    protocol_version INTEGER NOT NULL CHECK (protocol_version = 2),
+    protocol_version INTEGER NOT NULL CHECK (protocol_version = 1),
     space_id TEXT NOT NULL,
     entity_id TEXT NOT NULL CHECK (
         length(entity_id) = 36
@@ -103,14 +102,13 @@ CREATE TABLE operations (
         AND entity_id <> '00000000-0000-0000-0000-000000000000'
     ),
     schema_id TEXT NOT NULL CHECK (schema_id IN (
-        'event.v1',
-        'profile.v1',
-        'record.v1',
-        'record.v2',
-        'space.genesis.v1',
-        'capability.grant.v1',
-        'capability.revoke.v1',
-        'tag.v1'
+        'event',
+        'profile',
+        'record',
+        'space.genesis',
+        'capability.grant',
+        'capability.revoke',
+        'tag'
     )),
     actor_id TEXT NOT NULL CHECK (
         length(actor_id) = 78
@@ -167,12 +165,12 @@ BEGIN
     SELECT RAISE(ABORT, 'entity schema mismatch');
 END;
 
--- A space.genesis.v1 operation must be the exact locally selected trust
+-- A space.genesis operation must be the exact locally selected trust
 -- anchor, and the selected anchor must use that schema and controller actor.
 CREATE TRIGGER operations_validate_genesis
 BEFORE INSERT ON operations
 WHEN
-    NEW.schema_id = 'space.genesis.v1'
+    NEW.schema_id = 'space.genesis'
     OR EXISTS (
         SELECT 1 FROM spaces
         WHERE spaces.space_id = NEW.space_id
@@ -184,7 +182,7 @@ BEGIN
         WHERE spaces.space_id = NEW.space_id
           AND spaces.genesis_operation_id = NEW.operation_id
           AND spaces.controller_actor_id = NEW.actor_id
-          AND NEW.schema_id = 'space.genesis.v1'
+          AND NEW.schema_id = 'space.genesis'
     ) THEN RAISE(ABORT, 'invalid space genesis projection') END;
 END;
 
@@ -220,7 +218,7 @@ BEGIN
     SELECT RAISE(ABORT, 'space genesis cannot have causal parents');
 END;
 
--- Authorization may name a capability.grant.v1 operation or the selected
+-- Authorization may name a capability.grant operation or the selected
 -- space genesis root. Referencing operations rather than only the grant
 -- projection permits that bootstrap while still enforcing same-space identity.
 CREATE TABLE operation_authorization_refs (
@@ -279,7 +277,7 @@ CREATE TABLE client_entity_visibility (
     space_id TEXT NOT NULL,
     entity_id TEXT NOT NULL,
     schema_id TEXT NOT NULL CHECK (schema_id IN (
-        'event.v1', 'profile.v1', 'record.v1', 'record.v2', 'tag.v1'
+        'event', 'profile', 'record', 'tag'
     )),
     origin_operation_id TEXT NOT NULL,
     visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
@@ -335,15 +333,15 @@ CREATE TABLE operation_resources (
 CREATE INDEX operation_resources_content_idx
     ON operation_resources (content_id, space_id, operation_id);
 
--- These are verified projections of capability.grant.v1 bodies. The operation
+-- These are verified projections of capability.grant bodies. The operation
 -- payload remains authoritative. NULL bound columns mean the grant supplies no
 -- authority for that dimension; they never mean unlimited authority.
 CREATE TABLE capability_grants (
     space_id TEXT NOT NULL,
     grant_operation_id TEXT NOT NULL,
     issuer_actor_id TEXT NOT NULL,
-    grant_schema_id TEXT NOT NULL DEFAULT 'capability.grant.v1' CHECK (
-        grant_schema_id = 'capability.grant.v1'
+    grant_schema_id TEXT NOT NULL DEFAULT 'capability.grant' CHECK (
+        grant_schema_id = 'capability.grant'
     ),
     subject_actor_id TEXT NOT NULL CHECK (
         length(subject_actor_id) = 78
@@ -423,14 +421,13 @@ CREATE TABLE capability_grant_schema_scopes (
     grant_operation_id TEXT NOT NULL,
     position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 31),
     schema_id TEXT NOT NULL CHECK (schema_id IN (
-        'event.v1',
-        'profile.v1',
-        'record.v1',
-        'record.v2',
-        'space.genesis.v1',
-        'capability.grant.v1',
-        'capability.revoke.v1',
-        'tag.v1'
+        'event',
+        'profile',
+        'record',
+        'space.genesis',
+        'capability.grant',
+        'capability.revoke',
+        'tag'
     )),
     PRIMARY KEY (space_id, grant_operation_id, schema_id),
     UNIQUE (space_id, grant_operation_id, position),
@@ -477,8 +474,8 @@ CREATE TABLE capability_grant_revocations (
     space_id TEXT NOT NULL,
     revocation_operation_id TEXT NOT NULL,
     revoker_actor_id TEXT NOT NULL,
-    revocation_schema_id TEXT NOT NULL DEFAULT 'capability.revoke.v1' CHECK (
-        revocation_schema_id = 'capability.revoke.v1'
+    revocation_schema_id TEXT NOT NULL DEFAULT 'capability.revoke' CHECK (
+        revocation_schema_id = 'capability.revoke'
     ),
     grant_operation_id TEXT NOT NULL,
     reason TEXT NOT NULL CHECK (reason IN (

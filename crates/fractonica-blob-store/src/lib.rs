@@ -630,7 +630,7 @@ impl BlobStore {
         let wire = content_id.to_string();
         let digest = wire
             .strip_prefix("sha-256:")
-            .expect("ContentId v1 always emits sha-256");
+            .expect("ContentId always emits sha-256");
         self.root
             .join("blobs/sha-256")
             .join(&digest[..2])

@@ -1,16 +1,10 @@
 # Signed, space-scoped HTTP API
 
 The canonical HTTP contract for signed operations is
-[`contracts/openapi/v2.yaml`](../contracts/openapi/v2.yaml). It is a JSON
+[`contracts/openapi/api.yaml`](../contracts/openapi/api.yaml). It is a JSON
 projection of the deterministic CBOR and COSE representation fixed by
 [ADR 0009](adr/0009-signed-operation-trust-kernel.md); JSON bytes are never
 signed.
-
-Version 2 has no compatibility mode for unsigned version 1 operations. A v2
-node rejects `/api/v1/operations` and `/api/v1/entities/{entityId}`. Historical
-data is converted by an explicit offline migration that assigns a space,
-rebuilds digest parents, and signs newly encoded operations without claiming
-that the signature proves authorship of the legacy bytes.
 
 ## Admission
 
@@ -18,7 +12,7 @@ Clients retain their private keys. Fractonica deliberately exposes no generic
 signing endpoint. A client submits a complete projection to:
 
 ```http
-POST /api/v2/spaces/{spaceId}/operations
+POST /api/spaces/{spaceId}/operations
 Content-Type: application/json
 ```
 
@@ -49,9 +43,9 @@ later denies the request.
 
 The operation digest is its idempotency key. First admission returns `201`.
 Replaying the exact digest returns `200` with the original node-local sequence.
-There is no `Idempotency-Key` header in v2.
+There is no `Idempotency-Key` header.
 
-`space.genesis.v1` is readable through this surface but is not POST-admissible.
+`space.genesis` is readable through this surface but is not POST-admissible.
 Only the crash-safe local installation bootstrap may establish a genesis trust
 anchor; future peer admission requires the separately specified pairing
 ceremony.
@@ -61,9 +55,9 @@ ceremony.
 All stateful graph reads select one space explicitly:
 
 ```text
-GET /api/v2/spaces/{spaceId}/operations/{operationId}
-GET /api/v2/spaces/{spaceId}/entities/{entityId}
-GET /api/v2/spaces/{spaceId}/changes?after=0&limit=100
+GET /api/spaces/{spaceId}/operations/{operationId}
+GET /api/spaces/{spaceId}/entities/{entityId}
+GET /api/spaces/{spaceId}/changes?after=0&limit=100
 ```
 
 `localSequence` and the `after` cursor are assigned by one node and excluded
@@ -81,7 +75,7 @@ These GET routes are a loopback control-plane surface gated only by the node's
 optional transport bearer. Paired actors use the separate proof-carrying route:
 
 ```text
-POST /api/v2/peer/spaces/{spaceId}/changes
+POST /api/peer/spaces/{spaceId}/changes
 ```
 
 Its strict body is signed by both the paired node and actor and binds the exact
@@ -93,9 +87,8 @@ remains prohibited.
 
 ## Content boundary
 
-The signed-operation v2 document does not advertise blob or tus routes yet.
-Their current transfer mechanics remain documented by the v1 contract. Before
-they move under `/api/v2/spaces/{spaceId}`, the implementation must enforce
+Content-transfer mechanics are part of the composed node contract. Before
+they move under `/api/spaces/{spaceId}`, the implementation must enforce
 space capabilities for upload creation, resume, availability, reads, and
 metadata inspection. Physical deduplication must never allow one space to test
 another space's blob presence or retrieve its bytes.
@@ -114,13 +107,12 @@ admission codes include:
 - `space_not_found`, `space_id_mismatch`, and `cross_space_reference` for
   namespace failure.
 
-The complete closed code set and HTTP status mapping live in the OpenAPI v2
+The complete closed code set and HTTP status mapping live in the OpenAPI
 contract. Error details are bounded and must not echo signed payloads, private
 keys, invitation secrets, or transport credentials.
 
 ## Surfaces outside spaces
 
 Saros and glyph calculations remain stateless and do not acquire a fake space
-scope. They continue to use the v1 response contract while the signed stateful
-surface advances independently. Pairing uses the separately bounded Noise and
+scope. Pairing uses the separately bounded Noise and
 confirmation ceremony documented by ADR 0011; peer proof reads use ADR 0012.

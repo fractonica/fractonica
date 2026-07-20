@@ -104,11 +104,11 @@ impl InstallationPlan {
         };
         if self.node_id != identity.node_id()
             || self.bootstrap.genesis.space_id != identity.space_id()
-            || self.bootstrap.genesis.schema != EntitySchema::SpaceGenesisV1
+            || self.bootstrap.genesis.schema != EntitySchema::SpaceGenesis
             || self.bootstrap.genesis.actor_id != controller
             || genesis_controller != controller
             || self.bootstrap.initial_grant.space_id != identity.space_id()
-            || self.bootstrap.initial_grant.schema != EntitySchema::CapabilityGrantV1
+            || self.bootstrap.initial_grant.schema != EntitySchema::CapabilityGrant
             || self.bootstrap.initial_grant.actor_id != controller
             || grant_subject != writer
             || !self.bootstrap.genesis.causal_parents.is_empty()

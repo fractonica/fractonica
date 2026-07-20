@@ -14,19 +14,19 @@ missing local file must not invalidate an otherwise authentic causal history.
 ## Decision
 
 Immutable bytes live outside SQLite and are identified by a versioned,
-algorithm-tagged `ContentId`. Version 1 accepts exactly this wire form:
+algorithm-tagged `ContentId`. The current wire form is:
 
 ```text
 sha-256:<64 lowercase hexadecimal digits>
 ```
 
-The algorithm tag leaves an explicit future migration path, but version 1
+The algorithm tag leaves an explicit future evolution path, while the current format
 rejects every unknown algorithm, uppercase spelling, uppercase hexadecimal,
 and malformed length. `ContentDescriptor` couples an identity to its asserted
 byte length. `ResourceRef` adds a bounded media type, semantic role and
 optional path-free original-name label.
 
-`record.v1` may contain at most 64 resource references. Content IDs must be
+`record` may contain at most 64 resource references. Content IDs must be
 unique within one document. The operation validator validates only the
 reference contract: it does not consult a filesystem, network, blob database,
 or availability index. Consequently, missing bytes never invalidate or remove
@@ -53,7 +53,7 @@ store paths.
 SHA-256 identifies bytes and detects accidental or adversarial substitution;
 it does not identify an author. An HTTP `Content-Digest` header is transport
 integrity metadata and likewise is not evidence of authorship or authority.
-Version 2 operations authenticate the `ResourceRef` fields through the signed
+Operations authenticate the `ResourceRef` fields through the signed
 record body, as defined by
 [ADR 0009](0009-signed-operation-trust-kernel.md), but that signature does not
 prove that the referenced bytes are safe or confidential. The
@@ -68,9 +68,9 @@ concurrent branches, peers and backups may still require the bytes. Safe
 garbage collection needs an explicit retention and distributed-reachability
 protocol; until then deletion is an intentional administrative operation.
 
-This addition completes and freezes the pre-release `record.v1` document
+This addition completes and freezes the pre-release `record` document
 shape. Later incompatible content or record semantics require another schema
-identifier rather than silently reinterpreting `record.v1`.
+identifier rather than silently reinterpreting `record`.
 
 ## Consequences
 

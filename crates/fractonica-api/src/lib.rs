@@ -26,9 +26,10 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
 };
 use fractonica_application::{
-    ApplicationError, ApplicationService, DEFAULT_CHANGE_LIMIT, EntityState,
-    MAX_AVAILABILITY_CONTENT_IDS, OperationChangePage, PeerReadChangesRequest, RepositoryError,
-    SpaceDescriptor, StoredOperation, SubmitOperationRequest, UploadId, UploadSession, UploadState,
+    ApplicationError, ApplicationService, ClientEntityPage, ClientProjectionCursor, ClientStats,
+    DEFAULT_CHANGE_LIMIT, DEFAULT_CLIENT_QUERY_LIMIT, EntityState, MAX_AVAILABILITY_CONTENT_IDS,
+    OperationChangePage, PeerReadChangesRequest, RepositoryError, SpaceDescriptor, StoredOperation,
+    SubmitOperationRequest, UploadId, UploadSession, UploadState,
     authorization::AuthorizationError,
 };
 use fractonica_blob_store::{BlobStore, BlobStoreError, CreateUpload, MAX_PATCH_BYTES};
@@ -78,7 +79,7 @@ const SAROS_CAPABILITIES: &[&str] = &[
 ];
 const FULL_NODE_CAPABILITIES: &[&str] = &[
     "canonical-octal-glyphs",
-    "signed-operation-log-v2",
+    "signed-operation-log",
     "local-storage",
     "node-http-api",
     "openapi",
@@ -87,7 +88,7 @@ const FULL_NODE_CAPABILITIES: &[&str] = &[
 ];
 const FULL_NODE_CONTENT_CAPABILITIES: &[&str] = &[
     "canonical-octal-glyphs",
-    "signed-operation-log-v2",
+    "signed-operation-log",
     "content-addressed-resources",
     "local-storage",
     "node-http-api",
@@ -96,8 +97,9 @@ const FULL_NODE_CONTENT_CAPABILITIES: &[&str] = &[
     "reviewed-eclipse-geometry",
 ];
 const SAROS_PROFILE_INSTALLATION_ID: &str = "saros-engine";
-const OPENAPI_V1_CONTRACT: &str = include_str!("../../../contracts/openapi/v1.yaml");
-const OPENAPI_CONTRACT: &str = include_str!("../../../contracts/openapi/v2.yaml");
+const NODE_SERVICES_OPENAPI_CONTRACT: &str =
+    include_str!("../../../contracts/openapi/services.yaml");
+const OPENAPI_CONTRACT: &str = include_str!("../../../contracts/openapi/api.yaml");
 const DISPLAY_NAME_MAX_LENGTH: usize = 128;
 const VERSION_MAX_LENGTH: usize = 64;
 const BEARER_TOKEN_MIN_LENGTH: usize = 32;
@@ -379,11 +381,12 @@ pub enum PairingControlError {
 pub fn router(state: ApiState) -> Router {
     let mut openapi = serde_yaml_ng::from_str::<serde_json::Value>(OPENAPI_CONTRACT)
         .expect("checked-in OpenAPI contract must be valid YAML");
-    let mut openapi_v1 = serde_yaml_ng::from_str::<serde_json::Value>(OPENAPI_V1_CONTRACT)
-        .expect("checked-in OpenAPI v1 contract must be valid YAML");
+    let node_services_openapi =
+        serde_yaml_ng::from_str::<serde_json::Value>(NODE_SERVICES_OPENAPI_CONTRACT)
+            .expect("checked-in foundation OpenAPI contract must be valid YAML");
+    merge_openapi_contract(&mut openapi, node_services_openapi);
     let bearer_token_required = state.bearer_token.is_some();
     configure_openapi_transport_security(&mut openapi, bearer_token_required);
-    configure_openapi_transport_security(&mut openapi_v1, bearer_token_required);
     let allowed_origins = AllowOrigin::list([
         HeaderValue::from_static("http://127.0.0.1:5173"),
         HeaderValue::from_static("http://localhost:5173"),
@@ -398,76 +401,67 @@ pub fn router(state: ApiState) -> Router {
     let application = Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
-        .route("/api/v1/node", get(node))
+        .route("/api/node", get(node))
         .route(
-            "/api/v1/operations",
-            get(operation_v1_obsolete).post(operation_v1_obsolete),
-        )
-        .route("/api/v1/entities/{entity_id}", get(operation_v1_obsolete))
-        .route(
-            "/api/v2/spaces/{space_id}/operations",
-            post(submit_operation_v2).layer(DefaultBodyLimit::max(MAX_SIGNED_OPERATION_JSON_BYTES)),
+            "/api/spaces/{space_id}/operations",
+            post(submit_operation).layer(DefaultBodyLimit::max(MAX_SIGNED_OPERATION_JSON_BYTES)),
         )
         .route(
-            "/api/v2/spaces/{space_id}/operations/{operation_id}",
-            get(operation_v2),
+            "/api/spaces/{space_id}/operations/{operation_id}",
+            get(operation),
         )
         .route(
-            "/api/v2/spaces/{space_id}/entities/{entity_id}",
-            get(entity_state_v2),
+            "/api/spaces/{space_id}/entities/{entity_id}",
+            get(entity_state),
+        )
+        .route("/api/spaces/{space_id}/changes", get(operation_changes))
+        .route("/api/spaces/{space_id}/records", get(record_projections))
+        .route("/api/spaces/{space_id}/events", get(event_projections))
+        .route("/api/spaces/{space_id}/tags", get(tag_projections))
+        .route("/api/spaces/{space_id}/profiles", get(profile_projections))
+        .route("/api/spaces/{space_id}/stats", get(client_stats))
+        .route(
+            "/api/peer/spaces/{space_id}/changes",
+            post(peer_operation_changes).layer(DefaultBodyLimit::max(MAX_PEER_JSON_BYTES)),
         )
         .route(
-            "/api/v2/spaces/{space_id}/changes",
-            get(operation_changes_v2),
-        )
-        .route(
-            "/api/v2/peer/spaces/{space_id}/changes",
-            post(peer_operation_changes_v2).layer(DefaultBodyLimit::max(MAX_PEER_JSON_BYTES)),
-        )
-        .route(
-            "/api/v2/pairing/invitations",
+            "/api/pairing/invitations",
             post(create_pairing_invitation).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
         )
         .route(
-            "/api/v2/pairing/invitations/{invitation_id}",
+            "/api/pairing/invitations/{invitation_id}",
             get(pairing_invitation).delete(cancel_pairing_invitation),
         )
         .route(
-            "/api/v2/pairing/handshake",
+            "/api/pairing/handshake",
             post(pairing_handshake).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
         )
         .route(
-            "/api/v2/pairing/invitations/{invitation_id}/confirm",
+            "/api/pairing/invitations/{invitation_id}/confirm",
             post(confirm_pairing_invitation).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
         )
-        .route("/api/v1/uploads", post(create_upload))
+        .route("/api/uploads", post(create_upload))
         .route(
-            "/api/v1/uploads/{upload_id}",
+            "/api/uploads/{upload_id}",
             head(upload_status).patch(append_upload_chunk),
         )
-        .route("/api/v1/blobs/availability", post(blob_availability))
-        .route("/api/v1/blobs/{content_id}", get(get_blob).head(head_blob))
-        .route("/api/v1/saros", get(saros_metadata))
-        .route("/api/v1/glyphs", get(glyph_metadata))
-        .route("/api/v1/glyphs/{octal}/geometry", get(glyph_geometry))
-        .route("/api/v1/glyphs/{octal}/raster.rgba", get(glyph_raster))
-        .route("/api/v1/saros/pulse", get(saros_pulse))
-        .route("/api/v1/saros/series/{saros}/reading", get(saros_reading))
+        .route("/api/blobs/availability", post(blob_availability))
+        .route("/api/blobs/{content_id}", get(get_blob).head(head_blob))
+        .route("/api/saros", get(saros_metadata))
+        .route("/api/glyphs", get(glyph_metadata))
+        .route("/api/glyphs/{octal}/geometry", get(glyph_geometry))
+        .route("/api/glyphs/{octal}/raster.rgba", get(glyph_raster))
+        .route("/api/saros/pulse", get(saros_pulse))
+        .route("/api/saros/series/{saros}/reading", get(saros_reading))
         .route(
-            "/api/v1/saros/series/{saros}/eclipses/{sequence}/path",
+            "/api/saros/series/{saros}/eclipses/{sequence}/path",
             get(saros_path),
         )
         .merge(
-            SwaggerUi::new("/api/docs").external_urls_from_iter_unchecked([
-                (
-                    Url::with_primary("Signed operations v2", "/api/openapi.json", true),
-                    openapi,
-                ),
-                (
-                    Url::new("Temporal, glyph and content v1", "/api/openapi-v1.json"),
-                    openapi_v1,
-                ),
-            ]),
+            SwaggerUi::new("/api/docs").external_urls_from_iter_unchecked([(
+                Url::with_primary("Fractonica API", "/api/openapi.json", true),
+                openapi,
+            )]),
         )
         .layer(middleware::from_fn_with_state(
             authentication_state,
@@ -531,7 +525,7 @@ pub fn router(state: ApiState) -> Router {
     // discovery outside that layer so a plain tus OPTIONS request reaches the
     // capability handler rather than receiving an empty generic CORS reply.
     let upload_options = Router::new()
-        .route("/api/v1/uploads", options(upload_capabilities))
+        .route("/api/uploads", options(upload_capabilities))
         .layer(middleware::from_fn_with_state(
             upload_authentication_state,
             authenticate,
@@ -539,6 +533,62 @@ pub fn router(state: ApiState) -> Router {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     application.merge(upload_options)
+}
+
+fn merge_openapi_contract(target: &mut serde_json::Value, source: serde_json::Value) {
+    for pointer in ["paths", "components"] {
+        let Some(source_values) = source.get(pointer).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        let target_values = target
+            .get_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("primary OpenAPI contract has required object");
+        for (key, value) in source_values {
+            if pointer == "components" {
+                let source_section = value
+                    .as_object()
+                    .expect("OpenAPI component section must be an object");
+                let target_section = target_values
+                    .entry(key.clone())
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .expect("OpenAPI component section must be an object");
+                for (name, component) in source_section {
+                    if is_retired_foundation_component(key, name) {
+                        continue;
+                    }
+                    target_section
+                        .entry(name.clone())
+                        .or_insert_with(|| component.clone());
+                }
+            } else {
+                target_values
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+}
+
+fn is_retired_foundation_component(section: &str, name: &str) -> bool {
+    matches!(
+        (section, name),
+        (
+            "parameters",
+            "IdempotencyKey" | "OperationsAfter" | "OperationsLimit" | "EntityId"
+        ) | (
+            "schemas",
+            "OperationSubmission"
+                | "Operation"
+                | "OperationBody"
+                | "PutOperationBody"
+                | "TombstoneOperationBody"
+                | "StoredOperation"
+                | "OperationPage"
+                | "EntityState"
+        )
+    )
 }
 
 fn configure_openapi_transport_security(
@@ -1066,8 +1116,8 @@ impl IntoResponse for ApiError {
 }
 
 async fn authenticate(State(state): State<ApiState>, request: Request, next: Next) -> Response {
-    if request.uri().path() == "/api/v2/pairing/handshake"
-        || request.uri().path().starts_with("/api/v2/peer/")
+    if request.uri().path() == "/api/pairing/handshake"
+        || request.uri().path().starts_with("/api/peer/")
     {
         return next.run(request).await;
     }
@@ -1075,7 +1125,7 @@ async fn authenticate(State(state): State<ApiState>, request: Request, next: Nex
         return next.run(request).await;
     };
 
-    let uses_v2_contract = request.uri().path().starts_with("/api/v2/");
+    let uses_api_contract = request.uri().path().starts_with("/api/");
     let supplied = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -1088,7 +1138,7 @@ async fn authenticate(State(state): State<ApiState>, request: Request, next: Nex
 
     if valid {
         next.run(request).await
-    } else if uses_v2_contract {
+    } else if uses_api_contract {
         ApiError::transport_unauthorized().into_response()
     } else {
         ApiError::unauthorized().into_response()
@@ -1390,7 +1440,7 @@ async fn node(State(state): State<ApiState>) -> Result<Json<NodeResponse>, ApiEr
     }
     .to_vec();
     if state.pairing.is_some() {
-        capabilities.push("noise-pairing-v1");
+        capabilities.push("noise-pairing");
     }
 
     Ok(Json(NodeResponse {
@@ -1406,16 +1456,7 @@ async fn node(State(state): State<ApiState>) -> Result<Json<NodeResponse>, ApiEr
     }))
 }
 
-async fn operation_v1_obsolete() -> ApiError {
-    ApiError::gone(
-        "https://fractonica.com/problems/operation-v1-obsolete",
-        "operation_v1_obsolete",
-        "Operation API v1 is obsolete",
-        "Use the signed, space-scoped operation API under /api/v2/spaces/{spaceId}.",
-    )
-}
-
-async fn submit_operation_v2(
+async fn submit_operation(
     State(state): State<ApiState>,
     Path(space_id): Path<String>,
     payload: Result<Json<OperationEnvelope>, JsonRejection>,
@@ -1445,7 +1486,7 @@ async fn submit_operation_v2(
     Ok((status, Json(result.operation)).into_response())
 }
 
-async fn operation_v2(
+async fn operation(
     State(state): State<ApiState>,
     Path((space_id, operation_id)): Path<(String, String)>,
 ) -> Result<Json<StoredOperation>, ApiError> {
@@ -1461,7 +1502,7 @@ async fn operation_v2(
     Ok(Json(operation))
 }
 
-async fn operation_changes_v2(
+async fn operation_changes(
     State(state): State<ApiState>,
     Path(space_id): Path<String>,
     query: Result<Query<OperationChangesQuery>, QueryRejection>,
@@ -1488,7 +1529,7 @@ async fn operation_changes_v2(
     Ok(Json(page))
 }
 
-async fn peer_operation_changes_v2(
+async fn peer_operation_changes(
     State(state): State<ApiState>,
     Path(space_id): Path<String>,
     payload: Result<Json<PeerReadChangesBody>, JsonRejection>,
@@ -1530,7 +1571,7 @@ async fn peer_operation_changes_v2(
     Ok(Json(page))
 }
 
-async fn entity_state_v2(
+async fn entity_state(
     State(state): State<ApiState>,
     Path((space_id, entity_id)): Path<(String, String)>,
 ) -> Result<Json<EntityStateResponse>, ApiError> {
@@ -1543,6 +1584,113 @@ async fn entity_state_v2(
         .map_err(application_read_error)?
         .ok_or_else(entity_not_found)?;
     Ok(Json(entity.into()))
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClientProjectionQuery {
+    #[serde(default = "default_client_query_limit")]
+    limit: usize,
+    sort_number: Option<i64>,
+    sort_text: Option<String>,
+    entity_id: Option<String>,
+    operation_id: Option<String>,
+}
+
+const fn default_client_query_limit() -> usize {
+    DEFAULT_CLIENT_QUERY_LIMIT
+}
+
+async fn record_projections(
+    state: State<ApiState>,
+    path: Path<String>,
+    query: Result<Query<ClientProjectionQuery>, QueryRejection>,
+) -> Result<Json<ClientEntityPage>, ApiError> {
+    client_projections(state, path, query, EntitySchema::Record).await
+}
+
+async fn event_projections(
+    state: State<ApiState>,
+    path: Path<String>,
+    query: Result<Query<ClientProjectionQuery>, QueryRejection>,
+) -> Result<Json<ClientEntityPage>, ApiError> {
+    client_projections(state, path, query, EntitySchema::Event).await
+}
+
+async fn tag_projections(
+    state: State<ApiState>,
+    path: Path<String>,
+    query: Result<Query<ClientProjectionQuery>, QueryRejection>,
+) -> Result<Json<ClientEntityPage>, ApiError> {
+    client_projections(state, path, query, EntitySchema::Tag).await
+}
+
+async fn profile_projections(
+    state: State<ApiState>,
+    path: Path<String>,
+    query: Result<Query<ClientProjectionQuery>, QueryRejection>,
+) -> Result<Json<ClientEntityPage>, ApiError> {
+    client_projections(state, path, query, EntitySchema::Profile).await
+}
+
+async fn client_projections(
+    State(state): State<ApiState>,
+    Path(space_id): Path<String>,
+    query: Result<Query<ClientProjectionQuery>, QueryRejection>,
+    schema: EntitySchema,
+) -> Result<Json<ClientEntityPage>, ApiError> {
+    let application = signed_operation_application(&state)?;
+    let space_id = parse_space_id(&space_id)?;
+    let Query(query) = query.map_err(signed_operation_query_error)?;
+    let cursor = parse_client_cursor(&query, schema)?;
+    let limit = query.limit;
+    let page = tokio::task::spawn_blocking(move || {
+        application.client_entities(space_id, schema, cursor.as_ref(), limit)
+    })
+    .await
+    .map_err(|_| ApiError::storage_unavailable())?
+    .map_err(application_read_error)?;
+    Ok(Json(page))
+}
+
+fn parse_client_cursor(
+    query: &ClientProjectionQuery,
+    schema: EntitySchema,
+) -> Result<Option<ClientProjectionCursor>, ApiError> {
+    let empty = query.sort_number.is_none()
+        && query.sort_text.is_none()
+        && query.entity_id.is_none()
+        && query.operation_id.is_none();
+    if empty {
+        return Ok(None);
+    }
+    let temporal = matches!(schema, EntitySchema::Record | EntitySchema::Event);
+    if temporal != query.sort_number.is_some()
+        || temporal == query.sort_text.is_some()
+        || query.entity_id.is_none()
+        || query.operation_id.is_none()
+    {
+        return Err(signed_operation_query_error_placeholder());
+    }
+    Ok(Some(ClientProjectionCursor {
+        sort_number: query.sort_number,
+        sort_text: query.sort_text.clone(),
+        entity_id: parse_entity_id(query.entity_id.as_deref().expect("validated cursor"))?,
+        operation_id: parse_operation_id(query.operation_id.as_deref().expect("validated cursor"))?,
+    }))
+}
+
+async fn client_stats(
+    State(state): State<ApiState>,
+    Path(space_id): Path<String>,
+) -> Result<Json<ClientStats>, ApiError> {
+    let application = signed_operation_application(&state)?;
+    let space_id = parse_space_id(&space_id)?;
+    let stats = tokio::task::spawn_blocking(move || application.client_stats(space_id))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(application_read_error)?;
+    Ok(Json(stats))
 }
 
 fn signed_operation_application(state: &ApiState) -> Result<Arc<ApplicationService>, ApiError> {
@@ -1722,7 +1870,7 @@ async fn create_upload_inner(state: ApiState, request: Request) -> Result<Respon
     insert_header(
         response.headers_mut(),
         "location",
-        &format!("/api/v1/uploads/{}", session.upload_id),
+        &format!("/api/uploads/{}", session.upload_id),
     )?;
     add_upload_headers(response.headers_mut(), &session, true)?;
     Ok(response)
@@ -2595,7 +2743,9 @@ fn application_error(error: ApplicationError) -> ApiError {
         ApplicationError::GenericGenesisForbidden
         | ApplicationError::InvalidTrustedBootstrap(_) => operation_admission_conflict(),
         ApplicationError::InvalidReceivedAt(_) => ApiError::storage_unavailable(),
-        ApplicationError::InvalidChangeLimit => signed_operation_query_error_placeholder(),
+        ApplicationError::InvalidChangeLimit
+        | ApplicationError::InvalidClientQueryLimit
+        | ApplicationError::InvalidClientSchema(_) => signed_operation_query_error_placeholder(),
         ApplicationError::InvalidPeerProof(_) | ApplicationError::PeerSpacePathMismatch { .. } => {
             peer_unauthorized()
         }
@@ -2765,7 +2915,6 @@ fn repository_error(error: RepositoryError) -> ApiError {
         RepositoryError::Authorization(
             AuthorizationError::InvalidStoredOperation { .. } | AuthorizationError::View(_),
         )
-        | RepositoryError::LegacyMigrationRequired
         | RepositoryError::Corrupt(_)
         | RepositoryError::Unavailable(_) => ApiError::storage_unavailable(),
     }
@@ -3322,7 +3471,7 @@ mod tests {
     };
     use fractonica_core::{InstallationId, InstallationMetadata};
     use fractonica_data_model::{
-        OperationBody, OperationNonce, RecordDocument, SigningKey, Visibility,
+        OperationBody, OperationNonce, ProtectedDocument, RecordDocument, SigningKey,
     };
     use fractonica_store_sqlite::SqliteStore;
     use http_body_util::BodyExt;
@@ -3480,10 +3629,6 @@ mod tests {
                 operations: Mutex::new(Vec::new()),
                 repository_calls: AtomicUsize::new(0),
             }
-        }
-
-        fn calls(&self) -> usize {
-            self.repository_calls.load(Ordering::Relaxed)
         }
 
         fn count_call(&self) {
@@ -3685,6 +3830,29 @@ mod tests {
                 has_more,
             })
         }
+
+        fn client_entities(
+            &self,
+            space_id: SpaceId,
+            schema: EntitySchema,
+            _cursor: Option<&ClientProjectionCursor>,
+            _limit: usize,
+        ) -> Result<ClientEntityPage, RepositoryError> {
+            self.count_call();
+            self.require_space(space_id)?;
+            Ok(ClientEntityPage {
+                space_id,
+                schema,
+                items: Vec::new(),
+                next_cursor: None,
+            })
+        }
+
+        fn client_stats(&self, space_id: SpaceId) -> Result<ClientStats, RepositoryError> {
+            self.count_call();
+            self.require_space(space_id)?;
+            Ok(ClientStats::default())
+        }
     }
 
     fn fixture_space() -> SpaceId {
@@ -3712,20 +3880,22 @@ mod tests {
         OperationEnvelope::sign(
             space_id,
             EntityId::parse(entity_id).expect("fixture entity ID"),
-            EntitySchema::RecordV1,
+            EntitySchema::Record,
             Vec::new(),
             vec![OperationId::from_bytes([0x51; 32])],
             1_784_390_400_000,
             OperationNonce::from_bytes([nonce; 16]),
-            OperationBody::Put {
-                document: RecordDocument {
-                    start_at_unix_ms: 1_784_390_400_000,
-                    end_at_unix_ms: None,
-                    visibility: Visibility::Private,
-                    emoji: Some("🌀".to_owned()),
-                    text: Some("signed API fixture".to_owned()),
-                    metadata: BTreeMap::new(),
-                    resources: Vec::new(),
+            OperationBody::PutRecord {
+                payload: ProtectedDocument::Public {
+                    document: RecordDocument {
+                        start_at_unix_ms: 1_784_390_400_000,
+                        end_at_unix_ms: None,
+                        emoji: Some("🌀".to_owned()),
+                        text: Some("signed API fixture".to_owned()),
+                        metadata: BTreeMap::new(),
+                        resources: Vec::new(),
+                        references: Vec::new(),
+                    },
                 },
             },
             &SigningKey::from_seed([seed; 32]),
@@ -3820,25 +3990,25 @@ mod tests {
         assert_eq!(authorized.status(), StatusCode::OK);
         assert_contract_schema("LiveStatus", &json(authorized).await);
 
-        let v2_unauthorized = authenticated_test_app()
+        let api_unauthorized = authenticated_test_app()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v2/spaces/{}/changes", fixture_space()))
+                    .uri(format!("/api/spaces/{}/changes", fixture_space()))
                     .body(Body::empty())
                     .expect("request"),
             )
             .await
             .expect("response");
-        assert_eq!(v2_unauthorized.status(), StatusCode::UNAUTHORIZED);
-        let v2_unauthorized = json(v2_unauthorized).await;
-        assert_v2_contract_schema("Problem", &v2_unauthorized);
-        assert_eq!(v2_unauthorized["code"], "transport_unauthorized");
+        assert_eq!(api_unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let api_unauthorized = json(api_unauthorized).await;
+        assert_operation_contract_schema("Problem", &api_unauthorized);
+        assert_eq!(api_unauthorized["code"], "transport_unauthorized");
 
         let upload_discovery_unauthorized = authenticated_test_app()
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
-                    .uri("/api/v1/uploads")
+                    .uri("/api/uploads")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -3850,14 +4020,14 @@ mod tests {
         );
         assert_eq!(
             json(upload_discovery_unauthorized).await["code"],
-            "invalid_bootstrap_token"
+            "transport_unauthorized"
         );
 
         let upload_discovery_authorized = authenticated_test_app()
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
-                    .uri("/api/v1/uploads")
+                    .uri("/api/uploads")
                     .header(
                         header::AUTHORIZATION,
                         "Bearer 0123456789abcdef0123456789abcdef",
@@ -3882,7 +4052,7 @@ mod tests {
         let admin = authenticated_pairing_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v2/pairing/invitations/04040404040404040404040404040404")
+                    .uri("/api/pairing/invitations/04040404040404040404040404040404")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -3894,7 +4064,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v2/pairing/handshake")
+                    .uri("/api/pairing/handshake")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -3910,14 +4080,14 @@ mod tests {
         assert_eq!(handshake.status(), StatusCode::GONE);
         let problem = json(handshake).await;
         assert_eq!(problem["code"], "pairing_unavailable");
-        assert_v2_contract_schema("Problem", &problem);
+        assert_operation_contract_schema("Problem", &problem);
 
         let peer = authenticated_pairing_app()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/api/v2/peer/spaces/{}/changes",
+                        "/api/peer/spaces/{}/changes",
                         SpaceId::from_bytes([9; 32])
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -3929,7 +4099,7 @@ mod tests {
         assert_eq!(peer.status(), StatusCode::BAD_REQUEST);
         let problem = json(peer).await;
         assert_eq!(problem["code"], "malformed_peer_request");
-        assert_v2_contract_schema("Problem", &problem);
+        assert_operation_contract_schema("Problem", &problem);
     }
 
     async fn json(response: Response) -> Value {
@@ -3943,20 +4113,20 @@ mod tests {
     }
 
     fn assert_contract_schema(schema_name: &str, value: &Value) {
-        let contract: Value =
-            serde_yaml_ng::from_str(OPENAPI_V1_CONTRACT).expect("valid OpenAPI contract");
+        let contract: Value = serde_yaml_ng::from_str(NODE_SERVICES_OPENAPI_CONTRACT)
+            .expect("valid OpenAPI contract");
         let schema = contract
             .pointer(&format!("/components/schemas/{schema_name}"))
             .expect("named OpenAPI schema");
         assert_schema(value, schema, &contract);
     }
 
-    fn assert_v2_contract_schema(schema_name: &str, value: &Value) {
+    fn assert_operation_contract_schema(schema_name: &str, value: &Value) {
         let contract: Value =
-            serde_yaml_ng::from_str(OPENAPI_CONTRACT).expect("valid v2 OpenAPI contract");
+            serde_yaml_ng::from_str(OPENAPI_CONTRACT).expect("valid operation OpenAPI contract");
         let schema = contract
             .pointer(&format!("/components/schemas/{schema_name}"))
-            .expect("named v2 OpenAPI schema");
+            .expect("named operation OpenAPI schema");
         assert_schema(value, schema, &contract);
     }
 
@@ -4177,7 +4347,7 @@ mod tests {
         let app = test_app();
         let request = || {
             Request::builder()
-                .uri("/api/v1/node")
+                .uri("/api/node")
                 .body(Body::empty())
                 .expect("request")
         };
@@ -4199,7 +4369,7 @@ mod tests {
                 .as_array()
                 .expect("capabilities")
                 .iter()
-                .any(|capability| capability == "signed-operation-log-v2")
+                .any(|capability| capability == "signed-operation-log")
         );
         assert!(
             !first["capabilities"]
@@ -4216,7 +4386,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/node")
+                    .uri("/api/node")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4239,52 +4409,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operation_v1_is_gone_without_touching_storage() {
-        let (app, repository) = signed_operation_stub_app(StubAdmission::Accept);
-        for request in [
-            Request::builder()
-                .uri("/api/v1/operations")
-                .body(Body::empty())
-                .expect("GET v1 operations"),
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/operations")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from("{}"))
-                .expect("POST v1 operation"),
-            Request::builder()
-                .uri("/api/v1/entities/019f6f11-a1d7-72b1-8db1-6fa9e9c45b89")
-                .body(Body::empty())
-                .expect("GET v1 entity"),
-        ] {
-            let response = app.clone().oneshot(request).await.expect("response");
-            assert_eq!(response.status(), StatusCode::GONE);
-            let problem = json(response).await;
-            assert_eq!(problem["code"], "operation_v1_obsolete");
-        }
-        assert_eq!(repository.calls(), 0, "v1 must never reach the repository");
-
-        let saros = saros_only_app()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/operations")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(saros.status(), StatusCode::GONE);
-        assert_eq!(json(saros).await["code"], "operation_v1_obsolete");
-    }
-
-    #[tokio::test]
-    async fn signed_v2_cors_does_not_advertise_an_idempotency_key() {
+    async fn signed_operation_cors_does_not_advertise_an_idempotency_key() {
         let response = signed_operation_stub_app(StubAdmission::Accept)
             .0
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
-                    .uri(format!("/api/v2/spaces/{}/operations", fixture_space()))
+                    .uri(format!("/api/spaces/{}/operations", fixture_space()))
                     .header(header::ORIGIN, "http://127.0.0.1:5173")
                     .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
                     .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
@@ -4305,12 +4436,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_v2_admits_replays_reads_pages_and_materializes() {
+    async fn signed_operation_admits_replays_reads_pages_and_materializes() {
         let (app, _repository) = signed_operation_stub_app(StubAdmission::Accept);
         let space_id = fixture_space();
         let entity_id = "019f6f11-a1d7-72b1-8db1-6fa9e9c45b89";
         let operation = fixture_signed_record(space_id, entity_id, 0x41, 0x21);
-        let operations_uri = format!("/api/v2/spaces/{space_id}/operations");
+        let operations_uri = format!("/api/spaces/{space_id}/operations");
         let append_request = || {
             Request::builder()
                 .method(Method::POST)
@@ -4329,7 +4460,7 @@ mod tests {
             .expect("response");
         assert_eq!(accepted.status(), StatusCode::CREATED);
         let accepted = json(accepted).await;
-        assert_v2_contract_schema("StoredSignedOperationV2", &accepted);
+        assert_operation_contract_schema("StoredSignedOperation", &accepted);
         assert_eq!(accepted["localSequence"], 1);
         assert_eq!(
             accepted["operation"]["operationId"],
@@ -4350,7 +4481,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/v2/spaces/{space_id}/operations/{}",
+                        "/api/spaces/{space_id}/operations/{}",
                         operation.operation_id
                     ))
                     .body(Body::empty())
@@ -4365,7 +4496,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v2/spaces/{space_id}/changes?after=0&limit=1"))
+                    .uri(format!("/api/spaces/{space_id}/changes?after=0&limit=1"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4373,7 +4504,7 @@ mod tests {
             .expect("response");
         assert_eq!(changes.status(), StatusCode::OK);
         let changes = json(changes).await;
-        assert_v2_contract_schema("OperationPageV2", &changes);
+        assert_operation_contract_schema("OperationPage", &changes);
         assert_eq!(changes["operations"][0], accepted);
         assert_eq!(changes["nextAfter"], 1);
         assert_eq!(changes["hasMore"], false);
@@ -4381,7 +4512,7 @@ mod tests {
         let entity = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v2/spaces/{space_id}/entities/{entity_id}"))
+                    .uri(format!("/api/spaces/{space_id}/entities/{entity_id}"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4389,7 +4520,7 @@ mod tests {
             .expect("response");
         assert_eq!(entity.status(), StatusCode::OK);
         let entity = json(entity).await;
-        assert_v2_contract_schema("EntityStateV2", &entity);
+        assert_operation_contract_schema("EntityState", &entity);
         assert_eq!(entity["spaceId"], space_id.to_string());
         assert_eq!(entity["entityId"], entity_id);
         assert_eq!(entity["operationCount"], 1);
@@ -4398,7 +4529,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_v2_scopes_empty_reads_and_not_found_responses_to_the_space() {
+    async fn serves_bounded_client_projection_routes() {
+        let (app, _repository) = signed_operation_stub_app(StubAdmission::Accept);
+        let space_id = fixture_space();
+        for (collection, schema) in [
+            ("records", "record"),
+            ("events", "event"),
+            ("tags", "tag"),
+            ("profiles", "profile"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/spaces/{space_id}/{collection}?limit=25"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let page = json(response).await;
+            assert_operation_contract_schema("ClientEntityPage", &page);
+            assert_eq!(page["spaceId"], space_id.to_string());
+            assert_eq!(page["schema"], schema);
+            assert_eq!(page["items"], serde_json::json!([]));
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/spaces/{space_id}/stats"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let stats = json(response).await;
+        assert_operation_contract_schema("ClientStats", &stats);
+        assert_eq!(stats["records"], 0);
+        assert_eq!(stats["mediaBytes"], 0);
+    }
+
+    #[tokio::test]
+    async fn signed_operation_scopes_empty_reads_and_not_found_responses_to_the_space() {
         let (app, _repository) = signed_operation_stub_app(StubAdmission::Accept);
         let space_id = fixture_space();
         let missing_operation = app
@@ -4406,7 +4581,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/v2/spaces/{space_id}/operations/{}",
+                        "/api/spaces/{space_id}/operations/{}",
                         OperationId::from_bytes([0x73; 32])
                     ))
                     .body(Body::empty())
@@ -4422,7 +4597,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/v2/spaces/{space_id}/entities/019f6f12-89df-7bd1-a4be-d45790945e12"
+                        "/api/spaces/{space_id}/entities/019f6f12-89df-7bd1-a4be-d45790945e12"
                     ))
                     .body(Body::empty())
                     .expect("request"),
@@ -4435,7 +4610,7 @@ mod tests {
         let changes = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v2/spaces/{space_id}/changes"))
+                    .uri(format!("/api/spaces/{space_id}/changes"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4443,18 +4618,18 @@ mod tests {
             .expect("response");
         assert_eq!(changes.status(), StatusCode::OK);
         let changes = json(changes).await;
-        assert_v2_contract_schema("OperationPageV2", &changes);
+        assert_operation_contract_schema("OperationPage", &changes);
         assert_eq!(changes["spaceId"], space_id.to_string());
         assert_eq!(changes["operations"], serde_json::json!([]));
         assert_eq!(changes["nextAfter"], 0);
     }
 
     #[tokio::test]
-    async fn signed_v2_maps_validation_authorization_and_storage_failures() {
+    async fn signed_operation_maps_validation_authorization_and_storage_failures() {
         let space_id = fixture_space();
         let entity_id = "019f6f12-38ca-7f80-b4dd-cea4b2fa7f4b";
         let operation = fixture_signed_record(space_id, entity_id, 0x42, 0x22);
-        let uri = format!("/api/v2/spaces/{space_id}/operations");
+        let uri = format!("/api/spaces/{space_id}/operations");
 
         let malformed = signed_operation_stub_app(StubAdmission::Accept)
             .0
@@ -4470,7 +4645,7 @@ mod tests {
             .expect("response");
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
         let malformed = json(malformed).await;
-        assert_v2_contract_schema("Problem", &malformed);
+        assert_operation_contract_schema("Problem", &malformed);
         assert_eq!(malformed["code"], "malformed_signed_operation");
 
         let oversized = signed_operation_stub_app(StubAdmission::Accept)
@@ -4487,7 +4662,7 @@ mod tests {
             .expect("response");
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let oversized = json(oversized).await;
-        assert_v2_contract_schema("Problem", &oversized);
+        assert_operation_contract_schema("Problem", &oversized);
         assert_eq!(oversized["code"], "signed_operation_too_large");
 
         let other_space = SpaceId::from_bytes([0x32; 32]);
@@ -4496,7 +4671,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/api/v2/spaces/{other_space}/operations"))
+                    .uri(format!("/api/spaces/{other_space}/operations"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&operation).expect("operation JSON"),
@@ -4639,7 +4814,7 @@ mod tests {
                 .expect("response");
             assert_eq!(response.status(), status);
             let problem = json(response).await;
-            assert_v2_contract_schema("Problem", &problem);
+            assert_operation_contract_schema("Problem", &problem);
             assert_eq!(problem["code"], code);
             assert!(
                 !problem["detail"]
@@ -4651,12 +4826,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_v2_rejects_invalid_ids_and_is_unavailable_in_saros_profile() {
+    async fn signed_operation_rejects_invalid_ids_and_is_unavailable_in_saros_profile() {
         let invalid = signed_operation_stub_app(StubAdmission::Accept)
             .0
             .oneshot(
                 Request::builder()
-                    .uri("/api/v2/spaces/space:0000000000000000000000000000000000000000000000000000000000000000/changes")
+                    .uri("/api/spaces/space:0000000000000000000000000000000000000000000000000000000000000000/changes")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4671,7 +4846,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .uri(format!(
-                            "/api/v2/spaces/{}/changes?after={after}",
+                            "/api/spaces/{}/changes?after={after}",
                             fixture_space()
                         ))
                         .body(Body::empty())
@@ -4693,7 +4868,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/api/v2/spaces/{}/operations", fixture_space()))
+                    .uri(format!("/api/spaces/{}/operations", fixture_space()))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&operation).expect("operation JSON"),
@@ -4704,21 +4879,21 @@ mod tests {
             .expect("response");
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         let unavailable = json(unavailable).await;
-        assert_v2_contract_schema("Problem", &unavailable);
+        assert_operation_contract_schema("Problem", &unavailable);
         assert_eq!(unavailable["code"], "profile_unavailable");
 
         for uri in [
             format!(
-                "/api/v2/spaces/{}/operations/{}",
+                "/api/spaces/{}/operations/{}",
                 fixture_space(),
                 operation.operation_id
             ),
             format!(
-                "/api/v2/spaces/{}/entities/{}",
+                "/api/spaces/{}/entities/{}",
                 fixture_space(),
                 operation.entity_id
             ),
-            format!("/api/v2/spaces/{}/changes", fixture_space()),
+            format!("/api/spaces/{}/changes", fixture_space()),
         ] {
             let unavailable = saros_only_app()
                 .oneshot(
@@ -4756,7 +4931,7 @@ mod tests {
         let node = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/node")
+                    .uri("/api/node")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4783,7 +4958,7 @@ mod tests {
         let response = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/saros")
+                    .uri("/api/saros")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4807,7 +4982,7 @@ mod tests {
         let metadata = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/glyphs")
+                    .uri("/api/glyphs")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4829,7 +5004,7 @@ mod tests {
         let geometry = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/glyphs/12345/geometry?depth=5")
+                    .uri("/api/glyphs/12345/geometry?depth=5")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4865,7 +5040,7 @@ mod tests {
         let zero = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/glyphs/00000/geometry?depth=5")
+                    .uri("/api/glyphs/00000/geometry?depth=5")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4879,7 +5054,7 @@ mod tests {
         let fixture = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/glyphs/777777/geometry?depth=6")
+                    .uri("/api/glyphs/777777/geometry?depth=6")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4908,7 +5083,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(
-                        "/api/v1/glyphs/77777/raster.rgba?depth=5&width=32&height=16&foreground=12ABEF&background=00000000",
+                        "/api/glyphs/77777/raster.rgba?depth=5&width=32&height=16&foreground=12ABEF&background=00000000",
                     )
                     .body(Body::empty())
                     .expect("request"),
@@ -4948,7 +5123,7 @@ mod tests {
         let invalid = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/glyphs/8/geometry")
+                    .uri("/api/glyphs/8/geometry")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4965,7 +5140,7 @@ mod tests {
         let response = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/saros/pulse?atUnixSeconds=-11253795384")
+                    .uri("/api/saros/pulse?atUnixSeconds=-11253795384")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4989,7 +5164,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(
-                        "/api/v1/saros/series/141/reading?atUnixSeconds=-11253795384&precisionBits=32",
+                        "/api/saros/series/141/reading?atUnixSeconds=-11253795384&precisionBits=32",
                     )
                     .body(Body::empty())
                     .expect("request"),
@@ -5007,7 +5182,7 @@ mod tests {
         let path = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/saros/series/141/eclipses/0/path")
+                    .uri("/api/saros/series/141/eclipses/0/path")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -5031,7 +5206,7 @@ mod tests {
         let invalid = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/saros/pulse")
+                    .uri("/api/saros/pulse")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -5045,7 +5220,7 @@ mod tests {
         let outside = saros_only_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/saros/series/162/eclipses/0/path")
+                    .uri("/api/saros/series/162/eclipses/0/path")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -5067,7 +5242,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
-                    .uri("/api/v1/uploads")
+                    .uri("/api/uploads")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -5092,7 +5267,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/uploads")
+                    .uri("/api/uploads")
                     .header("tus-resumable", TUS_VERSION)
                     .header("upload-length", bytes.len())
                     .header("upload-metadata", metadata)
@@ -5170,7 +5345,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/blobs/availability")
+                    .uri("/api/blobs/availability")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -5191,7 +5366,7 @@ mod tests {
         assert_eq!(availability["available"][0]["byteLength"], bytes.len());
         assert_eq!(availability["missing"], serde_json::json!([]));
 
-        let blob_uri = format!("/api/v1/blobs/{content_id}");
+        let blob_uri = format!("/api/blobs/{content_id}");
         let blob_head = app
             .clone()
             .oneshot(
@@ -5287,7 +5462,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/uploads")
+                    .uri("/api/uploads")
                     .header("tus-resumable", TUS_VERSION)
                     .header("upload-length", 3)
                     .body(Body::empty())
@@ -5338,7 +5513,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
-                    .uri("/api/v1/uploads")
+                    .uri("/api/uploads")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -5378,7 +5553,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/uploads")
+                    .uri("/api/uploads")
                     .header("tus-resumable", TUS_VERSION)
                     .header("upload-length", 0)
                     .header("upload-metadata", metadata)
@@ -5441,7 +5616,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v1/blobs/{content_id}"))
+                    .uri(format!("/api/blobs/{content_id}"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -5453,7 +5628,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/blobs/availability")
+                    .uri("/api/blobs/availability")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
@@ -5469,7 +5644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_both_openapi_contracts_with_v2_as_the_operation_boundary() {
+    async fn serves_one_complete_openapi_contract() {
         let docs = saros_only_app()
             .oneshot(
                 Request::builder()
@@ -5498,7 +5673,7 @@ mod tests {
             .to_bytes();
         let selector = std::str::from_utf8(&selector).expect("Swagger initializer UTF-8");
         assert!(selector.contains("/api/openapi.json"));
-        assert!(selector.contains("/api/openapi-v1.json"));
+        assert!(!selector.contains("openapi-v1"));
 
         let response = saros_only_app()
             .oneshot(
@@ -5513,34 +5688,37 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json(response).await;
         assert_eq!(body["info"]["title"], "Fractonica Node API");
-        assert_eq!(body["info"]["version"], "2.0.0");
+        assert_eq!(body["info"]["version"], "1.0.0");
         assert_eq!(body["security"], serde_json::json!([{}]));
         let paths: HashSet<&str> = body["paths"]
             .as_object()
-            .expect("v2 paths")
+            .expect("API paths")
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(
-            paths,
-            HashSet::from([
-                "/api/v2/spaces/{spaceId}/operations",
-                "/api/v2/spaces/{spaceId}/operations/{operationId}",
-                "/api/v2/spaces/{spaceId}/entities/{entityId}",
-                "/api/v2/spaces/{spaceId}/changes",
-                "/api/v2/peer/spaces/{spaceId}/changes",
-                "/api/v2/pairing/invitations",
-                "/api/v2/pairing/invitations/{invitationId}",
-                "/api/v2/pairing/invitations/{invitationId}/confirm",
-                "/api/v2/pairing/handshake",
-            ])
+        for path in [
+            "/api/spaces/{spaceId}/operations",
+            "/api/spaces/{spaceId}/changes",
+            "/api/pairing/handshake",
+            "/api/saros/pulse",
+            "/api/glyphs/{octal}/geometry",
+            "/api/uploads",
+            "/api/blobs/{contentId}",
+        ] {
+            assert!(paths.contains(path), "merged contract is missing {path}");
+        }
+        assert!(!paths.contains("/api/operations"));
+        assert!(!paths.contains("/api/entities/{entityId}"));
+        assert!(
+            body.pointer("/components/schemas/OperationSubmission")
+                .is_none()
         );
         assert_eq!(
-            body.pointer("/paths/~1api~1v2~1pairing~1handshake/post/security"),
+            body.pointer("/paths/~1api~1pairing~1handshake/post/security"),
             Some(&serde_json::json!([]))
         );
         assert_eq!(
-            body.pointer("/paths/~1api~1v2~1peer~1spaces~1{spaceId}~1changes/post/security"),
+            body.pointer("/paths/~1api~1peer~1spaces~1{spaceId}~1changes/post/security"),
             Some(&serde_json::json!([]))
         );
         assert_eq!(
@@ -5551,36 +5729,35 @@ mod tests {
             body.pointer("/components/schemas/CanonicalBodyProjection/oneOf")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(9)
+            Some(8)
         );
         assert_eq!(
             body.pointer(
-                "/paths/~1api~1v2~1spaces~1{spaceId}~1operations/post/requestBody/content/application~1json/schema/$ref"
+                "/paths/~1api~1spaces~1{spaceId}~1operations/post/requestBody/content/application~1json/schema/$ref"
             ),
             Some(&serde_json::json!(
-                "#/components/schemas/AdmissibleSignedOperationV2"
+                "#/components/schemas/AdmissibleSignedOperation"
             ))
         );
         assert_eq!(
             body.pointer(
-                "/components/schemas/AdmissibleSignedOperationV2/allOf/1/not/properties/schema/const"
+                "/components/schemas/AdmissibleSignedOperation/allOf/1/not/properties/schema/const"
             ),
-            Some(&serde_json::json!("space.genesis.v1"))
+            Some(&serde_json::json!("space.genesis"))
         );
         for schema in [
-            "RecordPutBodyV1",
-            "RecordPutBodyV2",
-            "RecordTombstoneBodyV1",
-            "TagPutBodyV1",
-            "EventPutBodyV1",
-            "ProfilePutBodyV1",
-            "SpaceGenesisBodyV1",
-            "CapabilityGrantBodyV1",
-            "CapabilityRevokeBodyV1",
-            "RecordDocumentV1",
-            "ResourceRefV1",
-            "CapabilityGrantV1",
-            "CapabilityRevocationV1",
+            "RecordPutBody",
+            "TombstoneBody",
+            "TagPutBody",
+            "EventPutBody",
+            "ProfilePutBody",
+            "SpaceGenesisBody",
+            "CapabilityGrantBody",
+            "CapabilityRevokeBody",
+            "RecordDocument",
+            "ResourceRef",
+            "CapabilityGrant",
+            "CapabilityRevocation",
         ] {
             assert_eq!(
                 body.pointer(&format!(
@@ -5594,11 +5771,11 @@ mod tests {
             .pointer("/components/schemas/EntitySchema/enum")
             .and_then(Value::as_array)
             .expect("closed entity schema enum");
-        assert_eq!(entity_schemas.len(), 8);
+        assert_eq!(entity_schemas.len(), 7);
         for path in [
-            "/paths/~1api~1v2~1spaces~1{spaceId}~1operations~1{operationId}/get/responses/403",
-            "/paths/~1api~1v2~1spaces~1{spaceId}~1entities~1{entityId}/get/responses/403",
-            "/paths/~1api~1v2~1spaces~1{spaceId}~1changes/get/responses/403",
+            "/paths/~1api~1spaces~1{spaceId}~1operations~1{operationId}/get/responses/403",
+            "/paths/~1api~1spaces~1{spaceId}~1entities~1{entityId}/get/responses/403",
+            "/paths/~1api~1spaces~1{spaceId}~1changes/get/responses/403",
         ] {
             assert!(
                 body.pointer(path).is_none(),
@@ -5606,36 +5783,6 @@ mod tests {
             );
         }
         assert_local_openapi_references_resolve(&body, &body);
-
-        let v1 = saros_only_app()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/openapi-v1.json")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(v1.status(), StatusCode::OK);
-        let v1 = json(v1).await;
-        assert_eq!(v1["info"]["version"], "1.0.0");
-        assert_eq!(v1["security"], serde_json::json!([{}]));
-        assert!(v1["paths"].get("/api/v1/saros/pulse").is_some());
-        for pointer in [
-            "/paths/~1api~1v1~1operations/post/responses",
-            "/paths/~1api~1v1~1operations/get/responses",
-            "/paths/~1api~1v1~1entities~1{entityId}/get/responses",
-        ] {
-            let responses = v1
-                .pointer(pointer)
-                .and_then(Value::as_object)
-                .expect("obsolete v1 response map");
-            assert_eq!(
-                responses.keys().map(String::as_str).collect::<HashSet<_>>(),
-                HashSet::from(["401", "410"])
-            );
-        }
-        assert_local_openapi_references_resolve(&v1, &v1);
 
         let protected_contract = authenticated_test_app()
             .oneshot(
@@ -5657,9 +5804,9 @@ mod tests {
         );
 
         for uri in [
-            "/api/v2/sign",
-            "/api/v2/pairing",
-            "/api/v2/spaces/space:3131313131313131313131313131313131313131313131313131313131313131/sign",
+            "/api/sign",
+            "/api/pairing",
+            "/api/spaces/space:3131313131313131313131313131313131313131313131313131313131313131/sign",
         ] {
             let response = saros_only_app()
                 .oneshot(

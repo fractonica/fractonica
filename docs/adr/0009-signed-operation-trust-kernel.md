@@ -2,10 +2,10 @@
 
 - Status: Accepted
 - Date: 2026-07-18
-- Supersedes: The version 1 identifier and actor-attribution decisions in
+- Supersedes: The prototype identifier and actor-attribution decisions in
   [ADR 0007](0007-causal-operation-log.md)
 - Implementation: Cryptographic verification, strict projection checking,
-  capability-authorized node admission, and signed-v2 SQLite persistence are
+  capability-authorized node admission, and signed SQLite persistence are
   implemented. Pairing and non-loopback transport remain separate work.
 
 ## Context
@@ -24,8 +24,7 @@ trusted clock, or central account authority.
 
 ## Decision
 
-Operation protocol version 2 is a clean pre-release replacement for version 1.
-A version 2 operation consists of an unsigned deterministic-CBOR payload and a
+An operation consists of an unsigned deterministic-CBOR payload and a
 COSE Sign1 Ed25519 signature over that exact embedded payload. JSON is an API
 projection only and is never signed.
 
@@ -60,8 +59,8 @@ CBOR encoding of this exact fixed-position array:
 
 | Index | Logical field | Encoding and rule |
 | ---: | --- | --- |
-| 0 | domain | Text, exactly `org.fractonica.operation.v2`. |
-| 1 | protocol version | Unsigned integer, exactly `2`. |
+| 0 | domain | Text, exactly `org.fractonica.operation`. |
+| 1 | protocol version | Unsigned integer, exactly `1`. |
 | 2 | space | Byte string, exactly 32 `SpaceId` bytes. |
 | 3 | actor | Byte string, exactly 32 `ActorId`/public-key bytes. |
 | 4 | entity | Byte string, exactly 16 canonical UUID bytes. Nil is invalid. |
@@ -127,7 +126,7 @@ The signed wire value is a tagged COSE Sign1 structure as defined by
 
 The operation domain and version inside the protected payload provide protocol
 domain separation. No authority, routing, or interpretation may depend on an
-unprotected header. Version 2 receivers reject detached payloads, extra
+unprotected header. Receivers reject detached payloads, extra
 headers, untagged structures, non-deterministic CBOR, other curves or
 algorithms, and signatures whose key differs from the payload `ActorId`, even
 if a generic COSE library would accept them.
@@ -155,18 +154,13 @@ actor relies. Signature verification does not imply authorization. Grant-chain
 evaluation, revocation, space bootstrap, and QR pairing are defined in
 [ADR 0010](0010-space-capabilities-and-pairing.md).
 
-## Pre-release migration
+## External sources
 
-Protocol version 1 UUID operations are not valid version 2 operations and MUST
-NOT be accepted, upgraded in place, or interpreted as signatures. There is no
-dual-read compatibility mode. A migration tool re-encodes legacy logical data
-as new version 2 payloads, assigns a space and actor, creates digest parents,
-and signs the new operations. It MAY preserve the previous UUID and source
-provenance inside a schema-defined body field, but MUST NOT claim that the new
-signature proves the legacy author created the old bytes.
-
-Existing local sequence values remain node-local cursors and are rebuilt or
-reassigned during migration. They never enter the signed payload.
+Source-system values are never accepted as operations or interpreted as
+signatures. An import agent maps them into the current schema and authors new
+operations with its own explicit capability. It MAY preserve source IDs as
+bounded provenance, but MUST NOT claim its signature proves who created the
+source bytes. Source cursors and revisions never enter signed protocol fields.
 
 ## Consequences
 

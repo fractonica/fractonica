@@ -1,6 +1,6 @@
 # Fractonica operation schema mappings
 
-This document is normative for data-model protocol version 2. Each schema body
+This document is normative for the Fractonica data model. Each schema body
 is one deterministic RFC 8949 CBOR value embedded at operation-payload index
 10. Array positions and integer codes are protocol data, not implementation
 details. An unknown code, missing field, extra field, non-canonical value, or
@@ -29,35 +29,6 @@ deterministic CBOR float. Map keys are text and are ordered by their encoded
 key bytes. Byte strings, non-text map keys, duplicate keys, NaN, and infinity
 are not metadata values.
 
-## `record.v1`
-
-A tombstone is:
-
-```text
-[0]
-```
-
-The initial put fixes visibility for that entity history. Admission rejects a
-later put with a different visibility, and authorizes tombstones against the
-visibility inherited from the admitted origin put. Visibility changes require
-a new entity plus an explicit future relationship rule; they are not an update
-of `record.v1`.
-
-A complete record put is:
-
-```text
-[
-  1,
-  startAtUnixMs,
-  endAtUnixMs | null,
-  visibility,
-  emoji | null,
-  text | null,
-  metadata,
-  resources
-]
-```
-
 Visibility codes are `0 = public`, `1 = private`. Resource order is semantic.
 Each resource is:
 
@@ -68,12 +39,9 @@ Each resource is:
 The record validator retains the temporal, text, metadata, resource-count,
 resource-contract, and duplicate-content-ID bounds defined in the crate.
 
-`record.v1` is retained only as an already-published conformance fixture. New
-clients write `record.v2`.
-
 ## Protected client documents
 
-`record.v2`, `tag.v1`, and `event.v1` wrap their application document in:
+`record`, `tag`, and `event` wrap their application document in:
 
 ```text
 [visibility, documentOrEnvelope, outerResources]
@@ -94,6 +62,10 @@ use `key:aes256:` followed by 64 lowercase hexadecimal digits. Private resource
 descriptors use media type `application/octet-stream`, role `encrypted`, and a
 null original name.
 
+The first put fixes an entity's visibility. Later puts must retain it, and a
+tombstone is authorized against the inherited visibility. Changing visibility
+creates a new entity rather than rewriting the original entity's trust domain.
+
 ## Typed references
 
 A reference is `[relation, target]`. Actor targets are
@@ -102,11 +74,11 @@ A reference is `[relation, target]`. Actor targets are
 semantic; exact duplicates are invalid. References describe relationships and
 never grant authority.
 
-## `record.v2`
+## `record`
 
 ```text
 [
-  5,
+  1,
   protected([
     startAtUnixMs,
     endAtUnixMs | null,
@@ -119,48 +91,48 @@ never grant authority.
 ]
 ```
 
-## `tag.v1`
+## `tag`
 
 ```text
-[6, protected([name, emoji | null, notes | null, colorHex | null, metadata, references])]
+[2, protected([name, emoji | null, notes | null, colorHex | null, metadata, references])]
 ```
 
-## `event.v1`
+## `event`
 
 ```text
-[7, protected([startAtUnixMs, endAtUnixMs | null, label, typeNumber, metadata, references])]
+[3, protected([startAtUnixMs, endAtUnixMs | null, label, typeNumber, metadata, references])]
 ```
 
 Event type numbers are signed integers. Events cannot carry resources.
 
-## `profile.v1`
+## `profile`
 
 ```text
-[8, [handle, displayName, sarosAnchor, avatarResource | null, metadata]]
+[4, [handle, displayName, sarosAnchor, avatarResource | null, metadata]]
 ```
 
 Profiles are public. Their entity UUID is deterministically derived from the
-actor public key under the `fractonica-profile-entity-v1` domain and uses the
+actor public key under the `fractonica-profile-entity` domain and uses the
 UUID version-8/variant-1 bit layout. Saros anchors are bounded to 101 through
 161.
 
-All five mutable client schemas use `[0]` as their tombstone body.
+All four mutable client schemas use `[0]` as their tombstone body.
 
-## `space.genesis.v1`
+## `space.genesis`
 
 ```text
-[2, controllerActorPublicKey32]
+[5, controllerActorPublicKey32]
 ```
 
 The controller must equal the operation signer. Genesis has no causal parents
 and no authorization references. Whether a node explicitly trusts this exact
 genesis is an admission-policy decision above the pure data model.
 
-## `capability.grant.v1`
+## `capability.grant`
 
 ```text
 [
-  3,
+  6,
   subjectActorPublicKey32,
   actions,
   schemas,
@@ -191,7 +163,7 @@ sorted lexically.
 
 `appendOperation` requires a nonempty schema set, and a schema set is invalid
 without that action. Every client schema requires a nonempty visibility scope;
-`profile.v1` operations additionally require public visibility. `writeContent`
+`profile` operations additionally require public visibility. `writeContent`
 requires nonempty content roles and an explicit
 maximum resource byte length; those constraints are invalid without that
 action. The maximum cannot exceed the content contract's 1 TiB bound.
@@ -201,10 +173,10 @@ strictly after not-before. Delegation depth is at most 16. The descriptive
 label contains 1 through 128 non-control Unicode scalar values and has no
 authorization meaning.
 
-## `capability.revoke.v1`
+## `capability.revoke`
 
 ```text
-[4, grantOperationDigest32, reason, detail | null]
+[7, grantOperationDigest32, reason, detail | null]
 ```
 
 Reason codes are:
@@ -228,6 +200,6 @@ The strict camel-case JSON object contains `protocolVersion`, `operationId`,
 `spaceId`, `actorId`, `entityId`, `schema`, sorted `causalParents`, sorted
 `authorization`, `occurredAtUnixMs`, `nonce`, typed `body`, and `coseSign1`.
 The nonce is exactly 32 lowercase hexadecimal digits. COSE is canonical
-base64url without padding. Unknown JSON fields, protocol version 1, projection
-drift, malformed or non-canonical COSE, invalid signatures, and unsupported
-schema bodies are rejected.
+base64url without padding. Unknown JSON fields, unsupported protocol versions,
+projection drift, malformed or non-canonical COSE, invalid signatures, and
+unsupported schema bodies are rejected.

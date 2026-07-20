@@ -70,7 +70,7 @@ describe("node client", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
       "http://127.0.0.1:8789/health/ready",
-      "http://127.0.0.1:8789/api/v1/node",
+      "http://127.0.0.1:8789/api/node",
     ]);
   });
 
@@ -194,7 +194,7 @@ describe("node client", () => {
       expiresInMs: 300_000,
       capability: {
         actions: ["appendOperation", "readSpace", "writeContent"],
-        schemas: ["record.v1"],
+        schemas: ["record", "event", "tag", "profile"],
         visibilities: ["public", "private"],
         contentRoles: ["record.media"],
         maxResourceByteLength: 1_073_741_824,
@@ -209,10 +209,10 @@ describe("node client", () => {
     await expect(client.cancelPairing(invitationId)).resolves.toEqual(cancelled);
 
     expect(fetcher.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
-      ["http://127.0.0.1:8789/api/v2/pairing/invitations", "POST"],
-      [`http://127.0.0.1:8789/api/v2/pairing/invitations/${invitationId}`, "GET"],
-      [`http://127.0.0.1:8789/api/v2/pairing/invitations/${invitationId}/confirm`, "POST"],
-      [`http://127.0.0.1:8789/api/v2/pairing/invitations/${invitationId}`, "DELETE"],
+      ["http://127.0.0.1:8789/api/pairing/invitations", "POST"],
+      [`http://127.0.0.1:8789/api/pairing/invitations/${invitationId}`, "GET"],
+      [`http://127.0.0.1:8789/api/pairing/invitations/${invitationId}/confirm`, "POST"],
+      [`http://127.0.0.1:8789/api/pairing/invitations/${invitationId}`, "DELETE"],
     ]);
     for (const [, init] of fetcher.mock.calls) {
       expect(init?.headers).toMatchObject({ Authorization: `Bearer ${token}` });

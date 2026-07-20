@@ -54,15 +54,15 @@ is still loopback-only. Its read-only routes are:
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/v1/saros` | Semantics version and immutable geometry-release manifest. |
-| `GET /api/v1/saros/pulse?atUnixSeconds=…&anchorSaros=141` | Standard 30-bit pulse as two MSB-first five-digit glyphs. |
-| `GET /api/v1/saros/series/{saros}/reading?atUnixSeconds=…&precisionBits=…` | Exact phase ratio, 64-bit word, and requested 1–64-bit prefix. |
-| `GET /api/v1/saros/series/{saros}/eclipses/{sequence}/path` | Reviewed GeoJSON `MultiPolygon` path. |
+| `GET /api/saros` | Semantics version and immutable geometry-release manifest. |
+| `GET /api/saros/pulse?atUnixSeconds=…&anchorSaros=141` | Standard 30-bit pulse as two MSB-first five-digit glyphs. |
+| `GET /api/saros/series/{saros}/reading?atUnixSeconds=…&precisionBits=…` | Exact phase ratio, 64-bit word, and requested 1–64-bit prefix. |
+| `GET /api/saros/series/{saros}/eclipses/{sequence}/path` | Reviewed GeoJSON `MultiPolygon` path. |
 
 All calculation routes require `atUnixSeconds`; the server does not sample its
 own clock for them. Invalid query values return a `422` problem response.
 Series or eclipse requests outside the reviewed release return a `404` problem
-response. The checked-in [OpenAPI contract](../contracts/openapi/v1.yaml) is
+response. The checked-in [OpenAPI contract](../contracts/openapi/services.yaml) is
 the normative wire description.
 
 ## Rebuilding the release

@@ -1293,7 +1293,7 @@ mod tests {
                     CapabilityAction::AppendOperation,
                     CapabilityAction::WriteContent,
                 ],
-                schemas: vec![EntitySchema::RecordV1],
+                schemas: vec![EntitySchema::Record],
                 visibilities: vec![Visibility::Public],
                 content_roles: vec!["record.attachment".to_owned()],
                 max_resource_byte_length: Some(1_048_576),

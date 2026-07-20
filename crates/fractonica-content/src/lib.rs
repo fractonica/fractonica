@@ -11,13 +11,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// Algorithm tag accepted by version 1 content identifiers.
+/// Algorithm tag accepted by content identifiers.
 pub const CONTENT_ALGORITHM: &str = "sha-256";
-/// Number of digest bytes in a version 1 content identifier.
+/// Number of digest bytes in a content identifier.
 pub const CONTENT_ID_BYTES: usize = 32;
 /// Exact byte length of `sha-256:` followed by 64 lowercase hexadecimal digits.
 pub const CONTENT_ID_WIRE_LENGTH: usize = 72;
-/// Maximum byte length representable by a version 1 resource reference (1 TiB).
+/// Maximum byte length representable by a resource reference (1 TiB).
 pub const MAX_CONTENT_BYTE_LENGTH: u64 = 1_099_511_627_776;
 /// Maximum byte length of a canonical media type.
 pub const MAX_MEDIA_TYPE_BYTES: usize = 127;
@@ -28,7 +28,7 @@ pub const MAX_ORIGINAL_NAME_CHARS: usize = 255;
 
 const CONTENT_ID_PREFIX: &str = "sha-256:";
 
-/// A version 1 SHA-256 identity for immutable content bytes.
+/// A SHA-256 identity for immutable content bytes.
 ///
 /// Its JSON representation is always one string in the exact form
 /// `sha-256:` followed by 64 lowercase hexadecimal digits.
@@ -138,7 +138,7 @@ impl<'de> Deserialize<'de> for ContentId {
     }
 }
 
-/// Computes the canonical version 1 identity of `bytes`.
+/// Computes the canonical identity of `bytes`.
 #[must_use]
 pub fn hash_bytes(bytes: &[u8]) -> ContentId {
     ContentId::new(Sha256::digest(bytes).into())
@@ -300,7 +300,7 @@ fn validate_original_name(original_name: &str) -> Result<(), ContentValidationEr
 pub enum ContentIdParseError {
     #[error("content ID must contain an algorithm separator")]
     MissingAlgorithmSeparator,
-    #[error("unsupported content ID algorithm {0:?}; version 1 accepts only sha-256")]
+    #[error("unsupported content ID algorithm {0:?}; Fractonica accepts only sha-256")]
     UnsupportedAlgorithm(String),
     #[error("content ID has {found} bytes; expected exactly {expected}")]
     InvalidLength { found: usize, expected: usize },

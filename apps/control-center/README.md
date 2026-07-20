@@ -3,13 +3,13 @@
 React control surface for a local Fractonica node. It reads:
 
 - `GET /health/ready`
-- `GET /api/v1/node`
+- `GET /api/node`
 
 For a full node it also drives the loopback pairing administration routes:
 
-- `POST /api/v2/pairing/invitations`
-- `GET` and `DELETE /api/v2/pairing/invitations/{invitationId}`
-- `POST /api/v2/pairing/invitations/{invitationId}/confirm`
+- `POST /api/pairing/invitations`
+- `GET` and `DELETE /api/pairing/invitations/{invitationId}`
+- `POST /api/pairing/invitations/{invitationId}/confirm`
 
 The invitation view renders the canonical QR payload. Once a joining client
 claims it, the UI displays the complete confirmation as two five-digit,

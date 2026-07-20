@@ -1,6 +1,6 @@
 # Trust-kernel threat model
 
-- Status: Normative for operation protocol version 2
+- Status: Normative for the signed operation protocol
 - Date: 2026-07-18
 
 This document defines the security boundary for Fractonica's cryptographic
@@ -97,7 +97,7 @@ protocol and may read local plaintext or invoke authorized local interfaces.
 
 ### Forgery, mutation, and replay
 
-Every authoritative operation MUST use the version 2 deterministic CBOR and
+Every authoritative operation MUST use the deterministic CBOR and
 COSE Sign1 representation defined by
 [ADR 0009](adr/0009-signed-operation-trust-kernel.md). A receiver MUST derive
 the verification key from the asserted `ActorId`, verify the Ed25519 signature,

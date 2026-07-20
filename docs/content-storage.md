@@ -6,16 +6,16 @@ resumable; a committed blob is immutable and addressed only by the SHA-256 hash
 of its complete bytes.
 
 The HTTP contract is defined in
-[`contracts/openapi/v1.yaml`](../contracts/openapi/v1.yaml). Upload behavior
+[`contracts/openapi/services.yaml`](../contracts/openapi/services.yaml). Upload behavior
 follows the official [tus protocol 1.0.0](https://tus.io/protocols/resumable-upload),
 and HTTP digest fields follow [RFC 9530](https://www.rfc-editor.org/rfc/rfc9530.html).
 All content routes require the stateful `node` profile. The stateless `saros`
 profile returns `503` and creates no staging or blob directories.
 
-These v1 routes are currently loopback content-transfer mechanics, not a
+These routes are currently loopback content-transfer mechanics, not a
 space-authorized remote API. They do not accept actor proof or evaluate
 `readSpace`/`writeContent`; the optional node-wide bearer is transport gating
-only. Before content moves under a v2 space path, upload, resume, availability,
+only. Before content moves under a space path, upload, resume, availability,
 metadata, and blob reads must enforce the applicable capability without leaking
 cross-space blob presence through physical deduplication.
 
@@ -31,7 +31,7 @@ The digest is calculated over the complete unencoded blob bytes. Filenames,
 media types, upload metadata, record order, and the node that received the data
 do not affect the ID. Equal bytes therefore converge on one immutable blob.
 
-`record.v1` has an optional ordered `resources` array containing at most 64
+`record` has an optional ordered `resources` array containing at most 64
 `ResourceRef` objects. Each reference contains a canonical `contentId`,
 `byteLength`, `mediaType`, and semantic `role`; it may also carry the display
 label `originalName`. Array order is semantic and must be preserved.
@@ -41,7 +41,7 @@ the receiving node. Operation replication and causal validation must not depend
 on local media availability. Clients can query up to 256 IDs at once with:
 
 ```http
-POST /api/v1/blobs/availability
+POST /api/blobs/availability
 ```
 
 The response separates locally committed descriptors from missing IDs while
@@ -53,7 +53,7 @@ The upload collection implements the tus core protocol plus `creation`,
 `expiration`, and `checksum` extensions:
 
 ```http
-OPTIONS /api/v1/uploads
+OPTIONS /api/uploads
 ```
 
 The discovery response advertises:
@@ -86,7 +86,7 @@ keys and must never copy unsanitized values into response headers or paths.
 Inspect an upload's durable progress with:
 
 ```http
-HEAD /api/v1/uploads/{uploadId}
+HEAD /api/uploads/{uploadId}
 Tus-Resumable: 1.0.0
 ```
 
@@ -150,8 +150,8 @@ inspection rather than being followed or silently discarded.
 Committed bytes are streamed from:
 
 ```http
-GET /api/v1/blobs/{contentId}
-HEAD /api/v1/blobs/{contentId}
+GET /api/blobs/{contentId}
+HEAD /api/blobs/{contentId}
 ```
 
 A complete `GET` returns `ETag`, `Accept-Ranges: bytes`, `Content-Length`, and an

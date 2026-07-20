@@ -6,12 +6,9 @@ info:
     name: AGPL-3.0-or-later
     url: https://www.gnu.org/licenses/agpl-3.0.html
   description: >-
-    Obsolete pre-signature API retained as a historical migration contract.
-    Version 2 nodes reject version 1 operation submission and do not reinterpret
-    unsigned UUID operations as signed operations. Saros, glyph, and legacy
-    content shapes remain documented so migration tooling can identify old
-    responses. New clients use `contracts/openapi/v2.yaml`.
-    This was a loopback-only API for a Fractonica node and its deterministic Saros engine.
+    Loopback node health, content, Saros, and glyph services. The signed graph
+    and client query endpoints are composed with this foundation into the one
+    served Fractonica API contract.
     The `saros` profile is stateless and serves only temporal/geometry routes;
     the `node` profile also owns local SQLite storage. The server must not bind
     to a non-loopback interface until pairing and authentication have been
@@ -27,10 +24,6 @@ tags:
     description: Process and profile readiness probes.
   - name: Node
     description: Local node-profile identity and declared capabilities.
-  - name: Operations
-    description: >-
-      Obsolete unsigned UUID operation log. Version 2 nodes reject these
-      routes; this description exists only for one-way migration tooling.
   - name: Content
     description: >-
       Stateful content-addressed blob discovery, tus 1.0.0 resumable upload,
@@ -78,7 +71,7 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
-  /api/v1/node:
+  /api/node:
     get:
       tags:
         - Node
@@ -99,77 +92,7 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
-  /api/v1/operations:
-    post:
-      tags:
-        - Operations
-      summary: Obsolete unsigned operation submission
-      description: >-
-        Version 2 nodes reject this operation with `410 operation_v1_obsolete`.
-        The historical request and response schemas below are retained only so
-        explicit one-way migration tools can decode pre-v2 data.
-      deprecated: true
-      operationId: appendOperation
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/OperationSubmission"
-      responses:
-        "410":
-          description: >-
-            Unsigned UUID operations are obsolete and must be migrated and
-            signed explicitly before submission to `/api/v2`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "401":
-          $ref: "#/components/responses/BootstrapUnauthorized"
-    get:
-      tags:
-        - Operations
-      summary: Obsolete unsigned operation-log read
-      description: >-
-        Version 2 nodes reject this route. A one-way offline migration tool may
-        read it only from a legacy version 1 node.
-      deprecated: true
-      operationId: listOperations
-      parameters:
-        - $ref: "#/components/parameters/OperationsAfter"
-        - $ref: "#/components/parameters/OperationsLimit"
-      responses:
-        "410":
-          description: Version 1 operation reads are obsolete on a version 2 node.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "401":
-          $ref: "#/components/responses/BootstrapUnauthorized"
-  /api/v1/entities/{entityId}:
-    get:
-      tags:
-        - Operations
-      summary: Obsolete unsigned entity-head read
-      description: Version 2 nodes reject this route; use the space-scoped v2 route.
-      deprecated: true
-      operationId: getEntity
-      parameters:
-        - $ref: "#/components/parameters/EntityId"
-      responses:
-        "410":
-          description: Version 1 entity reads are obsolete on a version 2 node.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "401":
-          $ref: "#/components/responses/BootstrapUnauthorized"
-  /api/v1/uploads:
+  /api/uploads:
     options:
       tags:
         - Content
@@ -257,7 +180,7 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /api/v1/uploads/{uploadId}:
+  /api/uploads/{uploadId}:
     head:
       tags:
         - Content
@@ -462,7 +385,7 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /api/v1/blobs/{contentId}:
+  /api/blobs/{contentId}:
     get:
       tags:
         - Content
@@ -571,7 +494,7 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /api/v1/blobs/availability:
+  /api/blobs/availability:
     post:
       tags:
         - Content
@@ -600,7 +523,7 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /api/v1/saros:
+  /api/saros:
     get:
       tags:
         - Saros
@@ -615,7 +538,7 @@ paths:
                 $ref: "#/components/schemas/SarosMetadata"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
-  /api/v1/glyphs:
+  /api/glyphs:
     get:
       tags:
         - Glyphs
@@ -630,7 +553,7 @@ paths:
                 $ref: "#/components/schemas/GlyphMetadata"
         "401":
           $ref: "#/components/responses/BootstrapUnauthorized"
-  /api/v1/glyphs/{octal}/geometry:
+  /api/glyphs/{octal}/geometry:
     get:
       tags:
         - Glyphs
@@ -650,7 +573,7 @@ paths:
           $ref: "#/components/responses/BootstrapUnauthorized"
         "422":
           $ref: "#/components/responses/ProblemResponse"
-  /api/v1/glyphs/{octal}/raster.rgba:
+  /api/glyphs/{octal}/raster.rgba:
     get:
       tags:
         - Glyphs
@@ -717,7 +640,7 @@ paths:
           $ref: "#/components/responses/BootstrapUnauthorized"
         "422":
           $ref: "#/components/responses/ProblemResponse"
-  /api/v1/saros/pulse:
+  /api/saros/pulse:
     get:
       tags:
         - Saros
@@ -750,7 +673,7 @@ paths:
           $ref: "#/components/responses/ProblemResponse"
         "503":
           $ref: "#/components/responses/ProblemResponse"
-  /api/v1/saros/series/{saros}/reading:
+  /api/saros/series/{saros}/reading:
     get:
       tags:
         - Saros
@@ -784,7 +707,7 @@ paths:
           $ref: "#/components/responses/ProblemResponse"
         "503":
           $ref: "#/components/responses/ProblemResponse"
-  /api/v1/saros/series/{saros}/eclipses/{sequence}/path:
+  /api/saros/series/{saros}/eclipses/{sequence}/path:
     get:
       tags:
         - Saros
@@ -1384,7 +1307,7 @@ components:
           description: Canonical UUID of the entity affected by this operation.
         schema:
           type: string
-          const: record.v1
+          const: record
         causalParents:
           type: array
           maxItems: 64
@@ -1434,7 +1357,7 @@ components:
             submitters cannot provide or override it.
         schema:
           type: string
-          const: record.v1
+          const: record
         causalParents:
           type: array
           maxItems: 64
@@ -1653,7 +1576,7 @@ components:
           format: uuid
         schema:
           type: string
-          const: record.v1
+          const: record
         operationCount:
           type: integer
           format: int64
