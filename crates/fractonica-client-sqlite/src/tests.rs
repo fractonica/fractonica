@@ -185,6 +185,39 @@ fn local_commit_is_atomic_replayable_and_materialized_before_delivery() {
 }
 
 #[test]
+fn disabled_provisional_peer_can_supply_bootstrap_operations_without_syncing() {
+    let (store, signing_key, genesis) = seeded_store();
+    let peer_id = key(19).node_id();
+    let operation = record(
+        &signing_key,
+        entity(19),
+        Vec::new(),
+        genesis.operation_id,
+        19,
+        190,
+        "bootstrap",
+    );
+    assert!(matches!(
+        store.commit_from_peer(&operation, 20, peer_id),
+        Err(ClientStoreError::UnknownPeer(found)) if found == peer_id
+    ));
+
+    let provisional = PeerConfig {
+        peer_id,
+        endpoint: "http://192.168.0.24:56523".into(),
+        enabled: false,
+        push_enabled: false,
+        content_read_enabled: true,
+        peer_transport_credential: None,
+        added_at_unix_ms: 20,
+    };
+    store.upsert_peer(&provisional).unwrap();
+    assert_eq!(store.peer(peer_id).unwrap(), Some(provisional));
+    store.commit_from_peer(&operation, 20, peer_id).unwrap();
+    assert!(store.enabled_peers(10).unwrap().is_empty());
+}
+
+#[test]
 fn record_feed_projection_is_bounded_and_detail_requires_the_exact_live_head() {
     let (store, signing_key, genesis) = seeded_store();
     let long_text = "🌀".repeat(MAX_RECORD_PREVIEW_TEXT_CHARS + 1);

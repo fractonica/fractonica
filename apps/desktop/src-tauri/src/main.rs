@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     fs,
+    io::Write,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
@@ -28,6 +29,8 @@ use uuid::Uuid;
 
 const CONNECTION_WAIT_ATTEMPTS: usize = 100;
 const CONNECTION_WAIT_INTERVAL: Duration = Duration::from_millis(50);
+const RESET_MARKER_FILE: &str = ".reset-local-installation";
+const RESET_MARKER_BYTES: &[u8] = b"fractonica-reset-local-installation-v1\n";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -450,11 +453,21 @@ async fn client_accept_pairing_invitation(
         "discard" => PrePairRecordPolicy::Discard,
         _ => return Err("The pre-pair record policy is invalid.".to_owned()),
     };
-    Ok(client(&sidecar)?
-        .accept_pairing_invitation(invitation_id, record_policy)
+    match client(&sidecar)?
+        .accept_pairing_invitation(invitation_id.clone(), record_policy)
         .await
-        .map_err(command_error)?
-        .into())
+    {
+        Ok(claim) => {
+            eprintln!("Fractonica desktop pairing completed for invitation {invitation_id}");
+            Ok(claim.into())
+        }
+        Err(error) => {
+            eprintln!(
+                "Fractonica desktop pairing failed after confirmation for invitation {invitation_id}: {error}"
+            );
+            Err(command_error(error))
+        }
+    }
 }
 
 #[tauri::command]
@@ -466,45 +479,50 @@ async fn client_reset_local_installation(
         return Err("Resetting local storage requires explicit confirmation.".to_owned());
     }
     let application_data = app.path().app_data_dir().map_err(command_error)?;
-    let targets = [application_data.join("node"), application_data.join("client")];
-    if targets
-        .iter()
-        .any(|target| target.parent() != Some(application_data.as_path()))
-    {
-        return Err("Refusing to reset storage outside Fractonica app data.".to_owned());
-    }
-
-    stop_sidecar(&app);
-    for target in &targets {
-        remove_storage_tree_with_retry(target).await?;
-    }
-    eprintln!(
-        "Fractonica local installation reset completed; restarting with fresh node and client storage"
-    );
+    prepare_private_directory(&application_data).map_err(command_error)?;
+    let marker = application_data.join(RESET_MARKER_FILE);
+    publish_reset_marker(&marker)
+        .map_err(|error| format!("Failed to persist the local storage reset request: {error}"))?;
+    eprintln!("Fractonica local installation reset scheduled; restarting before deletion");
     app.request_restart();
     Ok(())
 }
 
-async fn remove_storage_tree_with_retry(path: &Path) -> Result<(), String> {
-    for attempt in 0..30 {
-        match fs::remove_dir_all(path) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 29 => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "Failed to remove Fractonica storage at {}: {error}",
-                    path.display()
-                ));
-            }
+fn publish_reset_marker(path: &Path) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(RESET_MARKER_BYTES)?;
+    file.sync_all()
+}
+
+fn apply_pending_local_reset(application_data: &Path) -> std::io::Result<bool> {
+    let marker = application_data.join(RESET_MARKER_FILE);
+    let contents = match fs::read(&marker) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if contents != RESET_MARKER_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid local reset marker at {}", marker.display()),
+        ));
+    }
+    for name in ["node", "client"] {
+        let target = application_data.join(name);
+        debug_assert_eq!(target.parent(), Some(application_data));
+        match fs::remove_dir_all(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
-    Err(format!(
-        "Fractonica storage at {} remained busy after shutdown",
-        path.display()
-    ))
+    fs::remove_file(&marker)?;
+    eprintln!("Fractonica local installation reset applied before storage startup");
+    Ok(true)
 }
 
 fn client(sidecar: &NodeSidecar) -> Result<Arc<ClientRuntime>, String> {
@@ -559,6 +577,7 @@ fn main() {
             supervise_development_parent(&handle);
             let application_data = app.path().app_data_dir()?;
             prepare_private_directory(&application_data)?;
+            apply_pending_local_reset(&application_data)?;
             let node_data = application_data.join("node");
             let client_data = application_data.join("client");
             prepare_private_directory(&node_data)?;
@@ -959,6 +978,27 @@ fn terminate_child(child: CommandChild) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_reset_removes_only_node_and_client_storage() {
+        let root = tempfile::tempdir().expect("temporary app data");
+        let node = root.path().join("node");
+        let client = root.path().join("client");
+        let preserved = root.path().join("preserved.txt");
+        fs::create_dir(&node).expect("node directory");
+        fs::create_dir(&client).expect("client directory");
+        fs::write(node.join("identity"), b"node").expect("node fixture");
+        fs::write(client.join("database"), b"client").expect("client fixture");
+        fs::write(&preserved, b"keep").expect("preserved fixture");
+        publish_reset_marker(&root.path().join(RESET_MARKER_FILE)).expect("reset marker");
+
+        assert!(apply_pending_local_reset(root.path()).expect("apply reset"));
+        assert!(!node.exists());
+        assert!(!client.exists());
+        assert!(preserved.exists());
+        assert!(!root.path().join(RESET_MARKER_FILE).exists());
+        assert!(!apply_pending_local_reset(root.path()).expect("reset is one-shot"));
+    }
 
     #[test]
     fn local_summary_wire_shape_omits_absent_optional_values() {

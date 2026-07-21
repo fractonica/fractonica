@@ -673,6 +673,23 @@ impl ClientRuntime {
             peer_transport_credential: Some(peer_transport_credential),
             added_at_unix_ms: now,
         };
+        // `commit_from_peer` intentionally refuses operations attributed to
+        // an unknown source. Register a dormant source record before the
+        // bootstrap pull, but do not enable synchronization or persist the
+        // Noise-delivered credential until the grant and import validate.
+        // A failed first pairing may leave this harmless disabled row so that
+        // already verified bootstrap operations retain a valid provenance.
+        if store.peer(peer_id)?.is_none() {
+            store.upsert_peer(&PeerConfig {
+                peer_id,
+                endpoint: endpoint.clone(),
+                enabled: false,
+                push_enabled: false,
+                content_read_enabled: true,
+                peer_transport_credential: None,
+                added_at_unix_ms: now,
+            })?;
+        }
         // Pull from sequence zero before switching the authoring namespace.
         // This guarantees the remote genesis and exact admitted grant are
         // durable locally; a paired device never authors against an unseen
@@ -1508,22 +1525,29 @@ async fn accept_pairing(
     record_policy: PrePairRecordPolicy,
 ) -> Result<(), ClientRuntimeError> {
     let identity = &runtime.custody.identity;
-    let endpoint = Url::parse(&pending.endpoint).map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let endpoint = Url::parse(&pending.endpoint).map_err(|error| {
+        ClientRuntimeError::PairingCompletion(format!("invalid responder endpoint: {error}"))
+    })?;
     let url = endpoint
         .join(&format!(
             "api/pairing/invitations/{}/accept",
             pending.invitation_id
         ))
-        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+        .map_err(|error| {
+            ClientRuntimeError::PairingCompletion(format!("invalid acceptance route: {error}"))
+        })?;
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+        .map_err(|error| {
+            ClientRuntimeError::PairingCompletion(format!("HTTP client setup failed: {error}"))
+        })?;
     let request = serde_json::json!({
         "acceptanceBase64url": URL_SAFE_NO_PAD.encode(&pending.acceptance),
     });
     let mut response = None;
+    let mut last_failure = "responder did not return a successful acceptance".to_owned();
     for attempt in 0..5_u32 {
         match client.post(url.clone()).json(&request).send().await {
             Ok(value) if value.status().is_success() => {
@@ -1533,20 +1557,43 @@ async fn accept_pairing(
             // A responder may have completed the invitation even when its
             // response was lost. Retrying the exact signed acceptance is
             // idempotent; the completed session is returned on replay.
-            Ok(_) | Err(_) if attempt < 4 => {
+            Ok(value) if attempt < 4 => {
+                last_failure = format!("responder returned HTTP {}", value.status());
                 tokio::time::sleep(std::time::Duration::from_millis(
                     400_u64.saturating_mul(u64::from(attempt + 1)),
                 ))
                 .await;
             }
-            Ok(_) | Err(_) => break,
+            Err(error) if attempt < 4 => {
+                last_failure = format!("responder was unreachable: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    400_u64.saturating_mul(u64::from(attempt + 1)),
+                ))
+                .await;
+            }
+            Ok(value) => {
+                last_failure = format!("responder returned HTTP {}", value.status());
+                break;
+            }
+            Err(error) => {
+                last_failure = format!("responder was unreachable: {error}");
+                break;
+            }
         }
     }
-    let response = response.ok_or(ClientRuntimeError::PairingFailed)?;
+    let response = response.ok_or(ClientRuntimeError::PairingCompletion(last_failure))?;
+    eprintln!(
+        "Fractonica pairing acceptance acknowledged by responder {}; validating completed session",
+        pending.endpoint
+    );
     let session: PairingSessionResponse = response
         .json()
         .await
-        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+        .map_err(|error| {
+            ClientRuntimeError::PairingCompletion(format!(
+                "responder returned an invalid completed session: {error}"
+            ))
+        })?;
     if session.invitation_id != pending.claim.invitation_id
         || session.space_id != pending.claim.space_id
         || session.state != "completed"
@@ -1556,14 +1603,24 @@ async fn accept_pairing(
         || session.confirmation_octal.as_deref() != Some(pending.claim.confirmation_octal.as_str())
         || session.grant_operation_id.as_deref() != Some(pending.claim.grant_operation_id.as_str())
     {
-        return Err(ClientRuntimeError::PairingFailed);
+        return Err(ClientRuntimeError::PairingCompletion(
+            "completed session did not match the authenticated claim".to_owned(),
+        ));
     }
     let session_id: PeerSessionId = pending
         .claim
         .invitation_id
         .parse()
-        .map_err(|_| ClientRuntimeError::PairingFailed)?;
-    runtime
+        .map_err(|error| {
+            ClientRuntimeError::PairingCompletion(format!(
+                "completed session identifier is invalid: {error}"
+            ))
+        })?;
+    eprintln!(
+        "Fractonica pairing session validated; bootstrapping admitted workspace from {}",
+        pending.endpoint
+    );
+    let result = runtime
         .configure_paired_peer(
             pending.responder_node_id,
             pending.endpoint.clone(),
@@ -1573,7 +1630,14 @@ async fn accept_pairing(
             pending.peer_transport_credential.clone(),
             record_policy,
         )
-        .await
+        .await;
+    if let Err(error) = &result {
+        eprintln!(
+            "Fractonica pairing workspace bootstrap failed for {}: {error}",
+            pending.endpoint
+        );
+    }
+    result
 }
 
 fn endpoint_origin(endpoint: &Url) -> String {
@@ -1693,6 +1757,8 @@ pub enum ClientRuntimeError {
     InvalidPairingInvitation,
     #[error("pairing ceremony failed")]
     PairingFailed,
+    #[error("pairing completion failed: {0}")]
+    PairingCompletion(String),
     #[error("pairing invitation is not pending human confirmation")]
     PairingNotPending,
     #[error("secure random source is unavailable")]

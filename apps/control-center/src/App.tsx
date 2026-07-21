@@ -39,6 +39,21 @@ function labelForPhase(phase: "loading" | "offline" | "ready") {
   return "Connecting";
 }
 
+function nativeErrorMessage(reason: unknown, fallback: string): string {
+  if (reason instanceof Error) return reason.message;
+  if (typeof reason === "string" && reason.trim()) return reason;
+  if (
+    typeof reason === "object" &&
+    reason !== null &&
+    "message" in reason &&
+    typeof reason.message === "string" &&
+    reason.message.trim()
+  ) {
+    return reason.message;
+  }
+  return fallback;
+}
+
 function LoadingOverview({ baseUrl }: { baseUrl: string }) {
   return (
     <Panel aria-busy="true" className="hero hero--loading">
@@ -390,7 +405,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
       setJoinClaim(await clientCore.claimPairing(payload));
       setJoinComplete(false);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not claim the remote invitation.");
+      setError(nativeErrorMessage(reason, "Could not claim the remote invitation."));
     } finally {
       setJoining(false);
     }
@@ -404,7 +419,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
       await clientCore.acceptPairing(joinClaim.invitationId, recordPolicy);
       setJoinComplete(true);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not complete desktop pairing.");
+      setError(nativeErrorMessage(reason, "Could not complete desktop pairing."));
     } finally {
       setJoining(false);
     }
@@ -681,7 +696,7 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
     try {
       await clientCore.resetInstallation();
     } catch (reason) {
-      setResetError(reason instanceof Error ? reason.message : "Local storage could not be reset.");
+      setResetError(nativeErrorMessage(reason, "Local storage could not be reset."));
       setResetting(false);
       setResetArmed(false);
     }

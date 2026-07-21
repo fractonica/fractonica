@@ -688,6 +688,30 @@ impl ClientSqliteStore {
         Ok(())
     }
 
+    pub fn peer(&self, peer_id: NodeId) -> Result<Option<PeerConfig>, ClientStoreError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT endpoint, enabled, push_enabled, content_read_enabled,
+                        peer_transport_credential, added_at_unix_ms
+                   FROM client_peers WHERE peer_id = ?1",
+                params![peer_id.to_string()],
+                |row| {
+                    Ok(PeerConfig {
+                        peer_id,
+                        endpoint: row.get(0)?,
+                        enabled: row.get(1)?,
+                        push_enabled: row.get(2)?,
+                        content_read_enabled: row.get(3)?,
+                        peer_transport_credential: row.get(4)?,
+                        added_at_unix_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn set_peer_enabled(&self, peer_id: NodeId, enabled: bool) -> Result<(), ClientStoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
