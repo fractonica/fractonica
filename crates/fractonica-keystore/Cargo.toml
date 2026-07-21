@@ -19,6 +19,9 @@ zeroize.workspace = true
 libc.workspace = true
 rustix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+fractonica-windows-protection = { path = "../fractonica-windows-protection" }
+
 [dev-dependencies]
 fractonica-data-model.workspace = true
 tempfile.workspace = true

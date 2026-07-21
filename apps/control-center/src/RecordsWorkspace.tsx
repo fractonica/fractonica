@@ -112,7 +112,17 @@ function formatRecordDate(record: ClientRecord): string {
 function syncLabel(status: ClientStatus | null): string {
   if (!status || status.phase === "starting") return "Starting client";
   if (status.phase === "failed") return "Client unavailable";
-  if (status.rejectedOperations > 0 || status.rejectedResources > 0) return "Needs attention";
+  if (status.rejectedOperations > 0 || status.rejectedResources > 0) {
+    const rejected = [
+      status.rejectedOperations > 0
+        ? `${status.rejectedOperations} operation${status.rejectedOperations === 1 ? "" : "s"}`
+        : null,
+      status.rejectedResources > 0
+        ? `${status.rejectedResources} file${status.rejectedResources === 1 ? "" : "s"}`
+        : null,
+    ].filter(Boolean).join(", ");
+    return `Needs attention · ${rejected} rejected`;
+  }
   const pending = status.pendingOperations + status.pendingUploads + status.pendingDownloads;
   return pending > 0 ? `Syncing ${pending}` : "In sync";
 }

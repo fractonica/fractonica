@@ -1319,11 +1319,14 @@ async fn claim_pairing(
     identity: Arc<IdentityBundle>,
 ) -> Result<PendingPairing, ClientRuntimeError> {
     let descriptor = invitation.descriptor();
-    let endpoint = descriptor
+    let endpoints = descriptor
         .endpoint_hints
         .iter()
-        .find_map(|hint| validate_paired_endpoint(hint).ok())
-        .ok_or(ClientRuntimeError::InvalidPairingInvitation)?;
+        .filter_map(|hint| validate_paired_endpoint(hint).ok())
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Err(ClientRuntimeError::InvalidPairingInvitation);
+    }
 
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|_| ClientRuntimeError::RandomSourceUnavailable)?;
@@ -1343,9 +1346,6 @@ async fn claim_pairing(
                 .map_err(|_| ClientRuntimeError::PairingFailed)?,
         )
         .map_err(|_| ClientRuntimeError::PairingFailed)?;
-    let url = endpoint
-        .join("api/pairing/handshake")
-        .map_err(|_| ClientRuntimeError::InvalidPairingInvitation)?;
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15))
@@ -1362,24 +1362,43 @@ async fn claim_pairing(
     // was lost after the invitation had already been claimed.
     let mut response = None;
     for attempt in 0..5_u32 {
-        match client.post(url.clone()).json(&request).send().await {
-            Ok(value) => {
-                response = Some(value);
+        let mut requests = tokio::task::JoinSet::new();
+        for endpoint in &endpoints {
+            let endpoint = endpoint.clone();
+            let url = endpoint
+                .join("api/pairing/handshake")
+                .map_err(|_| ClientRuntimeError::InvalidPairingInvitation)?;
+            let client = client.clone();
+            let request = request.clone();
+            requests.spawn(async move {
+                client
+                    .post(url)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map(|response| (endpoint, response))
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            if let Ok(Ok((endpoint, value))) = result
+                && value.status().is_success()
+            {
+                requests.abort_all();
+                response = Some((endpoint, value));
                 break;
             }
-            Err(_) if attempt < 4 => {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    500_u64.saturating_mul(u64::from(attempt + 1)),
-                ))
-                .await;
-            }
-            Err(_) => return Err(ClientRuntimeError::PairingFailed),
+        }
+        if response.is_some() {
+            break;
+        }
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                500_u64.saturating_mul(u64::from(attempt + 1)),
+            ))
+            .await;
         }
     }
-    let response = response.ok_or(ClientRuntimeError::PairingFailed)?;
-    if !response.status().is_success() {
-        return Err(ClientRuntimeError::PairingFailed);
-    }
+    let (endpoint, response) = response.ok_or(ClientRuntimeError::PairingFailed)?;
     let response: PairingHandshakeResponse = response
         .json()
         .await

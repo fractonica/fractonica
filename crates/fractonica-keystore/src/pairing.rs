@@ -47,10 +47,11 @@ impl FilePairingSecretVault {
             }
 
             let mut bytes = secret.protected_store_bytes();
+            let stored_bytes = protect_secret_bytes(&bytes)?;
             let temporary = self.temporary_path()?;
             let result = (|| {
                 let mut file = private_create_new(&temporary)?;
-                file.write_all(&bytes)
+                file.write_all(&stored_bytes)
                     .map_err(|source| io_error(&temporary, source))?;
                 file.sync_all()
                     .map_err(|source| io_error(&temporary, source))?;
@@ -121,9 +122,7 @@ impl FilePairingSecretVault {
                 };
                 let id = InvitationId::parse_hex(hex)
                     .map_err(|_| PairingSecretVaultError::UnsafeObject(entry.path()))?;
-                let file =
-                    File::open(entry.path()).map_err(|source| io_error(&entry.path(), source))?;
-                validate_private_file(&entry.path(), &file, Some(SECRET_BYTES))?;
+                read_secret_file(&entry.path())?;
                 ids.push(id);
             }
             ids.sort_unstable();
@@ -194,8 +193,20 @@ impl std::fmt::Debug for FilePairingSecretVault {
 }
 
 fn prepare_private_directory(path: &Path) -> Result<(), PairingSecretVaultError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     return Err(PairingSecretVaultError::UnsupportedPlatform);
+
+    #[cfg(windows)]
+    {
+        if !path_exists(path)? {
+            fs::create_dir_all(path).map_err(|source| io_error(path, source))?;
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(PairingSecretVaultError::UnsafeObject(path.to_owned()));
+        }
+        Ok(())
+    }
 
     #[cfg(unix)]
     {
@@ -222,8 +233,17 @@ fn unsafe_uid() -> u32 {
 }
 
 fn private_open_or_create(path: &Path) -> Result<File, PairingSecretVaultError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     return Err(PairingSecretVaultError::UnsupportedPlatform);
+
+    #[cfg(windows)]
+    {
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(false)
+            .open(path).map_err(|source| io_error(path, source))?;
+        validate_private_file(path, &file, None)?;
+        Ok(file)
+    }
 
     #[cfg(unix)]
     {
@@ -241,8 +261,12 @@ fn private_open_or_create(path: &Path) -> Result<File, PairingSecretVaultError> 
 }
 
 fn private_create_new(path: &Path) -> Result<File, PairingSecretVaultError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     return Err(PairingSecretVaultError::UnsupportedPlatform);
+
+    #[cfg(windows)]
+    return OpenOptions::new().read(true).write(true).create_new(true)
+        .open(path).map_err(|source| io_error(path, source));
 
     #[cfg(unix)]
     {
@@ -261,11 +285,11 @@ fn read_secret_file(path: &Path) -> Result<Vec<u8>, PairingSecretVaultError> {
         .read(true)
         .open(path)
         .map_err(|source| io_error(path, source))?;
-    validate_private_file(path, &file, Some(SECRET_BYTES))?;
-    let mut bytes = Vec::with_capacity(SECRET_BYTES);
+    validate_private_file(path, &file, platform_secret_length())?;
+    let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|source| io_error(path, source))?;
-    Ok(bytes)
+    unprotect_secret_bytes(&bytes, path)
 }
 
 fn validate_private_file(
@@ -273,8 +297,20 @@ fn validate_private_file(
     file: &File,
     expected_length: Option<usize>,
 ) -> Result<(), PairingSecretVaultError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     return Err(PairingSecretVaultError::UnsupportedPlatform);
+
+    #[cfg(windows)]
+    {
+        let link = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+        let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+        if !link.file_type().is_file() || link.file_type().is_symlink()
+            || expected_length.is_some_and(|length| metadata.len() != length as u64)
+        {
+            return Err(PairingSecretVaultError::UnsafeObject(path.to_owned()));
+        }
+        Ok(())
+    }
 
     #[cfg(unix)]
     {
@@ -302,9 +338,58 @@ fn path_exists(path: &Path) -> Result<bool, PairingSecretVaultError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), PairingSecretVaultError> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| io_error(path, source))
+}
+
+#[cfg(unix)]
+fn platform_secret_length() -> Option<usize> { Some(SECRET_BYTES) }
+
+#[cfg(windows)]
+fn platform_secret_length() -> Option<usize> { None }
+
+#[cfg(not(any(unix, windows)))]
+fn platform_secret_length() -> Option<usize> { Some(SECRET_BYTES) }
+
+#[cfg(unix)]
+fn protect_secret_bytes(bytes: &[u8]) -> Result<Vec<u8>, PairingSecretVaultError> {
+    Ok(bytes.to_vec())
+}
+
+#[cfg(windows)]
+fn protect_secret_bytes(bytes: &[u8]) -> Result<Vec<u8>, PairingSecretVaultError> {
+    fractonica_windows_protection::protect(bytes, b"fractonica/pairing-secret/v1")
+        .map_err(PairingSecretVaultError::Protection)
+}
+
+#[cfg(unix)]
+fn unprotect_secret_bytes(bytes: &[u8], _path: &Path) -> Result<Vec<u8>, PairingSecretVaultError> {
+    Ok(bytes.to_vec())
+}
+
+#[cfg(windows)]
+fn unprotect_secret_bytes(bytes: &[u8], path: &Path) -> Result<Vec<u8>, PairingSecretVaultError> {
+    let value = fractonica_windows_protection::unprotect(bytes, b"fractonica/pairing-secret/v1")
+        .map_err(|source| PairingSecretVaultError::ProtectedSecret { path: path.to_owned(), source })?;
+    if value.len() != SECRET_BYTES { return Err(PairingSecretVaultError::Corrupt(path.to_owned())); }
+    Ok(value)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect_secret_bytes(_bytes: &[u8]) -> Result<Vec<u8>, PairingSecretVaultError> {
+    Err(PairingSecretVaultError::UnsupportedPlatform)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unprotect_secret_bytes(_bytes: &[u8], _path: &Path) -> Result<Vec<u8>, PairingSecretVaultError> {
+    Err(PairingSecretVaultError::UnsupportedPlatform)
 }
 
 fn io_error(path: &Path, source: io::Error) -> PairingSecretVaultError {
@@ -318,6 +403,10 @@ fn io_error(path: &Path, source: io::Error) -> PairingSecretVaultError {
 pub enum PairingSecretVaultError {
     #[error("pairing secret files are unsupported on this platform")]
     UnsupportedPlatform,
+    #[error("Windows DPAPI failed to protect a pairing secret: {0}")]
+    Protection(#[source] io::Error),
+    #[error("Windows DPAPI failed to decrypt pairing secret at {path}: {source}")]
+    ProtectedSecret { path: PathBuf, #[source] source: io::Error },
     #[error("pairing secret path is not a private regular object: {0}")]
     UnsafeObject(PathBuf),
     #[error("pairing secret is corrupt: {0}")]

@@ -544,8 +544,16 @@ fn remove_if_exists(path: &Path) -> Result<(), ClientContentError> {
     }
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> Result<(), ClientContentError> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<(), ClientContentError> {
+    // Windows rejects opening a directory through std's regular-file API.
+    // Files themselves are synced before atomic publication.
     Ok(())
 }
 

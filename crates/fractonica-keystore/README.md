@@ -19,11 +19,9 @@ use mode `0600`. Symlinks, non-regular files, malformed lengths, missing files
 from a completed identity, and identity collisions are rejected rather than
 repaired.
 
-`FileKeyStore` is deliberately Unix-only. It returns an unsupported-platform
-error on Windows rather than storing raw seed files without equivalent ACL,
-owner, link, and no-follow guarantees. A Windows node requires a separately
-reviewed Credential Manager/DPAPI (or stronger hardware-backed) implementation
-of `KeyStore`; bypassing the platform check is not supported. Unix owner and
+On Windows, `FileKeyStore` protects every private seed with current-user DPAPI
+and role-specific entropy before filesystem publication. Pairing invitation
+secrets use the same current-user protection boundary. Unix owner and
 mode checks do not prove that a macOS or network filesystem has no extended
 ACL, so this raw adapter is currently limited to controlled single-user local
 filesystems. Production macOS desktop releases require a reviewed Keychain

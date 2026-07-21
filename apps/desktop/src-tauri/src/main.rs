@@ -387,12 +387,17 @@ async fn client_import_attachments(
         return Err("Attachment import limit must be between 1 and 64.".to_owned());
     }
     let runtime = client(&sidecar)?;
-    let selected = window
+    let (selection_tx, selection_rx) = tokio::sync::oneshot::channel();
+    window
         .dialog()
         .file()
         .set_title("Attach files to this record")
-        .blocking_pick_files()
-        .unwrap_or_default();
+        .pick_files(move |selection| {
+            let _ = selection_tx.send(selection.unwrap_or_default());
+        });
+    let selected = selection_rx
+        .await
+        .map_err(|_| "The attachment picker closed unexpectedly.".to_owned())?;
     if selected.len() > limit {
         return Err(format!(
             "Select at most {limit} more attachment{} for this record.",
@@ -831,7 +836,17 @@ fn private_interface_ipv4s() -> Vec<(u8, Ipv4Addr)> {
 
 #[cfg(not(unix))]
 fn private_interface_ipv4s() -> Vec<(u8, Ipv4Addr)> {
-    Vec::new()
+    local_ip_address::list_afinet_netifas()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, address)| {
+            let std::net::IpAddr::V4(ip) = address else {
+                return None;
+            };
+            (!ip.is_loopback() && (ip.is_private() || ip.is_link_local()))
+                .then_some((interface_preference(&name, ip), ip))
+        })
+        .collect()
 }
 
 fn prepare_private_directory(path: &Path) -> std::io::Result<()> {

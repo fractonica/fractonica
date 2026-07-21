@@ -24,6 +24,7 @@ members = [
     "crates/fractonica-store-sqlite",
     "crates/fractonica-temporal-core",
     "crates/fractonica-trust",
+    "crates/fractonica-windows-protection",
     "tools/uniffi-bindgen",
 ]
 resolver = "3"
@@ -69,6 +70,7 @@ async-trait = "0.1.89"
 http-body-util = "0.1.4"
 httpdate = "1.0.3"
 libc = "0.2.186"
+local-ip-address = "0.6.13"
 libm = "0.2.16"
 mime_guess = "2.0.5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
@@ -100,3 +102,4 @@ uuid = { version = "1.24.0", features = ["serde", "v4", "v7"] }
 uniffi = "=0.32.0"
 zeroize = "1.9.0"
 x25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
+windows-sys = "0.61.2"

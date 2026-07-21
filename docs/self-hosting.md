@@ -188,11 +188,9 @@ expected. These controls protect local filesystem ownership only; they do not
 encrypt the database. Store backups in a location with equivalent access
 controls.
 
-The current raw `FileKeyStore` is Unix-only because its security contract
-depends on owner IDs, exact modes, single hard links, no-follow opens, and
-durable directory operations. It intentionally refuses to run on Windows. A
-Windows release needs a reviewed Credential Manager/DPAPI or equivalent secure
-`KeyStore` backend; relaxing filesystem checks is not supported. Mode and owner
+The raw-file form of `FileKeyStore` is used on Unix. On Windows, private
+identity and pairing-secret payloads are encrypted with current-user DPAPI and
+domain-specific entropy before filesystem publication. Mode and owner
 checks do not prove the absence of extended ACL entries on macOS or network
 filesystems, so the raw backend is limited to a controlled single-user local
 filesystem. A production macOS desktop release requires a reviewed Keychain

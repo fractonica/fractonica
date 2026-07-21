@@ -17,6 +17,7 @@ fractonica-content.workspace = true
 fractonica-data-model.workspace = true
 fractonica-sync.workspace = true
 mime_guess.workspace = true
+local-ip-address.workspace = true
 serde.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true

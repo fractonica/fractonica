@@ -79,13 +79,12 @@ SQLite is the initial durable store for desktop and headless nodes. The node
 applies checked-in, ordered migrations and serializes writes through its
 persistence layer. Backup and restore must use SQLite-safe mechanisms rather
 than copying an active database opportunistically. The raw `FileKeyStore`
-backend is intentionally Unix-only because its guarantees rely on Unix owner,
-mode, hard-link, and no-follow semantics. It does not prove that a macOS or
+backend uses Unix owner, mode, hard-link, and no-follow guarantees on Unix. It
+does not prove that a macOS or
 network filesystem has no extended ACL, so it is currently a single-user local
 backend; desktop production releases must use Keychain or another reviewed
-platform store. Windows support requires a protected
-Credential Manager/DPAPI or equivalently reviewed backend; weakening these
-checks is not a portability strategy.
+platform store. Windows identity and pairing secrets are protected with
+current-user DPAPI and domain-specific entropy before filesystem publication.
 
 Replication belongs to the application protocol. Fractonica never treats raw
 SQLite pages or database files as a replication format. A managed deployment

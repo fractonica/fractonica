@@ -52,11 +52,6 @@ impl FileKeyStore {
     /// so deleting the identity directory can never silently mint replacement
     /// controller keys.
     pub fn load_existing(&self) -> Result<IdentityBundle, FileKeyStoreError> {
-        #[cfg(not(unix))]
-        {
-            return Err(FileKeyStoreError::UnsupportedPlatform);
-        }
-        #[cfg(unix)]
         {
             let metadata = fs::symlink_metadata(&self.identity_dir).map_err(|source| {
                 FileKeyStoreError::Io {
@@ -84,11 +79,6 @@ impl FileKeyStore {
     }
 
     fn bootstrap(&self) -> Result<IdentityBundle, FileKeyStoreError> {
-        #[cfg(not(unix))]
-        {
-            return Err(FileKeyStoreError::UnsupportedPlatform);
-        }
-        #[cfg(unix)]
         {
             prepare_identity_directory(&self.identity_dir)?;
             let lock = open_bootstrap_lock(&self.identity_dir)?;
@@ -307,10 +297,10 @@ fn load_or_create_material(
         Ok(_) => read_required_material(&path, role),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let candidate = random_material()?;
-            match publish_new_file(identity_dir, &path, &candidate[..])? {
+            let protected = protect_key_material(&candidate, role)?;
+            match publish_new_file(identity_dir, &path, &protected)? {
                 PublishOutcome::Created => {
-                    let file = open_validated_private_file(&path, MATERIAL_BYTES)?;
-                    drop(file);
+                    read_required_material(&path, role)?;
                     Ok(candidate)
                 }
                 PublishOutcome::Existing => read_required_material(&path, role),
@@ -332,7 +322,7 @@ fn load_or_create_space_id(identity_dir: &Path) -> Result<[u8; 32], FileKeyStore
             let candidate = random_nonzero_space_id()?;
             match publish_new_file(identity_dir, &path, &candidate)? {
                 PublishOutcome::Created => {
-                    let file = open_validated_private_file(&path, MATERIAL_BYTES)?;
+                    let file = open_validated_private_file(&path, Some(MATERIAL_BYTES))?;
                     drop(file);
                     Ok(candidate)
                 }
@@ -357,16 +347,8 @@ fn read_required_material(
             role: Some(role),
         });
     }
-    let mut file = open_validated_private_file(path, MATERIAL_BYTES)?;
-    let mut bytes = Zeroizing::new([0_u8; MATERIAL_BYTES]);
-    file.read_exact(&mut bytes[..])
-        .map_err(|source| FileKeyStoreError::Io {
-            action: "read private key material",
-            path: path.to_owned(),
-            source,
-        })?;
-    verify_end_of_file(path, &mut file, MATERIAL_BYTES)?;
-    Ok(bytes)
+    let bytes = read_key_material_file(path)?;
+    unprotect_key_material(&bytes, role, path)
 }
 
 fn read_required_space_id(path: &Path) -> Result<[u8; 32], FileKeyStoreError> {
@@ -388,7 +370,7 @@ fn read_required_space_id(path: &Path) -> Result<[u8; 32], FileKeyStoreError> {
 }
 
 fn read_private_exact(path: &Path, expected: usize) -> Result<Vec<u8>, FileKeyStoreError> {
-    let mut file = open_validated_private_file(path, expected)?;
+    let mut file = open_validated_private_file(path, Some(expected))?;
     let mut bytes = vec![0_u8; expected];
     file.read_exact(&mut bytes)
         .map_err(|source| FileKeyStoreError::Io {
@@ -400,7 +382,10 @@ fn read_private_exact(path: &Path, expected: usize) -> Result<Vec<u8>, FileKeySt
     Ok(bytes)
 }
 
-fn open_validated_private_file(path: &Path, expected: usize) -> Result<File, FileKeyStoreError> {
+fn open_validated_private_file(
+    path: &Path,
+    expected: Option<usize>,
+) -> Result<File, FileKeyStoreError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| FileKeyStoreError::Io {
         action: "inspect private file",
         path: path.to_owned(),
@@ -419,7 +404,7 @@ fn open_validated_private_file(path: &Path, expected: usize) -> Result<File, Fil
         path: path.to_owned(),
         source,
     })?;
-    validate_open_private_file(path, &file, Some(expected as u64))?;
+    validate_open_private_file(path, &file, expected.map(|value| value as u64))?;
     Ok(file)
 }
 
@@ -555,6 +540,127 @@ fn random_material() -> Result<Zeroizing<[u8; 32]>, FileKeyStoreError> {
     let mut bytes = Zeroizing::new([0_u8; 32]);
     getrandom::fill(&mut bytes[..]).map_err(FileKeyStoreError::Random)?;
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn protect_key_material(
+    material: &[u8; MATERIAL_BYTES],
+    _role: KeyRole,
+) -> Result<Vec<u8>, FileKeyStoreError> {
+    Ok(material.to_vec())
+}
+
+#[cfg(unix)]
+fn read_key_material_file(path: &Path) -> Result<Vec<u8>, FileKeyStoreError> {
+    read_private_exact(path, MATERIAL_BYTES)
+}
+
+#[cfg(unix)]
+fn unprotect_key_material(
+    bytes: &[u8],
+    _role: KeyRole,
+    path: &Path,
+) -> Result<Zeroizing<[u8; MATERIAL_BYTES]>, FileKeyStoreError> {
+    bytes
+        .try_into()
+        .map(Zeroizing::new)
+        .map_err(|_| FileKeyStoreError::InvalidLength {
+            path: path.to_owned(),
+            expected: MATERIAL_BYTES,
+            found: bytes.len(),
+        })
+}
+
+#[cfg(windows)]
+fn key_entropy(role: KeyRole) -> &'static [u8] {
+    match role {
+        KeyRole::NodeTransport => b"fractonica/identity/node-transport/v1",
+        KeyRole::SpaceController => b"fractonica/identity/space-controller/v1",
+        KeyRole::LocalWriter => b"fractonica/identity/local-writer/v1",
+    }
+}
+
+#[cfg(windows)]
+fn protect_key_material(
+    material: &[u8; MATERIAL_BYTES],
+    role: KeyRole,
+) -> Result<Vec<u8>, FileKeyStoreError> {
+    fractonica_windows_protection::protect(material, key_entropy(role))
+        .map_err(FileKeyStoreError::PlatformProtection)
+}
+
+#[cfg(windows)]
+fn read_key_material_file(path: &Path) -> Result<Vec<u8>, FileKeyStoreError> {
+    const MAX_DPAPI_BLOB_BYTES: u64 = 16 * 1024;
+    let mut file = open_validated_private_file(path, None)?;
+    let length = file
+        .metadata()
+        .map_err(|source| FileKeyStoreError::Io {
+            action: "inspect protected key material",
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if length == 0 || length > MAX_DPAPI_BLOB_BYTES {
+        return Err(FileKeyStoreError::InvalidProtectedLength {
+            path: path.to_owned(),
+            found: length,
+        });
+    }
+    let mut bytes = vec![0; length as usize];
+    file.read_exact(&mut bytes)
+        .map_err(|source| FileKeyStoreError::Io {
+            action: "read protected key material",
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn unprotect_key_material(
+    bytes: &[u8],
+    role: KeyRole,
+    path: &Path,
+) -> Result<Zeroizing<[u8; MATERIAL_BYTES]>, FileKeyStoreError> {
+    let output = Zeroizing::new(fractonica_windows_protection::unprotect(bytes, key_entropy(role)).map_err(
+        |source| FileKeyStoreError::ProtectedMaterial {
+            path: path.to_owned(),
+            source,
+        },
+    )?);
+    if output.len() == MATERIAL_BYTES {
+        let mut material = Zeroizing::new([0; MATERIAL_BYTES]);
+        material.copy_from_slice(&output);
+        Ok(material)
+    } else {
+        Err(FileKeyStoreError::InvalidProtectedLength {
+            path: path.to_owned(),
+            found: output.len() as u64,
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect_key_material(
+    _material: &[u8; MATERIAL_BYTES],
+    _role: KeyRole,
+) -> Result<Vec<u8>, FileKeyStoreError> {
+    Err(FileKeyStoreError::UnsupportedPlatform)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_key_material_file(_path: &Path) -> Result<Vec<u8>, FileKeyStoreError> {
+    Err(FileKeyStoreError::UnsupportedPlatform)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unprotect_key_material(
+    _bytes: &[u8],
+    _role: KeyRole,
+    _path: &Path,
+) -> Result<Zeroizing<[u8; MATERIAL_BYTES]>, FileKeyStoreError> {
+    Err(FileKeyStoreError::UnsupportedPlatform)
 }
 
 fn random_nonzero_space_id() -> Result<[u8; 32], FileKeyStoreError> {
@@ -860,6 +966,16 @@ pub enum FileKeyStoreError {
         "the raw-file keystore is disabled on this platform because private ACL guarantees are not implemented"
     )]
     UnsupportedPlatform,
+    #[error("Windows DPAPI failed to protect key material: {0}")]
+    PlatformProtection(io::Error),
+    #[error("Windows DPAPI failed to decrypt protected key material at {path}: {source}")]
+    ProtectedMaterial {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid protected key-material length at {path}: found {found} bytes")]
+    InvalidProtectedLength { path: PathBuf, found: u64 },
     #[error("failed to {action} at {path}: {source}")]
     Io {
         action: &'static str,
@@ -956,10 +1072,14 @@ mod tests {
             NODE_TRANSPORT_FILE,
             SPACE_CONTROLLER_FILE,
             LOCAL_WRITER_FILE,
-            SPACE_ID_FILE,
         ] {
-            assert_eq!(fs::metadata(identity_dir.join(name)).unwrap().len(), 32);
+            let length = fs::metadata(identity_dir.join(name)).unwrap().len();
+            #[cfg(unix)]
+            assert_eq!(length, 32);
+            #[cfg(windows)]
+            assert!(length > 32);
         }
+        assert_eq!(fs::metadata(identity_dir.join(SPACE_ID_FILE)).unwrap().len(), 32);
         assert_eq!(
             fs::read(identity_dir.join(MANIFEST_FILE)).unwrap(),
             MANIFEST_BYTES
@@ -1039,7 +1159,7 @@ mod tests {
         create_private_dir(&identity_dir);
         write_private(&identity_dir.join(STARTED_FILE), STARTED_BYTES);
         let seed = [7_u8; 32];
-        write_private(&identity_dir.join(NODE_TRANSPORT_FILE), &seed);
+        write_key(&identity_dir.join(NODE_TRANSPORT_FILE), &seed, KeyRole::NodeTransport);
         let expected = SigningKey::from_seed(seed).node_id();
 
         let loaded = FileKeyStore::new(&identity_dir).load_or_create().unwrap();
@@ -1056,6 +1176,7 @@ mod tests {
         let error = FileKeyStore::new(&identity_dir)
             .load_or_create()
             .unwrap_err();
+        #[cfg(unix)]
         assert!(matches!(
             error,
             FileKeyStoreError::InvalidLength {
@@ -1064,6 +1185,8 @@ mod tests {
                 ..
             }
         ));
+        #[cfg(windows)]
+        assert!(matches!(error, FileKeyStoreError::ProtectedMaterial { .. }));
         assert_eq!(
             fs::metadata(identity_dir.join(LOCAL_WRITER_FILE))
                 .unwrap()
@@ -1078,9 +1201,9 @@ mod tests {
         let identity_dir = temporary.path().join("identity");
         create_private_dir(&identity_dir);
         write_private(&identity_dir.join(MANIFEST_FILE), MANIFEST_BYTES);
-        write_private(&identity_dir.join(NODE_TRANSPORT_FILE), &[1_u8; 32]);
-        write_private(&identity_dir.join(SPACE_CONTROLLER_FILE), &[2_u8; 32]);
-        write_private(&identity_dir.join(LOCAL_WRITER_FILE), &[2_u8; 32]);
+        write_key(&identity_dir.join(NODE_TRANSPORT_FILE), &[1_u8; 32], KeyRole::NodeTransport);
+        write_key(&identity_dir.join(SPACE_CONTROLLER_FILE), &[2_u8; 32], KeyRole::SpaceController);
+        write_key(&identity_dir.join(LOCAL_WRITER_FILE), &[2_u8; 32], KeyRole::LocalWriter);
         write_private(&identity_dir.join(SPACE_ID_FILE), &[3_u8; 32]);
         let error = FileKeyStore::new(&identity_dir)
             .load_or_create()
@@ -1097,9 +1220,9 @@ mod tests {
         let identity_dir = temporary.path().join("identity");
         create_private_dir(&identity_dir);
         write_private(&identity_dir.join(MANIFEST_FILE), MANIFEST_BYTES);
-        write_private(&identity_dir.join(NODE_TRANSPORT_FILE), &[1_u8; 32]);
-        write_private(&identity_dir.join(SPACE_CONTROLLER_FILE), &[2_u8; 32]);
-        write_private(&identity_dir.join(LOCAL_WRITER_FILE), &[3_u8; 32]);
+        write_key(&identity_dir.join(NODE_TRANSPORT_FILE), &[1_u8; 32], KeyRole::NodeTransport);
+        write_key(&identity_dir.join(SPACE_CONTROLLER_FILE), &[2_u8; 32], KeyRole::SpaceController);
+        write_key(&identity_dir.join(LOCAL_WRITER_FILE), &[3_u8; 32], KeyRole::LocalWriter);
         write_private(&identity_dir.join(SPACE_ID_FILE), &[0_u8; 32]);
         assert!(matches!(
             FileKeyStore::new(&identity_dir).load_or_create(),
@@ -1264,6 +1387,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
+    }
+
+    fn write_key(path: &Path, seed: &[u8; MATERIAL_BYTES], role: KeyRole) {
+        write_private(path, &protect_key_material(seed, role).unwrap());
     }
 
     #[cfg(unix)]

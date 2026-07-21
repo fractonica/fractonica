@@ -202,6 +202,8 @@ confidentiality guarantee.
   modes, single-link files, and no-follow opens, but it does not prove that a
   macOS or network filesystem has no extended ACL. It is a single-user local
   bootstrap backend, not the production macOS secret-store boundary.
+- Windows identity seeds and pairing secrets are encrypted before publication
+  with current-user DPAPI and domain-specific optional entropy.
 - An `ActorId` or `NodeId` cannot retain its identity after key replacement,
   because the identity contains the public key. Rotation creates a new ID.
   Actor continuity is expressed by granting the new actor and revoking the old

@@ -860,6 +860,16 @@ fn set_private_file_permissions(path: &Path) -> io::Result<()> {
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        // Opening a directory through `std::fs::File::open` requests file-style
+        // access on Windows and fails with ERROR_ACCESS_DENIED. Windows does
+        // not expose the Unix directory-fsync durability primitive through
+        // std, so file `sync_all` plus atomic publication remains the boundary.
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
     File::open(path)?.sync_all()
 }
 
