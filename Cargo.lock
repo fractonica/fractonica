@@ -1605,13 +1605,19 @@ dependencies = [
 name = "fractonica-mobile-ffi"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64 0.22.1",
  "fractonica-client-runtime",
  "fractonica-client-sqlite",
  "fractonica-content",
  "fractonica-data-model",
  "fractonica-keystore",
+ "fractonica-pairing",
+ "fractonica-peer",
  "fractonica-trust",
  "getrandom 0.4.3",
+ "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -1642,12 +1648,14 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

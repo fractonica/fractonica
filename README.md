@@ -1,9 +1,10 @@
 # Fractonica
 
 Fractonica is a local-first personal data network. The current node owns its
-local storage and exposes an OpenAPI-described loopback API. Local pairing and
-capability-authorized peer reads are implemented; encrypted transport,
-replication, and public-data publishing remain planned.
+local storage and exposes an OpenAPI-described control API. The desktop build
+supervises that node, advertises a private-LAN pairing endpoint, and supports
+capability-authorized bidirectional record and media synchronization. Public
+transport, automatic discovery, and public-data publishing remain planned.
 
 This repository is intentionally independent from Exeligmos. Exeligmos is an
 external data source: the future import agent will read it and author ordinary
@@ -23,7 +24,7 @@ The initial vertical slice provides:
   capability grants, and append-only revocations;
 - content-addressed record resources with tus 1.0.0 resumable staging,
   immutable SHA-256 blobs, availability checks, and byte-range streaming;
-- loopback-only liveness, readiness, node metadata, and Swagger endpoints;
+- authenticated liveness, readiness, node metadata, and Swagger endpoints;
 - a stateless `saros` node profile for exact temporal readings and reviewed
   eclipse geometry without local storage;
 - a React control center that can inspect the local node and administer the
@@ -31,8 +32,8 @@ The initial vertical slice provides:
   confirmation;
 - an Expo/React Native mobile foundation with a strict native-client boundary,
   canonical SVG glyph rendering, and an offline-first records surface;
-- dual-signed, pairing-bound `readSpace` change pages with durable replay
-  protection;
+- dual-signed, pairing-bound `readSpace` change pages plus a Noise-delivered,
+  grant-scoped operation/content transport credential;
 - a Tauri desktop shell that supervises the node and owns a native client
   runtime without exposing keys or storage handles to the webview;
 - a platform-neutral Rust client authoring core with explicit native key
@@ -55,7 +56,7 @@ The initial vertical slice provides:
 ## Run the node
 
 ```sh
-cargo run -p fractonica-node
+pnpm node:dev
 ```
 
 The standalone node listens on `http://127.0.0.1:8789` by default. The desktop
@@ -128,11 +129,18 @@ pnpm dev
 
 ## Run the desktop application
 
-The desktop script builds a target-specific node sidecar before launching Tauri:
+This is the normal way to launch the node for desktop/iOS pairing. Do not start
+a second node separately: the command builds the target-specific sidecar,
+launches it, waits for readiness, and then opens Tauri:
 
 ```sh
 pnpm desktop:dev
 ```
+
+Keep this terminal open. `Fractonica node available` in the desktop status and
+a scannable pairing QR mean the supervised node is ready. If startup fails, the
+desktop status now includes the node's actual stderr (for example, a retained
+profile lock) rather than only saying that the node is unavailable.
 
 Create a release bundle with:
 

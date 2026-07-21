@@ -1288,6 +1288,8 @@ impl<C> NodeHttpTransport<C> {
     ) -> reqwest::RequestBuilder {
         if let Some(token) = self.bearer_tokens.get(&peer.peer_id) {
             request = request.bearer_auth(token);
+        } else if let Some(credential) = &peer.peer_transport_credential {
+            request = request.header("authorization", format!("Fractonica-Peer {credential}"));
         }
         request
     }
@@ -1308,9 +1310,7 @@ where
             &format!("api/spaces/{}/operations", operation.space_id),
         )?;
         let mut request = self.client.post(url).json(operation);
-        if let Some(token) = self.bearer_tokens.get(&peer.peer_id) {
-            request = request.bearer_auth(token);
-        }
+        request = self.authorize(peer, request);
         let response = request
             .send()
             .await

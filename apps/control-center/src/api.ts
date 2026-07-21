@@ -59,6 +59,7 @@ export interface PairingCapabilityTemplate {
 export interface CreatePairingRequest {
   spaceId: string;
   expiresInMs: number;
+  endpointHints: string[];
   capability: PairingCapabilityTemplate;
 }
 
@@ -80,6 +81,7 @@ export interface PairingInvitation {
 
 export interface NodeClient {
   readonly baseUrl: string;
+  readonly pairingEndpointHints: readonly string[];
   readStatus(signal?: AbortSignal): Promise<NodeSnapshot>;
   createPairing(request: CreatePairingRequest, signal?: AbortSignal): Promise<PairingInvitation>;
   readPairing(invitationId: string, signal?: AbortSignal): Promise<PairingSession>;
@@ -94,6 +96,7 @@ export interface NodeClient {
 interface NodeConnection {
   baseUrl: string;
   bearerToken?: string;
+  pairingEndpointHints: string[];
 }
 
 type Fetcher = typeof fetch;
@@ -391,7 +394,7 @@ export function createNodeClient(
 ): NodeClient {
   const resolvedBaseUrl = resolveNodeBaseUrl(baseUrl);
   return createResolvingNodeClient(
-    async () => ({ baseUrl: resolvedBaseUrl, bearerToken }),
+    async () => ({ baseUrl: resolvedBaseUrl, bearerToken, pairingEndpointHints: [resolvedBaseUrl] }),
     resolvedBaseUrl,
     fetcher,
     timeoutMs,
@@ -415,6 +418,7 @@ function createResolvingNodeClient(
   timeoutMs: number,
 ): NodeClient {
   let currentBaseUrl = initialBaseUrl;
+  let currentPairingEndpointHints = [initialBaseUrl];
 
   async function execute<T>(
     operation: (connection: NodeConnection, signal: AbortSignal) => Promise<T>,
@@ -431,6 +435,7 @@ function createResolvingNodeClient(
     try {
       const connection = await resolveConnection();
       currentBaseUrl = connection.baseUrl;
+      currentPairingEndpointHints = connection.pairingEndpointHints;
       return await operation(connection, controller.signal);
     } finally {
       window.clearTimeout(timeout);
@@ -441,6 +446,9 @@ function createResolvingNodeClient(
   return {
     get baseUrl() {
       return currentBaseUrl;
+    },
+    get pairingEndpointHints() {
+      return currentPairingEndpointHints;
     },
     readStatus: (signal) =>
       execute(async (connection, requestSignal) => {
@@ -515,16 +523,22 @@ function createResolvingNodeClient(
   };
 }
 
-async function resolveDesktopNodeConnection(): Promise<NodeConnection> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  const value = await invoke<unknown>("node_connection");
+export function decodeDesktopNodeConnection(value: unknown): NodeConnection {
   if (!isObject(value)) {
     throw new Error("The desktop node handoff did not match the expected schema.");
   }
-  const { baseUrl, bearerToken } = value;
+  // Tauri currently respects serde's camelCase names, but accepting the native
+  // snake_case names keeps the handoff compatible with older packaged shells.
+  const baseUrl = value.baseUrl ?? value.base_url;
+  const bearerToken = value.bearerToken ?? value.bearer_token;
+  const pairingEndpointHints =
+    value.pairingEndpointHints ?? value.pairing_endpoint_hints ?? [];
   if (
     typeof baseUrl !== "string" ||
     typeof bearerToken !== "string" ||
+    !Array.isArray(pairingEndpointHints) ||
+    pairingEndpointHints.length > 3 ||
+    !pairingEndpointHints.every((endpoint) => typeof endpoint === "string") ||
     bearerToken.length < 32 ||
     bearerToken.length > 512 ||
     /\s/.test(bearerToken)
@@ -536,5 +550,17 @@ async function resolveDesktopNodeConnection(): Promise<NodeConnection> {
   if (address.protocol !== "http:" || !["127.0.0.1", "[::1]", "::1"].includes(address.hostname)) {
     throw new Error("The desktop supervisor returned a non-loopback node endpoint.");
   }
-  return { baseUrl: resolvedBaseUrl, bearerToken };
+  const resolvedPairingEndpointHints = pairingEndpointHints.map((endpoint) =>
+    resolveNodeBaseUrl(endpoint as string),
+  );
+  return {
+    baseUrl: resolvedBaseUrl,
+    bearerToken,
+    pairingEndpointHints: resolvedPairingEndpointHints,
+  };
+}
+
+async function resolveDesktopNodeConnection(): Promise<NodeConnection> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return decodeDesktopNodeConnection(await invoke<unknown>("node_connection"));
 }

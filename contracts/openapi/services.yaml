@@ -126,6 +126,9 @@ paths:
       tags:
         - Content
       summary: Create an empty tus upload resource
+      security:
+        - bootstrapBearer: []
+        - pairedTransport: []
       operationId: createUpload
       parameters:
         - $ref: "#/components/parameters/TusResumableRequest"
@@ -185,6 +188,9 @@ paths:
       tags:
         - Content
       summary: Inspect the durable offset of a tus upload
+      security:
+        - bootstrapBearer: []
+        - pairedTransport: []
       operationId: getUploadOffset
       parameters:
         - $ref: "#/components/parameters/UploadId"
@@ -244,6 +250,9 @@ paths:
       tags:
         - Content
       summary: Append one bounded chunk to a tus upload
+      security:
+        - bootstrapBearer: []
+        - pairedTransport: []
       operationId: appendUploadChunk
       parameters:
         - $ref: "#/components/parameters/UploadId"
@@ -390,6 +399,9 @@ paths:
       tags:
         - Content
       summary: Stream an immutable content-addressed blob
+      security:
+        - bootstrapBearer: []
+        - pairedTransport: []
       operationId: getBlob
       parameters:
         - $ref: "#/components/parameters/BlobContentId"
@@ -460,6 +472,9 @@ paths:
       tags:
         - Content
       summary: Inspect immutable blob metadata without transferring bytes
+      security:
+        - bootstrapBearer: []
+        - pairedTransport: []
       operationId: headBlob
       parameters:
         - $ref: "#/components/parameters/BlobContentId"
@@ -499,6 +514,9 @@ paths:
       tags:
         - Content
       summary: Resolve which content IDs are locally available
+      security:
+        - bootstrapBearer: []
+        - pairedTransport: []
       operationId: getBlobAvailability
       requestBody:
         required: true
@@ -745,6 +763,13 @@ components:
       description: >-
         Optional per-launch credential used when the desktop supervisor starts
         a private node sidecar. Standalone loopback nodes may omit it.
+    pairedTransport:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >-
+        Pairing-scoped `Fractonica-Peer` credential for capability-authorized
+        content availability, upload, and download on a trusted private LAN.
   responses:
     BootstrapUnauthorized:
       description: The supervised node requires its per-launch bearer token.

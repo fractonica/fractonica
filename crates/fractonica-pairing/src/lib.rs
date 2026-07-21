@@ -508,7 +508,7 @@ impl JoinerClaim {
 }
 
 /// Responder identity proof bound to the completed Noise transcript.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PairingReceipt {
     pub invitation_id: InvitationId,
     pub descriptor_digest: [u8; DIGEST_BYTES],
@@ -516,7 +516,24 @@ pub struct PairingReceipt {
     pub handshake_hash: [u8; DIGEST_BYTES],
     pub responder_node_id: NodeId,
     pub joiner_node_id: NodeId,
+    peer_access_token: [u8; 32],
     signature: DetachedSignature,
+}
+
+impl std::fmt::Debug for PairingReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairingReceipt")
+            .field("invitation_id", &self.invitation_id)
+            .field("descriptor_digest", &self.descriptor_digest)
+            .field("claim_digest", &self.claim_digest)
+            .field("handshake_hash", &self.handshake_hash)
+            .field("responder_node_id", &self.responder_node_id)
+            .field("joiner_node_id", &self.joiner_node_id)
+            .field("peer_access_token", &"[REDACTED]")
+            .field("signature", &self.signature)
+            .finish()
+    }
 }
 
 impl PairingReceipt {
@@ -525,6 +542,7 @@ impl PairingReceipt {
         descriptor: &InvitationDescriptor,
         claim: &JoinerClaim,
         handshake_hash: [u8; DIGEST_BYTES],
+        peer_access_token: [u8; 32],
         responder_node_key: &SigningKey,
     ) -> Self {
         let mut receipt = Self {
@@ -534,6 +552,7 @@ impl PairingReceipt {
             handshake_hash,
             responder_node_id: responder_node_key.node_id(),
             joiner_node_id: claim.joiner_node_id,
+            peer_access_token,
             signature: DetachedSignature::from_bytes([0; 64]),
         };
         receipt.signature = responder_node_key.sign_detached(
@@ -543,6 +562,13 @@ impl PairingReceipt {
                 .expect("fixed-size receipt remains canonically encodable"),
         );
         receipt
+    }
+
+    /// Returns the random transport credential delivered only inside the
+    /// encrypted Noise session. Callers must never log or display these bytes.
+    #[must_use]
+    pub const fn peer_access_token(&self) -> &[u8; 32] {
+        &self.peer_access_token
     }
 
     pub fn verify_for(
@@ -584,7 +610,7 @@ impl PairingReceipt {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PairingError> {
         ensure_canonical_bound(bytes)?;
         let mut envelope = exact_map(CanonicalValue::from_canonical_cbor(bytes)?, 2)?;
-        let mut fields = exact_map(take(&mut envelope, 0)?, 7)?;
+        let mut fields = exact_map(take(&mut envelope, 0)?, 8)?;
         require_version(unsigned(take(&mut fields, 0)?)?, PAIRING_PROTOCOL_VERSION)?;
         Ok(Self {
             invitation_id: InvitationId::from_bytes(fixed_bytes(take(&mut fields, 1)?)?),
@@ -593,6 +619,7 @@ impl PairingReceipt {
             handshake_hash: fixed_bytes(take(&mut fields, 4)?)?,
             responder_node_id: NodeId::from_bytes(fixed_bytes(take(&mut fields, 5)?)?),
             joiner_node_id: NodeId::from_bytes(fixed_bytes(take(&mut fields, 6)?)?),
+            peer_access_token: fixed_bytes(take(&mut fields, 7)?)?,
             signature: DetachedSignature::from_bytes(fixed_bytes(take(&mut envelope, 1)?)?),
         })
     }
@@ -624,6 +651,183 @@ impl PairingReceipt {
                 key(6),
                 CanonicalValue::Bytes(self.joiner_node_id.as_bytes().to_vec()),
             ),
+            (
+                key(7),
+                CanonicalValue::Bytes(self.peer_access_token.to_vec()),
+            ),
+        ])
+    }
+}
+
+/// Dual-signed human acceptance of the exact Noise transcript shown on both
+/// devices. Possession of the QR secret can claim an invitation, but cannot
+/// admit its planned capability grant without this second, domain-separated
+/// proof from the joining node and actor keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairingAcceptance {
+    pub invitation_id: InvitationId,
+    pub claim_digest: [u8; DIGEST_BYTES],
+    pub handshake_hash: [u8; DIGEST_BYTES],
+    pub responder_node_id: NodeId,
+    pub space_id: SpaceId,
+    pub joiner_node_id: NodeId,
+    pub subject_actor_id: ActorId,
+    pub grant_operation_id: OperationId,
+    pub nonce: [u8; DIGEST_BYTES],
+    node_signature: DetachedSignature,
+    actor_signature: DetachedSignature,
+}
+
+impl PairingAcceptance {
+    #[must_use]
+    pub fn sign(
+        invitation_id: InvitationId,
+        claim_digest: [u8; DIGEST_BYTES],
+        handshake_hash: [u8; DIGEST_BYTES],
+        responder_node_id: NodeId,
+        space_id: SpaceId,
+        grant_operation_id: OperationId,
+        joiner_node_key: &SigningKey,
+        subject_actor_key: &SigningKey,
+        nonce: [u8; DIGEST_BYTES],
+    ) -> Self {
+        let mut acceptance = Self {
+            invitation_id,
+            claim_digest,
+            handshake_hash,
+            responder_node_id,
+            space_id,
+            joiner_node_id: joiner_node_key.node_id(),
+            subject_actor_id: subject_actor_key.actor_id(),
+            grant_operation_id,
+            nonce,
+            node_signature: DetachedSignature::from_bytes([0; 64]),
+            actor_signature: DetachedSignature::from_bytes([0; 64]),
+        };
+        let unsigned = acceptance
+            .unsigned_bytes()
+            .expect("fixed-size acceptance remains canonically encodable");
+        acceptance.node_signature =
+            joiner_node_key.sign_detached(DetachedSignatureDomain::PairingAcceptanceV1, &unsigned);
+        acceptance.actor_signature = subject_actor_key
+            .sign_detached(DetachedSignatureDomain::PairingAcceptanceV1, &unsigned);
+        acceptance
+    }
+
+    pub fn verify_for(
+        &self,
+        descriptor: &InvitationDescriptor,
+        claim_digest: &[u8; DIGEST_BYTES],
+        handshake_hash: &[u8; DIGEST_BYTES],
+        joiner_node_id: NodeId,
+        subject_actor_id: ActorId,
+        grant_operation_id: OperationId,
+    ) -> Result<(), PairingError> {
+        if self.invitation_id != descriptor.invitation_id
+            || &self.claim_digest != claim_digest
+            || &self.handshake_hash != handshake_hash
+            || self.responder_node_id != descriptor.responder_node_id
+            || self.space_id != descriptor.space_id
+            || self.joiner_node_id != joiner_node_id
+            || self.subject_actor_id != subject_actor_id
+            || self.grant_operation_id != grant_operation_id
+            || self.nonce == [0; DIGEST_BYTES]
+        {
+            return Err(PairingError::AcceptanceMismatch);
+        }
+        let unsigned = self.unsigned_bytes()?;
+        self.joiner_node_id.verify_detached(
+            DetachedSignatureDomain::PairingAcceptanceV1,
+            &unsigned,
+            &self.node_signature,
+        )?;
+        self.subject_actor_id.verify_detached(
+            DetachedSignatureDomain::PairingAcceptanceV1,
+            &unsigned,
+            &self.actor_signature,
+        )?;
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PairingError> {
+        let bytes = CanonicalValue::Map(vec![
+            (key(0), self.unsigned_value()),
+            (
+                key(1),
+                CanonicalValue::Bytes(self.node_signature.as_bytes().to_vec()),
+            ),
+            (
+                key(2),
+                CanonicalValue::Bytes(self.actor_signature.as_bytes().to_vec()),
+            ),
+        ])
+        .to_canonical_cbor()?;
+        ensure_canonical_bound(&bytes)?;
+        Ok(bytes)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PairingError> {
+        ensure_canonical_bound(bytes)?;
+        let mut envelope = exact_map(CanonicalValue::from_canonical_cbor(bytes)?, 3)?;
+        let mut fields = exact_map(take(&mut envelope, 0)?, 10)?;
+        require_version(unsigned(take(&mut fields, 0)?)?, PAIRING_PROTOCOL_VERSION)?;
+        let acceptance = Self {
+            invitation_id: InvitationId::from_bytes(fixed_bytes(take(&mut fields, 1)?)?),
+            claim_digest: fixed_bytes(take(&mut fields, 2)?)?,
+            handshake_hash: fixed_bytes(take(&mut fields, 3)?)?,
+            responder_node_id: NodeId::from_bytes(fixed_bytes(take(&mut fields, 4)?)?),
+            space_id: SpaceId::from_bytes(fixed_bytes(take(&mut fields, 5)?)?),
+            joiner_node_id: NodeId::from_bytes(fixed_bytes(take(&mut fields, 6)?)?),
+            subject_actor_id: ActorId::from_bytes(fixed_bytes(take(&mut fields, 7)?)?),
+            grant_operation_id: OperationId::from_bytes(fixed_bytes(take(&mut fields, 8)?)?),
+            nonce: fixed_bytes(take(&mut fields, 9)?)?,
+            node_signature: DetachedSignature::from_bytes(fixed_bytes(take(&mut envelope, 1)?)?),
+            actor_signature: DetachedSignature::from_bytes(fixed_bytes(take(&mut envelope, 2)?)?),
+        };
+        acceptance.joiner_node_id.public_key()?;
+        acceptance.subject_actor_id.public_key()?;
+        if acceptance.nonce == [0; DIGEST_BYTES] {
+            return Err(PairingError::InvalidField("acceptance nonce"));
+        }
+        Ok(acceptance)
+    }
+
+    fn unsigned_bytes(&self) -> Result<Vec<u8>, PairingError> {
+        let bytes = self.unsigned_value().to_canonical_cbor()?;
+        ensure_canonical_bound(&bytes)?;
+        Ok(bytes)
+    }
+
+    fn unsigned_value(&self) -> CanonicalValue {
+        CanonicalValue::Map(vec![
+            (key(0), CanonicalValue::Unsigned(PAIRING_PROTOCOL_VERSION)),
+            (
+                key(1),
+                CanonicalValue::Bytes(self.invitation_id.as_bytes().to_vec()),
+            ),
+            (key(2), CanonicalValue::Bytes(self.claim_digest.to_vec())),
+            (key(3), CanonicalValue::Bytes(self.handshake_hash.to_vec())),
+            (
+                key(4),
+                CanonicalValue::Bytes(self.responder_node_id.as_bytes().to_vec()),
+            ),
+            (
+                key(5),
+                CanonicalValue::Bytes(self.space_id.as_bytes().to_vec()),
+            ),
+            (
+                key(6),
+                CanonicalValue::Bytes(self.joiner_node_id.as_bytes().to_vec()),
+            ),
+            (
+                key(7),
+                CanonicalValue::Bytes(self.subject_actor_id.as_bytes().to_vec()),
+            ),
+            (
+                key(8),
+                CanonicalValue::Bytes(self.grant_operation_id.as_bytes().to_vec()),
+            ),
+            (key(9), CanonicalValue::Bytes(self.nonce.to_vec())),
         ])
     }
 }
@@ -1258,6 +1462,8 @@ pub enum PairingError {
     ClaimInvitationMismatch,
     #[error("pairing receipt does not match the authenticated transcript")]
     ReceiptTranscriptMismatch,
+    #[error("pairing acceptance does not match the claimed transcript")]
+    AcceptanceMismatch,
     #[error("protected pairing secret is corrupt or unsupported")]
     InvalidProtectedSecret,
     #[error("Noise handshake is not complete")]
@@ -1429,6 +1635,7 @@ mod tests {
             issued.invitation.descriptor(),
             &claim,
             *responder.handshake_hash(),
+            [17; 32],
             &responder_key,
         );
         let receipt_frame = responder
@@ -1440,6 +1647,7 @@ mod tests {
                 .expect("decrypt receipt"),
         )
         .expect("decode receipt");
+        assert_eq!(decoded_receipt.peer_access_token(), &[17; 32]);
         decoded_receipt
             .verify_for(
                 issued.invitation.descriptor(),

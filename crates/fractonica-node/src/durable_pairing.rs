@@ -4,19 +4,22 @@ use std::collections::BTreeSet;
 
 use fractonica_api::{
     PairingControl, PairingControlError, PairingCreateCommand, PairingHandshakeResult,
-    PairingInvitationCreated, PairingSessionView, PairingState,
+    PairingInvitationCreated, PairingSessionView, PairingState, PeerTransportAction,
+    PeerTransportPrincipal,
 };
 use fractonica_application::{OperationRepository, SubmitOperationRequest};
 use fractonica_data_model::{
-    EntityId, EntitySchema, OperationBody, OperationEnvelope, OperationId, OperationNonce,
+    CapabilityAction, EntityId, EntitySchema, OperationBody, OperationEnvelope, OperationId,
+    OperationNonce,
 };
 use fractonica_keystore::IdentityBundle;
 use fractonica_keystore::{FilePairingSecretVault, PairingSecretVaultError};
 use fractonica_pairing::{
-    InvitationId, InvitationParameters, IssuedInvitation, JoinerClaim, PairingInvitation,
-    PairingReceipt, confirmation_octal,
+    InvitationId, InvitationParameters, IssuedInvitation, JoinerClaim, PairingAcceptance,
+    PairingInvitation, PairingReceipt, confirmation_octal,
 };
 use fractonica_store_sqlite::{PairingLifecycle, PairingSession, PairingStoreError, SqliteStore};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
@@ -185,7 +188,17 @@ impl NodePairingControl {
             joiner_node_id: session.joiner_node_id,
             subject_actor_id: session.subject_actor_id,
             confirmation_octal: session.handshake_hash.as_ref().map(confirmation_octal),
-            grant_operation_id: session.grant_operation_id,
+            // The joiner needs the immutable grant id to construct its first
+            // paired read proof. It is safe to reveal the id while the grant
+            // is only planned: authorization still fails closed until the
+            // operator confirms the matching Noise transcript and the node
+            // admits the signed grant operation.
+            grant_operation_id: session.grant_operation_id.or_else(|| {
+                session
+                    .planned_grant
+                    .as_ref()
+                    .map(|operation| operation.operation_id)
+            }),
         }
     }
 
@@ -264,9 +277,10 @@ impl PairingControl for NodePairingControl {
         if request.space_id != self.identity.space_id()
             || request.expires_in_ms < fractonica_pairing::MIN_INVITATION_LIFETIME_MS
             || request.expires_in_ms > fractonica_pairing::MAX_INVITATION_LIFETIME_MS
-            || request.endpoint_hints.iter().any(|hint| {
-                !(hint.starts_with("http://127.0.0.1:") || hint.starts_with("http://localhost:"))
-            })
+            || request
+                .endpoint_hints
+                .iter()
+                .any(|hint| !is_safe_pairing_endpoint(hint))
         {
             return Err(PairingControlError::Invalid(
                 "invalid invitation scope".into(),
@@ -338,15 +352,26 @@ impl PairingControl for NodePairingControl {
             .finish()
             .map_err(|_| PairingControlError::Unavailable)?;
         let hash = *transport.handshake_hash();
+        let mut peer_access_token = [0_u8; 32];
+        getrandom::fill(&mut peer_access_token).map_err(|_| PairingControlError::Storage)?;
+        let peer_token_digest: [u8; 32] = Sha256::digest(peer_access_token).into();
         let claimed = self
             .durable
             .database()
-            .claim_pairing_session(&session.descriptor, &claim, hash, now)
+            .claim_pairing_session(&session.descriptor, &claim, hash, peer_token_digest, now)
             .map_err(store_error)?;
+        let _planned_grant = self.planned_or_new_grant(&claimed, now)?;
+        let claimed = self
+            .durable
+            .database()
+            .pairing_session(id)
+            .map_err(store_error)?
+            .ok_or(PairingControlError::Storage)?;
         let receipt = PairingReceipt::sign(
             &session.descriptor,
             &claim,
             hash,
+            peer_access_token,
             self.identity.node_transport_key(),
         );
         let receipt_frame = transport
@@ -414,6 +439,57 @@ impl PairingControl for NodePairingControl {
             .map_err(durable_error)
     }
 
+    fn accept(
+        &self,
+        id: InvitationId,
+        acceptance: &[u8],
+        now: i64,
+    ) -> Result<PairingSessionView, PairingControlError> {
+        let session = self
+            .durable
+            .database()
+            .pairing_session(id)
+            .map_err(store_error)?
+            .ok_or(PairingControlError::NotFound)?;
+        if now < 0 || now >= session.descriptor.expires_at_unix_ms {
+            return Err(PairingControlError::Unavailable);
+        }
+        let claim_digest = session
+            .claim_digest
+            .ok_or(PairingControlError::Unavailable)?;
+        let handshake_hash = session
+            .handshake_hash
+            .ok_or(PairingControlError::Unavailable)?;
+        let joiner_node_id = session
+            .joiner_node_id
+            .ok_or(PairingControlError::Unavailable)?;
+        let subject_actor_id = session
+            .subject_actor_id
+            .ok_or(PairingControlError::Unavailable)?;
+        let grant_operation_id = session
+            .grant_operation_id
+            .or_else(|| {
+                session
+                    .planned_grant
+                    .as_ref()
+                    .map(|operation| operation.operation_id)
+            })
+            .ok_or(PairingControlError::Unavailable)?;
+        let acceptance = PairingAcceptance::from_canonical_bytes(acceptance)
+            .map_err(|_| PairingControlError::Unavailable)?;
+        acceptance
+            .verify_for(
+                &session.descriptor,
+                &claim_digest,
+                &handshake_hash,
+                joiner_node_id,
+                subject_actor_id,
+                grant_operation_id,
+            )
+            .map_err(|_| PairingControlError::Unavailable)?;
+        self.confirm(id, &confirmation_octal(&handshake_hash), now)
+    }
+
     fn cancel(
         &self,
         id: InvitationId,
@@ -423,6 +499,83 @@ impl PairingControl for NodePairingControl {
             .cancel(id, now)
             .map(Self::view)
             .map_err(durable_error)
+    }
+
+    fn authenticate_peer_transport(
+        &self,
+        id: InvitationId,
+        token: [u8; 32],
+        action: PeerTransportAction,
+        now: i64,
+    ) -> Result<PeerTransportPrincipal, PairingControlError> {
+        let session = self
+            .durable
+            .database()
+            .pairing_session(id)
+            .map_err(store_error)?
+            .ok_or(PairingControlError::Unavailable)?;
+        if session.state != PairingLifecycle::Completed {
+            return Err(PairingControlError::Unavailable);
+        }
+        let supplied: [u8; 32] = Sha256::digest(token).into();
+        let expected = session
+            .peer_token_digest
+            .ok_or(PairingControlError::Unavailable)?;
+        if !bool::from(supplied.ct_eq(&expected)) {
+            return Err(PairingControlError::Unavailable);
+        }
+        let actor_id = session
+            .subject_actor_id
+            .ok_or(PairingControlError::Unavailable)?;
+        let grant_operation_id = session
+            .grant_operation_id
+            .ok_or(PairingControlError::Unavailable)?;
+        let capability_action = match action {
+            PeerTransportAction::AppendOperation => CapabilityAction::AppendOperation,
+            PeerTransportAction::ReadContent => CapabilityAction::ReadSpace,
+            PeerTransportAction::WriteContent => CapabilityAction::WriteContent,
+        };
+        self.durable
+            .database()
+            .authorize_stored_capability_action(
+                session.descriptor.space_id,
+                actor_id,
+                grant_operation_id,
+                capability_action,
+                now,
+            )
+            .map_err(|_| PairingControlError::Unavailable)?;
+        Ok(PeerTransportPrincipal {
+            invitation_id: id,
+            space_id: session.descriptor.space_id,
+            actor_id,
+            grant_operation_id,
+        })
+    }
+}
+
+fn is_safe_pairing_endpoint(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        Some(url::Host::Ipv6(address)) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+        None => false,
     }
 }
 
@@ -457,12 +610,12 @@ fn durable_error(error: DurablePairingError) -> PairingControlError {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use fractonica_api::{PairingControl, PairingCreateCommand};
+    use fractonica_api::{PairingControl, PairingCreateCommand, PeerTransportAction};
     use fractonica_application::OperationRepository;
     use fractonica_data_model::{CapabilityAction, SigningKey, SpaceId};
     use fractonica_keystore::IdentityBundle;
     use fractonica_pairing::{
-        CapabilityGrantTemplate, JoinerClaim, PairingInvitation, PairingReceipt,
+        CapabilityGrantTemplate, JoinerClaim, PairingAcceptance, PairingInvitation, PairingReceipt,
     };
     use tempfile::tempdir;
 
@@ -484,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn full_noise_ceremony_claims_once_and_requires_exact_confirmation() {
+    fn full_noise_ceremony_claims_once_and_requires_dual_signed_acceptance() {
         let root = tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let store = SqliteStore::open(root.path().join("node.sqlite3")).unwrap();
@@ -532,6 +685,19 @@ mod tests {
         let result = control
             .handshake(created.session.invitation_id, &first, NOW + 1)
             .unwrap();
+        let planned_grant_id = result
+            .session
+            .grant_operation_id
+            .expect("handshake exposes the immutable planned grant id");
+        assert!(
+            control
+                .durable
+                .database()
+                .operation(identity.space_id(), planned_grant_id)
+                .unwrap()
+                .is_none(),
+            "a planned grant must not authorize reads before confirmation"
+        );
         assert_eq!(initiator.read_message(&result.response_frame).unwrap(), b"");
         let mut transport = initiator.finish().unwrap();
         let receipt = PairingReceipt::from_canonical_bytes(
@@ -549,15 +715,25 @@ mod tests {
             control.confirm(created.session.invitation_id, "0000000000", NOW + 2),
             Err(PairingControlError::ConfirmationMismatch)
         ));
+        let acceptance = PairingAcceptance::sign(
+            created.session.invitation_id,
+            claim.digest(),
+            *transport.handshake_hash(),
+            identity.node_id(),
+            identity.space_id(),
+            planned_grant_id,
+            &node_key,
+            &actor_key,
+            [8; 32],
+        )
+        .canonical_bytes()
+        .unwrap();
         let confirmed = control
-            .confirm(
-                created.session.invitation_id,
-                transport.confirmation_octal(),
-                NOW + 2,
-            )
+            .accept(created.session.invitation_id, &acceptance, NOW + 2)
             .unwrap();
         assert_eq!(confirmed.state, PairingState::Completed);
         let grant_id = confirmed.grant_operation_id.expect("durable grant binding");
+        assert_eq!(grant_id, planned_grant_id);
         let admitted = control
             .durable
             .database()
@@ -569,14 +745,38 @@ mod tests {
         };
         assert_eq!(grant.subject, actor_key.actor_id());
         let replayed = control
-            .confirm(
-                created.session.invitation_id,
-                transport.confirmation_octal(),
-                NOW + 3,
-            )
+            .accept(created.session.invitation_id, &acceptance, NOW + 3)
             .unwrap();
         assert_eq!(replayed.state, PairingState::Completed);
         assert_eq!(replayed.grant_operation_id, Some(grant_id));
+        let principal = control
+            .authenticate_peer_transport(
+                created.session.invitation_id,
+                *receipt.peer_access_token(),
+                PeerTransportAction::ReadContent,
+                NOW + 3,
+            )
+            .expect("Noise-delivered credential authorizes the admitted read grant");
+        assert_eq!(principal.space_id, identity.space_id());
+        assert_eq!(principal.actor_id, actor_key.actor_id());
+        assert!(matches!(
+            control.authenticate_peer_transport(
+                created.session.invitation_id,
+                [99; 32],
+                PeerTransportAction::ReadContent,
+                NOW + 3,
+            ),
+            Err(PairingControlError::Unavailable)
+        ));
+        assert!(matches!(
+            control.authenticate_peer_transport(
+                created.session.invitation_id,
+                *receipt.peer_access_token(),
+                PeerTransportAction::AppendOperation,
+                NOW + 3,
+            ),
+            Err(PairingControlError::Unavailable)
+        ));
         assert!(
             control
                 .durable

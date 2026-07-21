@@ -20,6 +20,9 @@ pub enum NodeStartupError {
     #[error("refusing to expose the unauthenticated bootstrap API on non-loopback address {0}")]
     NonLoopbackBind(SocketAddr),
 
+    #[error("private-LAN binding requires both --allow-private-lan and a bootstrap bearer token")]
+    PrivateLanRequiresAuthentication,
+
     #[error("could not determine a platform data directory")]
     MissingDataDirectory,
 
@@ -39,6 +42,20 @@ pub fn validate_bind(address: SocketAddr) -> Result<SocketAddr, NodeStartupError
     } else {
         Err(NodeStartupError::NonLoopbackBind(address))
     }
+}
+
+pub fn validate_bind_policy(
+    address: SocketAddr,
+    allow_private_lan: bool,
+    bearer_configured: bool,
+) -> Result<SocketAddr, NodeStartupError> {
+    if address.ip().is_loopback() {
+        return Ok(address);
+    }
+    if allow_private_lan && bearer_configured && address.ip().is_unspecified() {
+        return Ok(address);
+    }
+    Err(NodeStartupError::PrivateLanRequiresAuthentication)
 }
 
 pub fn default_data_dir() -> Result<PathBuf, NodeStartupError> {
@@ -80,7 +97,19 @@ impl NodeReadyFile {
             options.mode(0o600);
         }
         let mut file = options.open(path)?;
-        writeln!(file, "http://{address}")?;
+        let control_address = if address.ip().is_unspecified() {
+            SocketAddr::new(
+                if address.is_ipv4() {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                } else {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                },
+                address.port(),
+            )
+        } else {
+            address
+        };
+        writeln!(file, "http://{control_address}")?;
         file.sync_all()?;
 
         #[cfg(unix)]
@@ -243,6 +272,23 @@ mod tests {
             validate_bind(address),
             Err(NodeStartupError::NonLoopbackBind(_))
         ));
+    }
+
+    #[test]
+    fn private_lan_binding_requires_both_explicit_opt_in_and_authentication() {
+        let address = "0.0.0.0:8789".parse().expect("address");
+        assert!(matches!(
+            validate_bind_policy(address, false, true),
+            Err(NodeStartupError::PrivateLanRequiresAuthentication)
+        ));
+        assert!(matches!(
+            validate_bind_policy(address, true, false),
+            Err(NodeStartupError::PrivateLanRequiresAuthentication)
+        ));
+        assert_eq!(
+            validate_bind_policy(address, true, true).expect("explicit authenticated LAN"),
+            address
+        );
     }
 
     #[test]

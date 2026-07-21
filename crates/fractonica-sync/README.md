@@ -30,9 +30,12 @@ grant, and a fresh dual-signed proof. `PeerProofCustody` keeps detached proof
 signing behind a native boundary; the included software adapter is intended
 for tests and protected headless agents.
 
-The current paired-read endpoint remains loopback-only and does not provide
-transport confidentiality. This worker does not change that boundary. LAN and
-internet use still requires the planned encrypted session transport.
+Paired operation/content requests use the credential delivered inside the
+Noise receipt. The node rechecks the completed session and current capability
+on every request; administrator bearer material never enters the QR or mobile
+store. The current private-LAN data plane is plain HTTP and does not provide
+traffic confidentiality, so internet or untrusted-network use still requires
+the planned encrypted persistent session transport.
 
 The worker automatically discovers immutable resources referenced by committed
 operations. Locally authored resources wait until their digest and length are

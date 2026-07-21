@@ -11,11 +11,13 @@ SQLite migration 0005 stores only non-secret lifecycle indexes. Short-lived
 secret material is written atomically to a separate private vault and startup
 reconciliation expires sessions, removes orphan secrets, and fails closed when
 an active row has lost its secret. Loopback HTTP routes now expose bearer-gated
-invitation administration and confirmation plus the cryptographically
-authenticated Noise claim exchange. Successful confirmation now durably plans,
-signs, and admits exactly one capability grant before completing the session;
-the local control center renders the scannable QR and complete two-glyph
-confirmation ceremony.
+invitation administration plus cryptographically authenticated Noise claim and
+acceptance exchanges. A successful claim durably prepares and signs exactly
+one inert capability grant. The joining node must then sign an acceptance with
+both its node and actor keys after the user compares the complete visual code.
+Only that proof admits the prepared operation and completes the session. The
+local control center renders the scannable app-opening QR and both clients
+render the same two-glyph confirmation ceremony.
 
 ## Context
 
@@ -61,11 +63,22 @@ focused cryptographic review.
 
 ## Canonical invitation
 
-The QR text is:
+The canonical invitation text is:
 
 ```text
 fractonica-pairing:v1:<unpadded-base64url canonical-CBOR envelope>
 ```
+
+The desktop QR encodes that invitation as the percent-encoded value of the
+custom app link:
+
+```text
+fractonica://pair?invitation=<canonical invitation text>
+```
+
+The app link is only a navigation envelope. The invitation remains the exact
+canonical value above and the mobile client rejects any malformed payload
+before network access.
 
 The closed envelope contains:
 
@@ -124,9 +137,19 @@ Both user interfaces derive a 30-bit confirmation value from:
 SHA-256("org.fractonica.pairing.confirmation.v1" || handshakeHash)
 ```
 
-and display it as two five-digit MSB-first octal glyphs. Confirmation compares
-the complete ten-digit value; it is a human relay/interception check, not a
-replacement for Noise or signatures.
+and display it as two five-digit MSB-first octal glyphs plus a two-row grid of
+the ten octal digits. Confirmation compares the complete ten-digit value; it
+is a human relay/interception check, not a replacement for Noise or
+signatures.
+
+After the human comparison, the joining client creates a canonical acceptance
+that binds the invitation ID, exact claim digest, Noise handshake hash,
+responder and joining node IDs, requested actor, space, immutable prepared
+grant operation ID, and a fresh nonce. Both the joining node key and actor key
+sign those exact fields under the `pairing-acceptance-v1` detached-signature
+domain. The responder verifies both signatures and every session binding
+before admitting the grant. Replaying the exact valid acceptance is
+idempotent; a changed or unrelated acceptance fails closed.
 
 ## State machine
 
@@ -144,12 +167,18 @@ created ----------------> expired
 - A valid first handshake message atomically changes `created` to `claimed`.
   Exactly one concurrent caller can win. The invitation cannot return to
   `created`, even if the process crashes or the user cancels.
+- The controller deterministically prepares and signs the candidate
+  `capability.grant` while recording that claim, and returns its immutable
+  operation ID to the joiner. The operation is not admitted and conveys no
+  authority in the `claimed` state; this only lets the joiner prepare its
+  first bounded authenticated read before confirmation.
 - Invalid, expired, cancelled, or already-used invitations yield the same
   bounded public rejection and reveal no peer or space state.
-- Explicit local confirmation must match the session, peer fingerprints,
-  effective capability summary, and complete ten-octal-digit code.
-- Only after confirmation may the controller create a separate signed
-  `capability.grant` operation for the joining `ActorId`.
+- The joining app automatically claims a valid deep-linked invitation, shows
+  the complete ten-octal-digit code, and requires an explicit Pair action.
+- Pair creates the dual-signed acceptance. Only after the responder verifies
+  it may the controller admit the already prepared `capability.grant`
+  operation for the joining `ActorId`.
 - Completion persists the paired `NodeId`, actor, space, grant digest, and
   transcript digest. It never persists Noise transport keys as graph
   authority.
@@ -157,10 +186,12 @@ created ----------------> expired
   admitted is recovered by the durable grant/session binding rather than by
   issuing a second grant.
 
-Invitation creation, confirmation, cancellation, and inspection are local
-administrative operations protected by the node bootstrap bearer until a
-stronger local UI session exists. The handshake endpoints authenticate
-themselves with the invitation protocol and must not require that bearer.
+Invitation creation, cancellation, and inspection are local administrative
+operations protected by the node bootstrap bearer until a stronger local UI
+session exists. The claim and acceptance endpoints authenticate themselves
+with the pairing protocol and must not require that bearer. The older local
+administrative confirmation route remains available for diagnostics but is
+not the user-facing completion path.
 
 ## Bounds and failure behavior
 
@@ -179,9 +210,13 @@ themselves with the invitation protocol and must not require that bearer.
 
 ## Network gate
 
-This ADR does not enable a public listener. Pairing routes are first developed
-and adversarially tested on loopback. Non-loopback binding remains rejected
-until all of the following exist:
+This ADR does not enable a public listener. The desktop may opt into an
+authenticated unspecified-address listener solely to advertise a
+private/link-local pairing endpoint. The control URL remains loopback. The
+Noise receipt carries a random pairing-scoped transport credential, of which
+the node stores only a digest; each operation/content request re-evaluates the
+completed pairing grant. Public binding remains rejected. A confidential
+persistent peer transport still requires:
 
 1. durable single-use invitation and session recovery;
 2. confirmation UI accessibility and shoulder-surfing review;
@@ -191,6 +226,11 @@ until all of the following exist:
    tests;
 6. second-implementation Noise interoperability fixtures; and
 7. a reviewed LAN exposure and discovery threat model.
+
+The current plain-HTTP data plane is therefore a trusted-private-network test
+milestone. A passive observer on that network can observe payloads and the
+pairing-scoped authorization header; it must not be used on public or untrusted
+networks.
 
 ## Consequences
 

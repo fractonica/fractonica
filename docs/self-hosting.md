@@ -240,17 +240,22 @@ or trust-anchor replacement.
 ## Desktop application behavior
 
 The desktop application is a local supervisor, not a second server type. It
-starts the same `fractonica-node` executable as a sidecar, assigns it a random
-loopback port, and gives its bundled control center a fresh per-launch bearer
-token through Tauri's local invoke boundary. The token is not placed in a URL
-or command-line argument. When the desktop app exits, it terminates the child
-node and removes the private readiness handoff file.
+starts the same `fractonica-node` executable as a sidecar on an
+operating-system-assigned port. Tauri receives a loopback control URL and a
+fresh per-launch bearer token through its private invoke boundary; pairing QR
+codes advertise a private-LAN URL for the same listener. The administrator
+token is not placed in the QR, URL, or command-line arguments. When the desktop
+app exits, it terminates the child node and removes the readiness handoff file.
 
 Run a development desktop instance from the repository root:
 
 ```sh
 pnpm desktop:dev
 ```
+
+This command builds and starts the node automatically. Keep its terminal open
+and do not start a second node against the desktop profile. The node watches
+the desktop parent PID and shuts down if its supervisor disappears.
 
 Build a local bundle with:
 
@@ -275,7 +280,7 @@ pnpm dev
 It defaults to `http://127.0.0.1:8789`. To point the development UI at another
 local node, set `VITE_FRACTONICA_NODE_URL` to that node's loopback URL before
 starting Vite. The control center reads readiness and node metadata and can
-administer the loopback pairing ceremony; it is not a general record-management
+administer the pairing ceremony; it is not a general record-management
 UI yet.
 
 ## Deliberately deferred deployment boundary
@@ -283,14 +288,12 @@ UI yet.
 The following are not implemented and must not be inferred from the word
 "self-hosted":
 
-- public or non-loopback HTTP binding, TLS, reverse-proxy configuration, or
-  public authentication;
-- non-loopback device pairing, LAN discovery, peer-to-peer transport, or
+- public HTTP binding, TLS, reverse-proxy configuration, or public
+  authentication;
+- automatic LAN discovery, internet peer-to-peer transport, or public
   replication;
-- encrypted/resumable peer sessions and multi-page replication orchestration
-  beyond the bounded, dual-signed `readSpace` change-page primitive;
-- space-capability enforcement for content upload, availability, metadata,
-  and blob reads;
+- a confidential persistent peer channel beyond the bounded Noise bootstrap,
+  paired change-page proof, and grant-scoped private-LAN credential;
 - user accounts, remote API keys, higher-level event/tag CRUD facades, or
   public feed distribution;
 - a supported Linux service unit, container image, VPS deployment workflow, or
@@ -300,8 +303,8 @@ The [trust-kernel threat model](threat-model.md) and Phase 3 security ADRs fix
 the signed-operation, capability, key-lifecycle, and QR-bootstrap boundaries.
 The node now implements local trusted-space bootstrap, grant/revocation
 admission, signed operation storage, the bounded Noise pairing handshake,
-explicit local confirmation, and replay-safe paired reads; that does not
-implement or authorize a network service. Before any deferred capability is enabled, Fractonica still
+explicit local confirmation, replay-safe paired reads, and private-LAN
+record/media synchronization. Before any deferred capability is enabled, Fractonica still
 needs the applicable versioned wire contract, abuse bounds, interoperability
 fixtures, operational runbook, and complete implementation review. The current
-loopback-only restriction remains intentional until those pieces exist.
+listener must not be exposed to a public interface or untrusted network.

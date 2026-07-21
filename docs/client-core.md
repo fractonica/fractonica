@@ -154,8 +154,11 @@ Cancelling is a no-op, equal bytes deduplicate, and removing a draft reference
 does not delete historical content.
 
 Private-record key management/decryption, richer pagination, and paired-device
-lifecycle commands are the next client-facing layers.
+lifecycle management are the next client-facing layers.
 
-The paired peer route is still loopback-only and unauthenticated transport is
-not safe to expose on a LAN. Encrypted session transport remains a subsequent
-phase.
+Pairing accepts explicit private/link-local endpoint hints. The QR secret opens
+a Noise session; its encrypted receipt carries a random transport credential
+whose digest alone is stored by the node. Each use is rechecked against the
+completed pairing and current grant. The current data plane is plain HTTP and
+therefore restricted to a trusted private network; a confidential persistent
+peer channel remains a subsequent hardening phase.

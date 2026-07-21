@@ -20,6 +20,23 @@ From the repository root:
 pnpm desktop:dev
 ```
 
+That single command is the supported development launch path. It builds and
+starts `fractonica-node`; do not run `cargo run -p fractonica-node` against the
+desktop data directory at the same time. Keep the terminal open while testing.
+The child watches the desktop PID and exits if its supervisor disappears, so a
+crashed/hot-reloaded desktop cannot normally retain the node profile lock.
+In development, the desktop also watches the `tauri dev` parent and exits when
+that command stops. A successful pairing-capable launch prints a line like:
+
+```text
+Fractonica node handoff ready at http://127.0.0.1:<port>; pairing endpoints: http://192.168.x.x:<port>
+```
+
+If `pairing endpoints` says `none`, the node itself is still usable locally,
+but the phone cannot reach it. Put both devices on the same private network and
+relaunch. Always stop an existing development command with Control-C before
+starting another one.
+
 The preparation script builds the node and copies it to Tauri's target-specific
 sidecar path. Generated binaries are never committed.
 
@@ -34,9 +51,11 @@ pnpm --filter @fractonica/desktop bundle -- --target x86_64-apple-darwin
 sidecars with `lipo`. The preparation script reads Cargo metadata, so a custom
 `CARGO_TARGET_DIR` is respected.
 
-Every desktop launch starts its child on an operating-system-assigned loopback
-port. The node publishes that endpoint through a private readiness file and
-requires a fresh bearer token handed directly from Tauri to the control center.
+Every desktop launch starts its child on an operating-system-assigned port. Its
+private control URL is published as loopback through a readiness file, while a
+private-LAN URL for the same authenticated listener is placed in pairing
+invitations. The node requires a fresh bearer token handed directly from Tauri
+to the control center.
 The token is never placed in a URL or process argument. This bootstrap channel
 is local process supervision, not the future device-pairing protocol.
 

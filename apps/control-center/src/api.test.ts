@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { createNodeClient, DEFAULT_NODE_URL, resolveNodeBaseUrl } from "./api";
+import {
+  createNodeClient,
+  decodeDesktopNodeConnection,
+  DEFAULT_NODE_URL,
+  resolveNodeBaseUrl,
+} from "./api";
 import type { CreatePairingRequest } from "./api";
 
 function jsonResponse(value: unknown, status = 200): Response {
@@ -52,6 +57,35 @@ const SAROS_NODE_RESPONSE = {
 };
 
 describe("node client", () => {
+  it("decodes current, legacy, and temporarily LAN-less desktop handoffs", () => {
+    const token = "0123456789abcdef0123456789abcdef";
+    expect(decodeDesktopNodeConnection({
+      baseUrl: "http://127.0.0.1:49152",
+      bearerToken: token,
+      pairingEndpointHints: ["http://192.168.1.12:49152"],
+    })).toEqual({
+      baseUrl: "http://127.0.0.1:49152",
+      bearerToken: token,
+      pairingEndpointHints: ["http://192.168.1.12:49152"],
+    });
+    expect(decodeDesktopNodeConnection({
+      base_url: "http://127.0.0.1:49152",
+      bearer_token: token,
+    })).toEqual({
+      baseUrl: "http://127.0.0.1:49152",
+      bearerToken: token,
+      pairingEndpointHints: [],
+    });
+  });
+
+  it("keeps the desktop control handoff loopback-only", () => {
+    expect(() => decodeDesktopNodeConnection({
+      baseUrl: "http://192.168.1.12:49152",
+      bearerToken: "0123456789abcdef0123456789abcdef",
+      pairingEndpointHints: [],
+    })).toThrow("non-loopback");
+  });
+
   it("uses the loopback URL by default", () => {
     expect(resolveNodeBaseUrl("")).toBe(DEFAULT_NODE_URL);
   });
@@ -192,6 +226,7 @@ describe("node client", () => {
     const request: CreatePairingRequest = {
       spaceId,
       expiresInMs: 300_000,
+      endpointHints: ["http://127.0.0.1:8789"],
       capability: {
         actions: ["appendOperation", "readSpace", "writeContent"],
         schemas: ["record", "event", "tag", "profile"],

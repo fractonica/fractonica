@@ -311,11 +311,45 @@ pub trait PairingControl: Send + Sync {
         confirmation_octal: &str,
         now_unix_ms: i64,
     ) -> Result<PairingSessionView, PairingControlError>;
+    fn accept(
+        &self,
+        id: InvitationId,
+        acceptance: &[u8],
+        now_unix_ms: i64,
+    ) -> Result<PairingSessionView, PairingControlError>;
     fn cancel(
         &self,
         id: InvitationId,
         now_unix_ms: i64,
     ) -> Result<PairingSessionView, PairingControlError>;
+
+    /// Authenticates a short pairing-scoped credential for one bounded data
+    /// plane action. Implementations must also verify that the completed
+    /// pairing grant is still active for the requested action.
+    fn authenticate_peer_transport(
+        &self,
+        _id: InvitationId,
+        _token: [u8; 32],
+        _action: PeerTransportAction,
+        _now_unix_ms: i64,
+    ) -> Result<PeerTransportPrincipal, PairingControlError> {
+        Err(PairingControlError::Unavailable)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerTransportAction {
+    AppendOperation,
+    ReadContent,
+    WriteContent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerTransportPrincipal {
+    pub invitation_id: InvitationId,
+    pub space_id: SpaceId,
+    pub actor_id: ActorId,
+    pub grant_operation_id: OperationId,
 }
 
 #[derive(Clone, Debug)]
@@ -439,6 +473,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/pairing/invitations/{invitation_id}/confirm",
             post(confirm_pairing_invitation).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
+        )
+        .route(
+            "/api/pairing/invitations/{invitation_id}/accept",
+            post(accept_pairing_invitation).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
         )
         .route("/api/uploads", post(create_upload))
         .route(
@@ -1108,7 +1146,9 @@ impl IntoResponse for ApiError {
         if self.status == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Bearer realm=\"fractonica-desktop\""),
+                HeaderValue::from_static(
+                    "Bearer realm=\"fractonica-desktop\", Fractonica-Peer realm=\"fractonica-pairing\"",
+                ),
             );
         }
         response
@@ -1117,6 +1157,11 @@ impl IntoResponse for ApiError {
 
 async fn authenticate(State(state): State<ApiState>, request: Request, next: Next) -> Response {
     if request.uri().path() == "/api/pairing/handshake"
+        || (request
+            .uri()
+            .path()
+            .starts_with("/api/pairing/invitations/")
+            && request.uri().path().ends_with("/accept"))
         || request.uri().path().starts_with("/api/peer/")
     {
         return next.run(request).await;
@@ -1138,11 +1183,62 @@ async fn authenticate(State(state): State<ApiState>, request: Request, next: Nex
 
     if valid {
         next.run(request).await
+    } else if let Some(action) = peer_transport_action(request.method(), request.uri().path()) {
+        let credential = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Fractonica-Peer "))
+            .and_then(parse_peer_transport_credential);
+        let authenticated =
+            if let (Some((id, token)), Some(control)) = (credential, state.pairing.clone()) {
+                let now = unix_time_millis().ok();
+                match now {
+                    Some(now) => tokio::task::spawn_blocking(move || {
+                        control.authenticate_peer_transport(id, token, action, now)
+                    })
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some(),
+                    None => false,
+                }
+            } else {
+                false
+            };
+        if authenticated {
+            next.run(request).await
+        } else {
+            ApiError::transport_unauthorized().into_response()
+        }
     } else if uses_api_contract {
         ApiError::transport_unauthorized().into_response()
     } else {
         ApiError::unauthorized().into_response()
     }
+}
+
+fn peer_transport_action(method: &Method, path: &str) -> Option<PeerTransportAction> {
+    if method == Method::POST && path.starts_with("/api/spaces/") && path.ends_with("/operations") {
+        return Some(PeerTransportAction::AppendOperation);
+    }
+    if path == "/api/blobs/availability"
+        || (path.starts_with("/api/blobs/") && matches!(*method, Method::GET | Method::HEAD))
+    {
+        return Some(PeerTransportAction::ReadContent);
+    }
+    if path == "/api/uploads" || path.starts_with("/api/uploads/") {
+        return Some(PeerTransportAction::WriteContent);
+    }
+    None
+}
+
+fn parse_peer_transport_credential(value: &str) -> Option<(InvitationId, [u8; 32])> {
+    let (invitation, encoded_token) = value.split_once('.')?;
+    let invitation = InvitationId::parse_hex(invitation).ok()?;
+    let bytes = URL_SAFE_NO_PAD.decode(encoded_token).ok()?;
+    let token: [u8; 32] = bytes.try_into().ok()?;
+    (token != [0; 32]).then_some((invitation, token))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1166,6 +1262,12 @@ struct PairingHandshakeRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PairingConfirmRequest {
     confirmation_octal: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingAcceptRequest {
+    acceptance_base64url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1306,6 +1408,28 @@ async fn confirm_pairing_invitation(
             .await
             .map_err(|_| ApiError::storage_unavailable())?
             .map_err(pairing_error)?;
+    Ok(Json(session.into()))
+}
+
+async fn accept_pairing_invitation(
+    State(state): State<ApiState>,
+    Path(invitation_id): Path<String>,
+    payload: Result<Json<PairingAcceptRequest>, JsonRejection>,
+) -> Result<Json<PairingSessionResponse>, ApiError> {
+    let id = parse_invitation_id(&invitation_id)?;
+    let Json(request) = payload.map_err(pairing_json_error)?;
+    let acceptance = URL_SAFE_NO_PAD
+        .decode(request.acceptance_base64url)
+        .map_err(|_| pairing_malformed())?;
+    if acceptance.len() > fractonica_pairing::MAX_CANONICAL_MESSAGE_BYTES {
+        return Err(pairing_malformed());
+    }
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let session = tokio::task::spawn_blocking(move || control.accept(id, &acceptance, now))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(pairing_error)?;
     Ok(Json(session.into()))
 }
 
@@ -3546,12 +3670,38 @@ mod tests {
         ) -> Result<PairingSessionView, PairingControlError> {
             Err(PairingControlError::Unavailable)
         }
+        fn accept(
+            &self,
+            _: InvitationId,
+            _: &[u8],
+            _: i64,
+        ) -> Result<PairingSessionView, PairingControlError> {
+            Err(PairingControlError::Unavailable)
+        }
         fn cancel(
             &self,
             _: InvitationId,
             _: i64,
         ) -> Result<PairingSessionView, PairingControlError> {
             Err(PairingControlError::Unavailable)
+        }
+
+        fn authenticate_peer_transport(
+            &self,
+            id: InvitationId,
+            token: [u8; 32],
+            _action: PeerTransportAction,
+            _now_unix_ms: i64,
+        ) -> Result<PeerTransportPrincipal, PairingControlError> {
+            if id != InvitationId::from_bytes([7; 16]) || token != [9; 32] {
+                return Err(PairingControlError::Unavailable);
+            }
+            Ok(PeerTransportPrincipal {
+                invitation_id: id,
+                space_id: fixture_space(),
+                actor_id: SigningKey::from_seed([0x62; 32]).actor_id(),
+                grant_operation_id: OperationId::from_bytes([0x63; 32]),
+            })
         }
     }
 
@@ -3586,6 +3736,27 @@ mod tests {
         )
         .expect("API state")
         .with_blob_store(blob_store);
+        (router(state), temporary)
+    }
+
+    fn paired_content_test_app() -> (Router, TempDir) {
+        let temporary = TempDir::new().expect("temporary content directory");
+        let store = Arc::new(SqliteStore::open_in_memory().expect("database"));
+        let blob_store = Arc::new(
+            BlobStore::open(temporary.path().join("content"), Arc::clone(&store))
+                .expect("blob store"),
+        );
+        let state = ApiState::new(
+            test_application(store),
+            fixture_node_id(),
+            "Test Node",
+            "0.1.0",
+        )
+        .expect("API state")
+        .with_blob_store(blob_store)
+        .with_pairing(Arc::new(UnavailablePairing))
+        .with_bearer_token("0123456789abcdef0123456789abcdef")
+        .expect("bearer token");
         (router(state), temporary)
     }
 
@@ -4081,6 +4252,20 @@ mod tests {
         let problem = json(handshake).await;
         assert_eq!(problem["code"], "pairing_unavailable");
         assert_operation_contract_schema("Problem", &problem);
+
+        let acceptance = authenticated_pairing_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pairing/invitations/04040404040404040404040404040404/accept")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"acceptanceBase64url":"AA"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(acceptance.status(), StatusCode::GONE);
+        assert_eq!(json(acceptance).await["code"], "pairing_unavailable");
 
         let peer = authenticated_pairing_app()
             .oneshot(
@@ -5455,6 +5640,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_transport_credential_opens_only_the_bounded_content_plane() {
+        let (app, _temporary) = paired_content_test_app();
+        let invitation = InvitationId::from_bytes([7; 16]);
+        let credential = format!(
+            "Fractonica-Peer {}.{}",
+            invitation,
+            URL_SAFE_NO_PAD.encode([9; 32])
+        );
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/uploads")
+                    .header("tus-resumable", TUS_VERSION)
+                    .header("upload-length", 0)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/uploads")
+                    .header(header::AUTHORIZATION, credential)
+                    .header("tus-resumable", TUS_VERSION)
+                    .header("upload-length", 0)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let denied_control_plane = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/node")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!(
+                            "Fractonica-Peer {}.{}",
+                            invitation,
+                            URL_SAFE_NO_PAD.encode([9; 32])
+                        ),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(denied_control_plane.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn rejects_bad_upload_checksums_without_advancing_and_content_in_saros() {
         let (app, _temporary) = content_test_app();
         let created = app
@@ -5845,5 +6090,18 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn pairing_transport_credentials_are_strict_and_bounded() {
+        let invitation = InvitationId::from_bytes([7; 16]);
+        let token = [9; 32];
+        let value = format!("{}.{}", invitation, URL_SAFE_NO_PAD.encode(token));
+        assert_eq!(
+            parse_peer_transport_credential(&value),
+            Some((invitation, token))
+        );
+        assert!(parse_peer_transport_credential("not-a-credential").is_none());
+        assert!(parse_peer_transport_credential(&format!("{}.", invitation)).is_none());
     }
 }

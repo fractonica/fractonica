@@ -160,10 +160,11 @@ alone MUST NOT establish trust.
 
 ADR 0011 fixes the authenticated key exchange as bounded
 `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s` messages with a signed transcript
-receipt and complete two-glyph confirmation. The implemented administration
-and handshake endpoints remain loopback-only. They do not authorize a LAN or
-public listener; interoperability and independent transcript/replay review are
-still required before that boundary changes.
+receipt and complete two-glyph confirmation. Desktop pairing now explicitly
+advertises one private/link-local endpoint and the encrypted receipt carries a
+random grant-scoped transport credential. This is a trusted-private-network
+milestone, not authorization for public exposure: the subsequent data plane is
+plain HTTP and does not protect traffic from a local passive observer.
 
 ## Private payloads and observable metadata
 

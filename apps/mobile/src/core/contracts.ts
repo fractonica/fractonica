@@ -97,3 +97,12 @@ export interface CommitResult {
   replayed: boolean;
   queuedPeers: number;
 }
+
+export interface PairingClaim {
+  invitationId: string;
+  responderNodeId: string;
+  spaceId: string;
+  endpoint: string;
+  confirmationOctal: string;
+  grantOperationId: string;
+}

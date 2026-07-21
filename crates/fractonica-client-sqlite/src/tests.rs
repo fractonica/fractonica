@@ -129,6 +129,9 @@ fn local_commit_is_atomic_replayable_and_materialized_before_delivery() {
         peer_id: key(9).node_id(),
         endpoint: "https://node.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     store.upsert_peer(&peer).unwrap();
@@ -229,6 +232,9 @@ fn local_resource_waits_for_verification_then_resumes_durable_upload_progress() 
         peer_id: key(31).node_id(),
         endpoint: "https://media.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     store.upsert_peer(&peer).unwrap();
@@ -324,12 +330,18 @@ fn completed_peer_download_unlocks_fanout_without_duplicate_source_upload() {
         peer_id: key(32).node_id(),
         endpoint: "https://source.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     let destination = PeerConfig {
         peer_id: key(33).node_id(),
         endpoint: "https://destination.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     store.upsert_peer(&source).unwrap();
@@ -454,6 +466,9 @@ fn expired_delivery_lease_recovers_and_stale_worker_cannot_acknowledge() {
         peer_id: key(8).node_id(),
         endpoint: "http://127.0.0.1:8789".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     store.upsert_peer(&peer).unwrap();
@@ -508,6 +523,9 @@ fn retry_backoff_and_terminal_rejection_are_durable() {
         peer_id: key(14).node_id(),
         endpoint: "https://retry.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     store.upsert_peer(&peer).unwrap();
@@ -613,6 +631,9 @@ fn a_peer_added_later_receives_all_history_and_peer_ingest_forwards_elsewhere() 
         peer_id: key(10).node_id(),
         endpoint: "https://later.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 4,
     };
     store.upsert_peer(&peer).unwrap();
@@ -641,6 +662,9 @@ fn a_peer_added_later_receives_all_history_and_peer_ingest_forwards_elsewhere() 
         peer_id: key(12).node_id(),
         endpoint: "https://second.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 5,
     };
     store.upsert_peer(&second).unwrap();
@@ -690,6 +714,9 @@ fn file_store_survives_reopen_with_heads_and_outbox_intact() {
         peer_id: key(11).node_id(),
         endpoint: "https://durable.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 1,
     };
     {
@@ -727,6 +754,9 @@ fn projections_and_heads_rebuild_without_touching_delivery_state() {
         peer_id: key(13).node_id(),
         endpoint: "https://rebuild.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     store.upsert_peer(&peer).unwrap();
@@ -766,6 +796,9 @@ fn peer_space_cursor_and_failure_state_use_compare_and_swap() {
         peer_id: key(15).node_id(),
         endpoint: "https://cursor.example".into(),
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 2,
     };
     store.upsert_peer(&peer).unwrap();
@@ -798,6 +831,49 @@ fn peer_space_cursor_and_failure_state_use_compare_and_swap() {
     assert_eq!(store.due_sync_targets(39, 10).unwrap().len(), 0);
     let failed = store.due_sync_targets(40, 10).unwrap().remove(0);
     assert_eq!(failed.pull_failure_count, 1);
+}
+
+#[test]
+fn paired_read_only_peer_never_queues_local_operations_or_media_uploads() {
+    let (store, signing_key, genesis) = seeded_store();
+    let peer = PeerConfig {
+        peer_id: key(18).node_id(),
+        endpoint: "http://127.0.0.1:8789".into(),
+        enabled: true,
+        push_enabled: false,
+        content_read_enabled: false,
+        peer_transport_credential: None,
+        added_at_unix_ms: 2,
+    };
+    store.upsert_peer(&peer).unwrap();
+    store
+        .configure_peer_space(&PeerSpaceConfig {
+            peer_id: peer.peer_id,
+            space_id: space(),
+            read_mode: PeerReadMode::Paired {
+                session_id: PeerSessionId::from_bytes([18; 16]),
+                grant_operation_id: genesis.operation_id,
+            },
+            start_after: 0,
+            next_pull_at_unix_ms: 2,
+        })
+        .unwrap();
+    let operation = record(
+        &signing_key,
+        entity(18),
+        Vec::new(),
+        genesis.operation_id,
+        18,
+        180,
+        "local only",
+    );
+    let result = store.commit_local(&operation, 3).unwrap();
+    assert_eq!(result.queued_peers, 0);
+    assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 0);
+    assert_eq!(store.sync_counts(3).unwrap().resources.pending_uploads, 0);
+    let targets = store.due_sync_targets(3, 10).unwrap();
+    assert_eq!(targets.len(), 1);
+    assert!(matches!(targets[0].read_mode, PeerReadMode::Paired { .. }));
 }
 
 #[test]

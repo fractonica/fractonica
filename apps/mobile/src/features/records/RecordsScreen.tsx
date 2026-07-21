@@ -16,7 +16,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { OctalGlyph } from "@fractonica/glyph-react-native";
 
-import type { ClientRecordPreview, ClientStatus } from "../../core/contracts";
+import type { ClientRecordPreview, ClientStatus, PairingClaim } from "../../core/contracts";
 import { discoverNativeClient } from "../../core/native-client-discovery";
 import {
   isRecoveryRequiredError,
@@ -291,11 +291,193 @@ function Composer({
   );
 }
 
-export function RecordsScreen() {
+function PairingModal({
+  client,
+  invitation,
+  open,
+  onClose,
+}: {
+  client?: NativeClientPort;
+  invitation?: string;
+  open: boolean;
+  onClose(): void;
+}) {
+  const [qr, setQr] = useState("");
+  const [claim, setClaim] = useState<PairingClaim | null>(null);
+  const [accepted, setAccepted] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [working, setWorking] = useState(false);
+  const autoSubmitted = useRef(false);
+
+  useEffect(() => {
+    if (open) return;
+    setQr("");
+    setClaim(null);
+    setAccepted(false);
+    setError(null);
+    setWorking(false);
+    autoSubmitted.current = false;
+  }, [open]);
+
+  const submit = async (value = qr) => {
+    if (!client || working) return;
+    setWorking(true);
+    setError(null);
+    try {
+      setClaim(await client.claimPairingInvitation(value.trim()));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!open || !client || !invitation || claim || working || autoSubmitted.current) return;
+    autoSubmitted.current = true;
+    setQr(invitation);
+    void submit(invitation);
+  }, [claim, client, invitation, open, working]);
+
+  const accept = async () => {
+    if (!client || !claim || working) return;
+    setWorking(true);
+    setError(null);
+    try {
+      await client.acceptPairingInvitation(claim.invitationId);
+      setAccepted(true);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const digitRows = claim
+    ? [claim.confirmationOctal.slice(0, 5), claim.confirmationOctal.slice(5)]
+    : [];
+
+  return (
+    <Modal animationType="slide" onRequestClose={onClose} presentationStyle="pageSheet" visible={open}>
+      <SafeAreaView edges={["top", "bottom"]} style={styles.pairingSafeArea}>
+        <View style={styles.composerHeader}>
+          <Pressable accessibilityRole="button" disabled={working} hitSlop={12} onPress={onClose}>
+            <Text style={styles.composerCancel}>Close</Text>
+          </Pressable>
+          <Text style={styles.composerTitle}>Pair a node</Text>
+          <View style={styles.composerSpacer} />
+        </View>
+
+        {claim ? (
+          <View style={styles.pairingResult}>
+            <Text style={styles.pairingKicker}>
+              {accepted ? "PAIRING COMPLETE" : "COMPARE WITH THE DESKTOP"}
+            </Text>
+            <Text style={styles.pairingTitle}>
+              {accepted ? "Node paired" : "Do both sequences match?"}
+            </Text>
+            <Text style={styles.pairingText}>
+              {accepted
+                ? "The verified peer is stored on this device and record and media synchronization can continue in the background."
+                : "Check every octal digit and both glyphs. Press Pair only when the desktop shows the same sequence."}
+            </Text>
+            <Pressable
+              accessibilityLabel={`Pair with confirmation ${claim.confirmationOctal}`}
+              accessibilityRole="button"
+              disabled={working || accepted}
+              onPress={() => void accept()}
+              style={({ pressed }) => [
+                styles.confirmationButton,
+                pressed && styles.pressed,
+                (working || accepted) && styles.disabled,
+              ]}
+            >
+              <View style={styles.confirmationGlyphs}>
+                {digitRows.map((digits) => (
+                  <OctalGlyph
+                    background={colors.accentWash}
+                    depth={5}
+                    foreground={colors.accent}
+                    key={digits}
+                    size={92}
+                    value={digits}
+                  />
+                ))}
+              </View>
+              <View accessibilityElementsHidden style={styles.confirmationGrid}>
+                {digitRows.map((digits) => (
+                  <View key={digits} style={styles.confirmationRow}>
+                    {[...digits].map((digit, index) => (
+                      <Text key={`${digit}-${index}`} style={styles.confirmationDigit}>{digit}</Text>
+                    ))}
+                  </View>
+                ))}
+              </View>
+              <Text style={styles.confirmationButtonText}>
+                {working ? "Pairing…" : accepted ? "Paired" : "Pair"}
+              </Text>
+            </Pressable>
+            {error ? <Text accessibilityRole="alert" style={styles.errorText}>{error}</Text> : null}
+            <Text style={styles.pairingFootnote}>{claim.endpoint}</Text>
+          </View>
+        ) : (
+          <View style={styles.pairingBody}>
+            <Text style={styles.pairingKicker}>LOCAL NETWORK PAIRING</Text>
+            <Text style={styles.pairingTitle}>Paste a pairing invitation</Text>
+            <Text style={styles.pairingText}>
+              Create a short-lived invitation in the desktop node, then paste its Fractonica v1 payload here. The protected device keys never enter JavaScript.
+            </Text>
+            <TextInput
+              accessibilityLabel="Pairing invitation"
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!working}
+              multiline
+              onChangeText={setQr}
+              placeholder="fractonica-pairing:v1:…"
+              placeholderTextColor={colors.textMuted}
+              style={styles.pairingInput}
+              value={qr}
+            />
+            {error ? <Text accessibilityRole="alert" style={styles.errorText}>{error}</Text> : null}
+            <Pressable
+              accessibilityRole="button"
+              disabled={!client || working || qr.trim().length === 0}
+              onPress={() => void submit()}
+              style={({ pressed }) => [
+                styles.createButton,
+                styles.pairingButton,
+                pressed && styles.pressed,
+                (!client || working || qr.trim().length === 0) && styles.disabled,
+              ]}
+            >
+              {working ? (
+                <ActivityIndicator color={colors.background} />
+              ) : (
+                <Text style={styles.createButtonText}>Verify and claim</Text>
+              )}
+            </Pressable>
+            <Text style={styles.pairingFootnote}>
+              This phase deliberately accepts only a node exposed on this device’s loopback interface. LAN transport remains disabled until encrypted resumable sessions are implemented.
+            </Text>
+          </View>
+        )}
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
+export interface RecordsScreenProps {
+  pairingInvitation?: string;
+  onClosePairing?: () => void;
+}
+
+export function RecordsScreen({ pairingInvitation, onClosePairing }: RecordsScreenProps = {}) {
   const [core, setCore] = useState<CoreState>({ kind: "booting" });
   const [records, setRecords] = useState<ClientRecordPreview[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
+  const [pairingOpen, setPairingOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const [timelineError, setTimelineError] = useState<string | null>(null);
@@ -367,6 +549,10 @@ export function RecordsScreen() {
       loadGeneration.current += 1;
     };
   }, [boot]);
+
+  useEffect(() => {
+    if (pairingInvitation) setPairingOpen(true);
+  }, [pairingInvitation]);
 
   useEffect(() => {
     if (core.kind !== "starting") return;
@@ -482,9 +668,19 @@ export function RecordsScreen() {
               <Text style={styles.title}>Records</Text>
             </View>
           </View>
-          <View style={[styles.statusPill, coreReady && styles.statusPillReady]}>
-            <View style={[styles.statusDot, coreReady && styles.statusDotReady]} />
-            <Text style={[styles.statusText, coreReady && styles.statusTextReady]}>{statusLabel(core)}</Text>
+          <View style={styles.headerActions}>
+            <Pressable
+              accessibilityRole="button"
+              disabled={!coreReady}
+              onPress={() => setPairingOpen(true)}
+              style={({ pressed }) => [styles.pairButton, pressed && styles.pressed, !coreReady && styles.disabled]}
+            >
+              <Text style={styles.pairButtonText}>Pair</Text>
+            </Pressable>
+            <View style={[styles.statusPill, coreReady && styles.statusPillReady]}>
+              <View style={[styles.statusDot, coreReady && styles.statusDotReady]} />
+              <Text style={[styles.statusText, coreReady && styles.statusTextReady]}>{statusLabel(core)}</Text>
+            </View>
           </View>
         </View>
 
@@ -562,6 +758,15 @@ export function RecordsScreen() {
         </Pressable>
 
         <Composer onClose={() => setComposerOpen(false)} onCreate={create} open={composerOpen} saving={saving} />
+        <PairingModal
+          client={core.kind === "ready" ? core.client : undefined}
+          invitation={pairingInvitation}
+          onClose={() => {
+            setPairingOpen(false);
+            onClosePairing?.();
+          }}
+          open={pairingOpen}
+        />
       </View>
     </SafeAreaView>
   );
@@ -572,6 +777,9 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 22, paddingTop: 14, paddingBottom: 12 },
   brand: { flexDirection: "row", alignItems: "center", gap: 13 },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: 8 },
+  pairButton: { borderColor: colors.border, borderWidth: 1, borderRadius: radius.pill, paddingHorizontal: 12, paddingVertical: 8, backgroundColor: colors.surface },
+  pairButtonText: { color: colors.text, fontSize: 12, fontWeight: "700" },
   eyebrow: { color: colors.accent, fontSize: 11, fontWeight: "700", letterSpacing: 2.5 },
   title: { color: colors.text, fontSize: 36, fontWeight: "700", letterSpacing: -1.4, marginTop: 2 },
   statusPill: { flexDirection: "row", alignItems: "center", gap: 7, borderColor: colors.border, borderWidth: 1, borderRadius: radius.pill, paddingHorizontal: 12, paddingVertical: 8, backgroundColor: colors.surface },
@@ -637,4 +845,19 @@ const styles = StyleSheet.create({
   errorText: { color: colors.danger, fontSize: 13, lineHeight: 19, marginTop: 14 },
   createButton: { alignItems: "center", justifyContent: "center", minHeight: 54, backgroundColor: colors.accent, borderRadius: radius.medium, marginBottom: 8 },
   createButtonText: { color: colors.background, fontSize: 15, fontWeight: "800" },
+  pairingSafeArea: { flex: 1, backgroundColor: colors.background, paddingHorizontal: 20 },
+  pairingBody: { flex: 1, paddingTop: 36 },
+  pairingKicker: { color: colors.accent, fontSize: 10, fontWeight: "800", letterSpacing: 2, textAlign: "center" },
+  pairingTitle: { color: colors.text, fontSize: 26, fontWeight: "700", letterSpacing: -0.6, textAlign: "center", marginTop: 12 },
+  pairingText: { color: colors.textMuted, fontSize: 14, lineHeight: 21, textAlign: "center", marginTop: 10 },
+  pairingInput: { minHeight: 132, color: colors.text, fontSize: 13, lineHeight: 19, backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: radius.large, paddingHorizontal: 15, paddingVertical: 14, marginTop: 28, textAlignVertical: "top" },
+  pairingButton: { marginTop: 18, flex: 0 },
+  pairingFootnote: { color: colors.textMuted, fontSize: 11, lineHeight: 17, textAlign: "center", marginTop: 18 },
+  pairingResult: { flex: 1, alignItems: "center", paddingTop: 32 },
+  confirmationButton: { width: "100%", alignItems: "center", backgroundColor: colors.accentWash, borderColor: colors.borderStrong, borderWidth: 1, borderRadius: radius.large, paddingHorizontal: 18, paddingVertical: 20, marginTop: 24 },
+  confirmationGlyphs: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 18 },
+  confirmationGrid: { gap: 7, marginTop: 14 },
+  confirmationRow: { flexDirection: "row", justifyContent: "center", gap: 7 },
+  confirmationDigit: { width: 31, height: 34, color: colors.text, backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 7, fontSize: 21, fontWeight: "700", lineHeight: 32, textAlign: "center", fontVariant: ["tabular-nums"] },
+  confirmationButtonText: { color: colors.accent, fontSize: 17, fontWeight: "800", marginTop: 17 },
 });

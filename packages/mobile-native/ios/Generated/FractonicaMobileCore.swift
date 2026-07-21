@@ -398,7 +398,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles. 
+// Initial value and increment amount for handles.
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -606,11 +606,11 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  * platform module and is never returned to JavaScript.
  */
 public protocol MobileClientBootstrapProtocol: AnyObject, Sendable {
-    
+
     func `open`(identityMaterial: Data) throws  -> MobileClientCore
-    
+
     func prepare(identityPresent: Bool) throws  -> MobileIdentityAction
-    
+
     /**
      * Deletes this client's app-private database and content only after the
      * native adapter supplies the explicit destructive confirmation token.
@@ -618,8 +618,8 @@ public protocol MobileClientBootstrapProtocol: AnyObject, Sendable {
      * after this method succeeds, so a crash can never silently replace an
      * identity while its old database is still present.
      */
-    func resetLocalInstallation(confirmation: String) throws 
-    
+    func resetLocalInstallation(confirmation: String) throws
+
 }
 /**
  * Prepared standalone bootstrap. The storage path is supplied only by the
@@ -685,9 +685,9 @@ public convenience init(storageDir: String, displayName: String)throws  {
         try! rustCall { uniffi_fractonica_mobile_ffi_fn_free_mobileclientbootstrap(handle, $0) }
     }
 
-    
 
-    
+
+
 open func `open`(identityMaterial: Data)throws  -> MobileClientCore  {
     return try  FfiConverterTypeMobileClientCore_lift(try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
         uniffiCallStatus in
@@ -697,7 +697,7 @@ open func `open`(identityMaterial: Data)throws  -> MobileClientCore  {
     )
 })
 }
-    
+
 open func prepare(identityPresent: Bool)throws  -> MobileIdentityAction  {
     return try  FfiConverterTypeMobileIdentityAction_lift(try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
         uniffiCallStatus in
@@ -707,7 +707,7 @@ open func prepare(identityPresent: Bool)throws  -> MobileIdentityAction  {
     )
 })
 }
-    
+
     /**
      * Deletes this client's app-private database and content only after the
      * native adapter supplies the explicit destructive confirmation token.
@@ -723,9 +723,9 @@ open func resetLocalInstallation(confirmation: String)throws   {try rustCallWith
     )
 }
 }
-    
 
-    
+
+
 }
 
 
@@ -775,9 +775,27 @@ public func FfiConverterTypeMobileClientBootstrap_lower(_ value: MobileClientBoo
 
 
 public protocol MobileClientCoreProtocol: AnyObject, Sendable {
-    
+
+    /**
+     * Admits a claimed pairing only after the user has compared the complete
+     * ten-octal transcript. The acceptance is dual-signed below JavaScript;
+     * after the node returns the completed grant, the peer is persisted as
+     * bidirectional operation/media peer and the background worker discovers
+     * it without exposing transport credentials to JavaScript.
+     */
+    func acceptPairingInvitation(invitationId: String) throws  -> MobilePairingClaim
+
+    /**
+     * Claims a short-lived local-network invitation using the protected device
+     * identity. The raw QR secret is used only for this call and is neither
+     * logged nor persisted. Endpoint hints are restricted to loopback or
+     * private/link-local addresses; the transport credential is returned only
+     * inside the encrypted Noise receipt.
+     */
+    func claimPairingInvitation(qr: String) throws  -> MobilePairingClaim
+
     func createPublicRecord(payloadJson: String) throws  -> MobileCommitResult
-    
+
     /**
      * Reads one exact live record head. Both identifiers are required so a
      * stale or mismatched list item fails closed instead of opening another
@@ -785,13 +803,13 @@ public protocol MobileClientCoreProtocol: AnyObject, Sendable {
      * string across native/JavaScript boundaries.
      */
     func getRecord(operationId: String, entityId: String) throws  -> MobileRecordDetail?
-    
+
     func listRecords(limit: UInt32) throws  -> [MobileRecordPreview]
-    
-    func shutdown() throws 
-    
+
+    func shutdown() throws
+
     func status()  -> MobileClientStatus
-    
+
 }
 open class MobileClientCore: MobileClientCoreProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -843,9 +861,43 @@ open class MobileClientCore: MobileClientCoreProtocol, @unchecked Sendable {
         try! rustCall { uniffi_fractonica_mobile_ffi_fn_free_mobileclientcore(handle, $0) }
     }
 
-    
 
-    
+
+
+    /**
+     * Admits a claimed pairing only after the user has compared the complete
+     * ten-octal transcript. The acceptance is dual-signed below JavaScript;
+     * after the node returns the completed grant, the peer is persisted as
+     * bidirectional operation/media peer and the background worker discovers
+     * it without exposing transport credentials to JavaScript.
+     */
+open func acceptPairingInvitation(invitationId: String)throws  -> MobilePairingClaim  {
+    return try  FfiConverterTypeMobilePairingClaim_lift(try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
+        uniffiCallStatus in
+    uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(invitationId),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Claims a short-lived local-network invitation using the protected device
+     * identity. The raw QR secret is used only for this call and is neither
+     * logged nor persisted. Endpoint hints are restricted to loopback or
+     * private/link-local addresses; the transport credential is returned only
+     * inside the encrypted Noise receipt.
+     */
+open func claimPairingInvitation(qr: String)throws  -> MobilePairingClaim  {
+    return try  FfiConverterTypeMobilePairingClaim_lift(try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
+        uniffiCallStatus in
+    uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_claim_pairing_invitation(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(qr),uniffiCallStatus
+    )
+})
+}
+
 open func createPublicRecord(payloadJson: String)throws  -> MobileCommitResult  {
     return try  FfiConverterTypeMobileCommitResult_lift(try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
         uniffiCallStatus in
@@ -855,7 +907,7 @@ open func createPublicRecord(payloadJson: String)throws  -> MobileCommitResult  
     )
 })
 }
-    
+
     /**
      * Reads one exact live record head. Both identifiers are required so a
      * stale or mismatched list item fails closed instead of opening another
@@ -872,7 +924,7 @@ open func getRecord(operationId: String, entityId: String)throws  -> MobileRecor
     )
 })
 }
-    
+
 open func listRecords(limit: UInt32)throws  -> [MobileRecordPreview]  {
     return try  FfiConverterSequenceTypeMobileRecordPreview.lift(try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
         uniffiCallStatus in
@@ -882,7 +934,7 @@ open func listRecords(limit: UInt32)throws  -> [MobileRecordPreview]  {
     )
 })
 }
-    
+
 open func shutdown()throws   {try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
         uniffiCallStatus in
     uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_shutdown(
@@ -890,7 +942,7 @@ open func shutdown()throws   {try rustCallWithError(FfiConverterTypeMobileClient
     )
 }
 }
-    
+
 open func status() -> MobileClientStatus  {
     return try!  FfiConverterTypeMobileClientStatus_lift(try! rustCall() {
         uniffiCallStatus in
@@ -899,9 +951,9 @@ open func status() -> MobileClientStatus  {
     )
 })
 }
-    
 
-    
+
+
 }
 
 
@@ -961,9 +1013,9 @@ public struct MobileBridgeStatus: Equatable, Hashable {
         self.rustCoreLinked = rustCoreLinked
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -977,8 +1029,8 @@ public struct FfiConverterTypeMobileBridgeStatus: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobileBridgeStatus {
         return
             try MobileBridgeStatus(
-                apiVersion: FfiConverterUInt32.read(from: &buf), 
-                implementation: FfiConverterString.read(from: &buf), 
+                apiVersion: FfiConverterUInt32.read(from: &buf),
+                implementation: FfiConverterString.read(from: &buf),
                 rustCoreLinked: FfiConverterBool.read(from: &buf)
         )
     }
@@ -1043,9 +1095,9 @@ public struct MobileClientStatus: Equatable, Hashable {
         self.lastError = lastError
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1059,20 +1111,20 @@ public struct FfiConverterTypeMobileClientStatus: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobileClientStatus {
         return
             try MobileClientStatus(
-                phase: FfiConverterString.read(from: &buf), 
-                nodeId: FfiConverterOptionString.read(from: &buf), 
-                actorId: FfiConverterOptionString.read(from: &buf), 
-                spaceId: FfiConverterOptionString.read(from: &buf), 
-                syncRunning: FfiConverterBool.read(from: &buf), 
-                cycle: FfiConverterUInt64.read(from: &buf), 
-                pendingOperations: FfiConverterUInt64.read(from: &buf), 
-                rejectedOperations: FfiConverterUInt64.read(from: &buf), 
-                waitingUploads: FfiConverterUInt64.read(from: &buf), 
-                pendingUploads: FfiConverterUInt64.read(from: &buf), 
-                pendingDownloads: FfiConverterUInt64.read(from: &buf), 
-                rejectedResources: FfiConverterUInt64.read(from: &buf), 
-                synchronizedBytes: FfiConverterUInt64.read(from: &buf), 
-                totalBytes: FfiConverterUInt64.read(from: &buf), 
+                phase: FfiConverterString.read(from: &buf),
+                nodeId: FfiConverterOptionString.read(from: &buf),
+                actorId: FfiConverterOptionString.read(from: &buf),
+                spaceId: FfiConverterOptionString.read(from: &buf),
+                syncRunning: FfiConverterBool.read(from: &buf),
+                cycle: FfiConverterUInt64.read(from: &buf),
+                pendingOperations: FfiConverterUInt64.read(from: &buf),
+                rejectedOperations: FfiConverterUInt64.read(from: &buf),
+                waitingUploads: FfiConverterUInt64.read(from: &buf),
+                pendingUploads: FfiConverterUInt64.read(from: &buf),
+                pendingDownloads: FfiConverterUInt64.read(from: &buf),
+                rejectedResources: FfiConverterUInt64.read(from: &buf),
+                synchronizedBytes: FfiConverterUInt64.read(from: &buf),
+                totalBytes: FfiConverterUInt64.read(from: &buf),
                 lastError: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -1127,9 +1179,9 @@ public struct MobileCommitResult: Equatable, Hashable {
         self.queuedPeers = queuedPeers
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1143,9 +1195,9 @@ public struct FfiConverterTypeMobileCommitResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobileCommitResult {
         return
             try MobileCommitResult(
-                localSequence: FfiConverterUInt64.read(from: &buf), 
-                operationId: FfiConverterString.read(from: &buf), 
-                replayed: FfiConverterBool.read(from: &buf), 
+                localSequence: FfiConverterUInt64.read(from: &buf),
+                operationId: FfiConverterString.read(from: &buf),
+                replayed: FfiConverterBool.read(from: &buf),
                 queuedPeers: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -1174,6 +1226,81 @@ public func FfiConverterTypeMobileCommitResult_lower(_ value: MobileCommitResult
 }
 
 
+/**
+ * Verified result of the joiner's Noise handshake. The planned grant id is
+ * not authority by itself: the desktop node must still admit that operation
+ * after the user compares and confirms all ten octal digits.
+ */
+public struct MobilePairingClaim: Equatable, Hashable {
+    public let invitationId: String
+    public let responderNodeId: String
+    public let spaceId: String
+    public let endpoint: String
+    public let confirmationOctal: String
+    public let grantOperationId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(invitationId: String, responderNodeId: String, spaceId: String, endpoint: String, confirmationOctal: String, grantOperationId: String) {
+        self.invitationId = invitationId
+        self.responderNodeId = responderNodeId
+        self.spaceId = spaceId
+        self.endpoint = endpoint
+        self.confirmationOctal = confirmationOctal
+        self.grantOperationId = grantOperationId
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MobilePairingClaim: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMobilePairingClaim: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobilePairingClaim {
+        return
+            try MobilePairingClaim(
+                invitationId: FfiConverterString.read(from: &buf),
+                responderNodeId: FfiConverterString.read(from: &buf),
+                spaceId: FfiConverterString.read(from: &buf),
+                endpoint: FfiConverterString.read(from: &buf),
+                confirmationOctal: FfiConverterString.read(from: &buf),
+                grantOperationId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MobilePairingClaim, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.invitationId, into: &buf)
+        FfiConverterString.write(value.responderNodeId, into: &buf)
+        FfiConverterString.write(value.spaceId, into: &buf)
+        FfiConverterString.write(value.endpoint, into: &buf)
+        FfiConverterString.write(value.confirmationOctal, into: &buf)
+        FfiConverterString.write(value.grantOperationId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMobilePairingClaim_lift(_ buf: RustBuffer) throws -> MobilePairingClaim {
+    return try FfiConverterTypeMobilePairingClaim.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMobilePairingClaim_lower(_ value: MobilePairingClaim) -> RustBuffer {
+    return FfiConverterTypeMobilePairingClaim.lower(value)
+}
+
+
 public struct MobileRecordDetail: Equatable, Hashable {
     public let operationId: String
     public let entityId: String
@@ -1195,7 +1322,7 @@ public struct MobileRecordDetail: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(operationId: String, entityId: String, schema: String, visibility: String, conflicted: Bool, tombstone: Bool, startAtUnixMs: Int64?, endAtUnixMs: Int64?, sortText: String?, resourceCount: UInt64, mediaBytes: UInt64, 
+    public init(operationId: String, entityId: String, schema: String, visibility: String, conflicted: Bool, tombstone: Bool, startAtUnixMs: Int64?, endAtUnixMs: Int64?, sortText: String?, resourceCount: UInt64, mediaBytes: UInt64,
         /**
          * Exact public `RecordDocument` JSON, bounded and kept opaque by native
          * wrappers so metadata integers are never rounded through NSNumber or
@@ -1215,9 +1342,9 @@ public struct MobileRecordDetail: Equatable, Hashable {
         self.documentJson = documentJson
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1231,17 +1358,17 @@ public struct FfiConverterTypeMobileRecordDetail: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobileRecordDetail {
         return
             try MobileRecordDetail(
-                operationId: FfiConverterString.read(from: &buf), 
-                entityId: FfiConverterString.read(from: &buf), 
-                schema: FfiConverterString.read(from: &buf), 
-                visibility: FfiConverterString.read(from: &buf), 
-                conflicted: FfiConverterBool.read(from: &buf), 
-                tombstone: FfiConverterBool.read(from: &buf), 
-                startAtUnixMs: FfiConverterOptionInt64.read(from: &buf), 
-                endAtUnixMs: FfiConverterOptionInt64.read(from: &buf), 
-                sortText: FfiConverterOptionString.read(from: &buf), 
-                resourceCount: FfiConverterUInt64.read(from: &buf), 
-                mediaBytes: FfiConverterUInt64.read(from: &buf), 
+                operationId: FfiConverterString.read(from: &buf),
+                entityId: FfiConverterString.read(from: &buf),
+                schema: FfiConverterString.read(from: &buf),
+                visibility: FfiConverterString.read(from: &buf),
+                conflicted: FfiConverterBool.read(from: &buf),
+                tombstone: FfiConverterBool.read(from: &buf),
+                startAtUnixMs: FfiConverterOptionInt64.read(from: &buf),
+                endAtUnixMs: FfiConverterOptionInt64.read(from: &buf),
+                sortText: FfiConverterOptionString.read(from: &buf),
+                resourceCount: FfiConverterUInt64.read(from: &buf),
+                mediaBytes: FfiConverterUInt64.read(from: &buf),
                 documentJson: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -1300,7 +1427,7 @@ public struct MobileRecordPreview: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(operationId: String, entityId: String, schema: String, visibility: String, conflicted: Bool, tombstone: Bool, startAtUnixMs: Int64?, endAtUnixMs: Int64?, sortText: String?, resourceCount: UInt64, mediaBytes: UInt64, 
+    public init(operationId: String, entityId: String, schema: String, visibility: String, conflicted: Bool, tombstone: Bool, startAtUnixMs: Int64?, endAtUnixMs: Int64?, sortText: String?, resourceCount: UInt64, mediaBytes: UInt64,
         /**
          * Bounded public display fields only. Metadata, references, resource
          * descriptors, and encrypted private content never cross list calls.
@@ -1321,9 +1448,9 @@ public struct MobileRecordPreview: Equatable, Hashable {
         self.previewTruncated = previewTruncated
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1337,19 +1464,19 @@ public struct FfiConverterTypeMobileRecordPreview: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobileRecordPreview {
         return
             try MobileRecordPreview(
-                operationId: FfiConverterString.read(from: &buf), 
-                entityId: FfiConverterString.read(from: &buf), 
-                schema: FfiConverterString.read(from: &buf), 
-                visibility: FfiConverterString.read(from: &buf), 
-                conflicted: FfiConverterBool.read(from: &buf), 
-                tombstone: FfiConverterBool.read(from: &buf), 
-                startAtUnixMs: FfiConverterOptionInt64.read(from: &buf), 
-                endAtUnixMs: FfiConverterOptionInt64.read(from: &buf), 
-                sortText: FfiConverterOptionString.read(from: &buf), 
-                resourceCount: FfiConverterUInt64.read(from: &buf), 
-                mediaBytes: FfiConverterUInt64.read(from: &buf), 
-                emoji: FfiConverterOptionString.read(from: &buf), 
-                textPreview: FfiConverterOptionString.read(from: &buf), 
+                operationId: FfiConverterString.read(from: &buf),
+                entityId: FfiConverterString.read(from: &buf),
+                schema: FfiConverterString.read(from: &buf),
+                visibility: FfiConverterString.read(from: &buf),
+                conflicted: FfiConverterBool.read(from: &buf),
+                tombstone: FfiConverterBool.read(from: &buf),
+                startAtUnixMs: FfiConverterOptionInt64.read(from: &buf),
+                endAtUnixMs: FfiConverterOptionInt64.read(from: &buf),
+                sortText: FfiConverterOptionString.read(from: &buf),
+                resourceCount: FfiConverterUInt64.read(from: &buf),
+                mediaBytes: FfiConverterUInt64.read(from: &buf),
+                emoji: FfiConverterOptionString.read(from: &buf),
+                textPreview: FfiConverterOptionString.read(from: &buf),
                 previewTruncated: FfiConverterBool.read(from: &buf)
         )
     }
@@ -1388,11 +1515,11 @@ public func FfiConverterTypeMobileRecordPreview_lower(_ value: MobileRecordPrevi
 }
 
 
-public 
+public
 enum MobileClientError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-    
-    
+
+
     case InvalidIdentity
     case InvalidConfiguration
     case InvalidRecord
@@ -1401,16 +1528,18 @@ enum MobileClientError: Swift.Error, Equatable, Hashable, Foundation.LocalizedEr
     case InitializationFailed
     case RandomSourceUnavailable
     case OperationFailed
+    case InvalidPairingInvitation
+    case PairingFailed
 
-    
 
-    
 
-    
+
+
+
     public var errorDescription: String? {
         String(reflecting: self)
     }
-    
+
 }
 
 #if compiler(>=6)
@@ -1427,9 +1556,9 @@ public struct FfiConverterTypeMobileClientError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        
 
-        
+
+
         case 1: return .InvalidIdentity
         case 2: return .InvalidConfiguration
         case 3: return .InvalidRecord
@@ -1438,6 +1567,8 @@ public struct FfiConverterTypeMobileClientError: FfiConverterRustBuffer {
         case 6: return .InitializationFailed
         case 7: return .RandomSourceUnavailable
         case 8: return .OperationFailed
+        case 9: return .InvalidPairingInvitation
+        case 10: return .PairingFailed
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1446,41 +1577,49 @@ public struct FfiConverterTypeMobileClientError: FfiConverterRustBuffer {
     public static func write(_ value: MobileClientError, into buf: inout [UInt8]) {
         switch value {
 
-        
 
-        
-        
+
+
+
         case .InvalidIdentity:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .InvalidConfiguration:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .InvalidRecord:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .AlreadyOpened:
             writeInt(&buf, Int32(4))
-        
-        
+
+
         case .RecoveryRequired:
             writeInt(&buf, Int32(5))
-        
-        
+
+
         case .InitializationFailed:
             writeInt(&buf, Int32(6))
-        
-        
+
+
         case .RandomSourceUnavailable:
             writeInt(&buf, Int32(7))
-        
-        
+
+
         case .OperationFailed:
             writeInt(&buf, Int32(8))
-        
+
+
+        case .InvalidPairingInvitation:
+            writeInt(&buf, Int32(9))
+
+
+        case .PairingFailed:
+            writeInt(&buf, Int32(10))
+
         }
     }
 }
@@ -1503,7 +1642,7 @@ public func FfiConverterTypeMobileClientError_lower(_ value: MobileClientError) 
 
 
 public enum MobileIdentityAction: Equatable, Hashable {
-    
+
     case createOrResume
     case openExisting
 
@@ -1526,26 +1665,26 @@ public struct FfiConverterTypeMobileIdentityAction: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobileIdentityAction {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .createOrResume
-        
+
         case 2: return .openExisting
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: MobileIdentityAction, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .createOrResume:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .openExisting:
             writeInt(&buf, Int32(2))
-        
+
         }
     }
 }
@@ -1712,6 +1851,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientbootstrap_reset_local_installation() != 60421) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_accept_pairing_invitation() != 60083) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_claim_pairing_invitation() != 16134) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_create_public_record() != 37884) {

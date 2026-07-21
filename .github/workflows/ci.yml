@@ -150,7 +150,7 @@ jobs:
           packages/mobile-native/android/src/main/java/com/fractonica/mobile/core
 
       - name: Generate Android application
-        run: pnpm --filter @fractonica/mobile run prebuild -- --platform android --no-install
+        run: pnpm --filter @fractonica/mobile exec expo prebuild --platform android --no-install
 
       - name: Assemble Android development application
         working-directory: apps/mobile/android
@@ -212,7 +212,7 @@ jobs:
           packages/mobile-native/android/src/main/java/com/fractonica/mobile/core
 
       - name: Generate iOS application
-        run: pnpm --filter @fractonica/mobile run prebuild -- --platform ios --no-install
+        run: pnpm --filter @fractonica/mobile exec expo prebuild --platform ios --no-install
 
       - name: Install CocoaPods dependencies
         working-directory: apps/mobile/ios

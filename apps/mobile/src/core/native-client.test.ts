@@ -77,6 +77,22 @@ function bridge(overrides: Partial<NativeClientBridge> = {}): NativeClientBridge
       replayed: false,
       queuedPeers: 0,
     })),
+    clientClaimPairingInvitation: vi.fn(async () => ({
+      invitationId: "1".repeat(32),
+      responderNodeId: `node:ed25519:${HASH}`,
+      spaceId: `space:${HASH}`,
+      endpoint: "http://127.0.0.1:8787",
+      confirmationOctal: "0123456701",
+      grantOperationId: `sha-256:${OTHER_HASH}`,
+    })),
+    clientAcceptPairingInvitation: vi.fn(async () => ({
+      invitationId: "1".repeat(32),
+      responderNodeId: `node:ed25519:${HASH}`,
+      spaceId: `space:${HASH}`,
+      endpoint: "http://127.0.0.1:8787",
+      confirmationOctal: "0123456701",
+      grantOperationId: `sha-256:${OTHER_HASH}`,
+    })),
     clientResetLocalInstallation: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -210,6 +226,59 @@ describe("native client port", () => {
     expect(native.clientResetLocalInstallation).toHaveBeenCalledExactlyOnceWith({
       confirmation: "RESET_LOCAL_INSTALLATION",
     });
+  });
+
+  it("validates pairing invitations and the verified native handshake result", async () => {
+    const native = bridge();
+    const client = createNativeClientPort(native);
+    const qr = "fractonica-pairing:v1:abc_DEF-123";
+    await expect(client.claimPairingInvitation(qr)).resolves.toMatchObject({
+      confirmationOctal: "0123456701",
+      endpoint: "http://127.0.0.1:8787",
+    });
+    expect(native.clientClaimPairingInvitation).toHaveBeenCalledExactlyOnceWith({ qr });
+    await expect(client.acceptPairingInvitation("1".repeat(32))).resolves.toMatchObject({
+      confirmationOctal: "0123456701",
+    });
+    expect(native.clientAcceptPairingInvitation).toHaveBeenCalledExactlyOnceWith({
+      invitationId: "1".repeat(32),
+    });
+
+    const lanClient = createNativeClientPort(bridge({
+      clientClaimPairingInvitation: vi.fn(async () => ({
+        invitationId: "1".repeat(32),
+        responderNodeId: `node:ed25519:${HASH}`,
+        spaceId: `space:${HASH}`,
+        endpoint: "http://192.168.0.24:60743",
+        confirmationOctal: "0123456701",
+        grantOperationId: `sha-256:${OTHER_HASH}`,
+      })),
+    }));
+    await expect(lanClient.claimPairingInvitation(qr)).resolves.toMatchObject({
+      endpoint: "http://192.168.0.24:60743",
+    });
+
+    const publicClient = createNativeClientPort(bridge({
+      clientClaimPairingInvitation: vi.fn(async () => ({
+        invitationId: "1".repeat(32),
+        responderNodeId: `node:ed25519:${HASH}`,
+        spaceId: `space:${HASH}`,
+        endpoint: "http://8.8.8.8:60743",
+        confirmationOctal: "0123456701",
+        grantOperationId: `sha-256:${OTHER_HASH}`,
+      })),
+    }));
+    await expect(publicClient.claimPairingInvitation(qr)).rejects.toBeInstanceOf(
+      NativeContractError,
+    );
+
+    await expect(client.claimPairingInvitation("not-a-qr")).rejects.toBeInstanceOf(
+      NativeContractError,
+    );
+    expect(native.clientClaimPairingInvitation).toHaveBeenCalledOnce();
+    await expect(client.acceptPairingInvitation("not-an-id")).rejects.toBeInstanceOf(
+      NativeContractError,
+    );
   });
 
   it("recognizes only the coded recovery error, including a wrapped cause", () => {

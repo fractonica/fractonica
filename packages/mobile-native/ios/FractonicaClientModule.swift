@@ -27,6 +27,14 @@ public final class FractonicaClientModule: Module {
       try self.coordinator.createRecord(options: options)
     }.runOnQueue(clientQueue)
 
+    AsyncFunction("clientClaimPairingInvitation") { (options: [String: Any]) throws -> [String: Any] in
+      try self.coordinator.claimPairingInvitation(options: options)
+    }.runOnQueue(clientQueue)
+
+    AsyncFunction("clientAcceptPairingInvitation") { (options: [String: Any]) throws -> [String: Any] in
+      try self.coordinator.acceptPairingInvitation(options: options)
+    }.runOnQueue(clientQueue)
+
     AsyncFunction("clientResetLocalInstallation") { (options: [String: Any]) throws in
       try self.coordinator.resetLocalInstallation(options: options)
     }.runOnQueue(clientQueue)

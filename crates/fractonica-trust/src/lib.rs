@@ -250,6 +250,7 @@ pub enum DetachedSignatureDomain {
     PairingInvitationV1,
     PairingJoinerClaimV1,
     PairingReceiptV1,
+    PairingAcceptanceV1,
     PeerNodeRequestV1,
     PeerActorRequestV1,
 }
@@ -260,6 +261,7 @@ impl DetachedSignatureDomain {
             Self::PairingInvitationV1 => b"pairing-invitation-v1",
             Self::PairingJoinerClaimV1 => b"pairing-joiner-claim-v1",
             Self::PairingReceiptV1 => b"pairing-receipt-v1",
+            Self::PairingAcceptanceV1 => b"pairing-acceptance-v1",
             Self::PeerNodeRequestV1 => b"peer-node-request-v1",
             Self::PeerActorRequestV1 => b"peer-actor-request-v1",
         }

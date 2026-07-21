@@ -343,10 +343,9 @@ async fn standalone_client_creates_offline_and_survives_force_drop() {
     let runtime = ClientRuntime::bootstrap_standalone(config.clone(), Arc::clone(&identities))
         .await
         .unwrap();
-    assert!(matches!(&runtime.sync, RuntimeSync::Static(_)));
+    assert!(matches!(&runtime.sync, RuntimeSync::Worker { .. }));
     let initial = runtime.status();
-    assert!(!initial.sync.running);
-    assert_eq!(initial.sync.counts.unwrap().enabled_peers, 0);
+    assert_eq!(initial.sync.counts.unwrap_or_default().enabled_peers, 0);
 
     let committed = runtime
         .create_record(standalone_record("offline and durable"))

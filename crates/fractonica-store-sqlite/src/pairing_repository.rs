@@ -47,6 +47,7 @@ pub struct PairingSession {
     pub grant_operation_id: Option<OperationId>,
     pub planned_grant: Option<OperationEnvelope>,
     pub grant_planned_at_unix_ms: Option<i64>,
+    pub peer_token_digest: Option<[u8; 32]>,
 }
 
 impl SqliteStore {
@@ -90,10 +91,11 @@ impl SqliteStore {
         descriptor: &InvitationDescriptor,
         claim: &JoinerClaim,
         handshake_hash: [u8; 32],
+        peer_token_digest: [u8; 32],
         now: i64,
     ) -> Result<PairingSession, PairingStoreError> {
         claim.verify_for(descriptor)?;
-        if now < 0 || handshake_hash == [0; 32] {
+        if now < 0 || handshake_hash == [0; 32] || peer_token_digest == [0; 32] {
             return Err(PairingStoreError::InvalidTime);
         }
         let mut connection = self
@@ -117,6 +119,7 @@ impl SqliteStore {
         let changed = transaction.execute(
             "UPDATE pairing_sessions SET state='claimed', claimed_at_unix_ms=?2,
              claim_digest=?3, handshake_hash=?4, joiner_node_id=?5, subject_actor_id=?6
+             , peer_token_digest=?7
              , claimed_expires_at_unix_ms=min(expires_at_unix_ms, ?2 + 120000)
              WHERE invitation_id=?1 AND state='created'",
             params![
@@ -125,7 +128,8 @@ impl SqliteStore {
                 claim.digest().as_slice(),
                 handshake_hash.as_slice(),
                 claim.joiner_node_id.as_bytes().as_slice(),
-                claim.subject_actor_id.as_bytes().as_slice()
+                claim.subject_actor_id.as_bytes().as_slice(),
+                peer_token_digest.as_slice()
             ],
         )?;
         if changed != 1 {
@@ -213,8 +217,10 @@ impl SqliteStore {
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
         let current = load(&connection, id)?.ok_or(PairingStoreError::NotFound)?;
-        if current.state != PairingLifecycle::Confirmed
-            || current.descriptor.space_id != operation.space_id
+        if !matches!(
+            current.state,
+            PairingLifecycle::Claimed | PairingLifecycle::Confirmed
+        ) || current.descriptor.space_id != operation.space_id
             || current.subject_actor_id != Some(grant.subject)
         {
             return Err(PairingStoreError::InvalidGrantPlan);
@@ -229,7 +235,8 @@ impl SqliteStore {
         if connection.execute(
             "UPDATE pairing_sessions SET planned_grant_operation_id=?2,
              planned_grant_json=?3, grant_planned_at_unix_ms=?4
-             WHERE invitation_id=?1 AND state='confirmed' AND planned_grant_operation_id IS NULL",
+             WHERE invitation_id=?1 AND state IN ('claimed','confirmed')
+               AND planned_grant_operation_id IS NULL",
             params![
                 id.as_bytes().as_slice(),
                 operation.operation_id.to_string(),
@@ -263,7 +270,7 @@ impl SqliteStore {
             "SELECT invitation_id, descriptor_cbor, state, created_at_unix_ms,
              claimed_at_unix_ms, confirmed_at_unix_ms, completed_at_unix_ms, terminal_at_unix_ms,
              claim_digest, handshake_hash, joiner_node_id, subject_actor_id, grant_operation_id,
-             planned_grant_json, grant_planned_at_unix_ms
+             planned_grant_json, grant_planned_at_unix_ms, peer_token_digest
              FROM pairing_sessions WHERE state IN ('created','claimed','confirmed')
              ORDER BY created_at_unix_ms, invitation_id LIMIT 1025",
         )?;
@@ -316,7 +323,7 @@ fn load(
         "SELECT invitation_id, descriptor_cbor, state, created_at_unix_ms,
         claimed_at_unix_ms, confirmed_at_unix_ms, completed_at_unix_ms, terminal_at_unix_ms,
         claim_digest, handshake_hash, joiner_node_id, subject_actor_id, grant_operation_id,
-        planned_grant_json, grant_planned_at_unix_ms
+        planned_grant_json, grant_planned_at_unix_ms, peer_token_digest
         FROM pairing_sessions WHERE invitation_id=?1",
         params![id.as_bytes().as_slice()],
         decode,
@@ -355,6 +362,7 @@ fn decode(row: &Row<'_>) -> Result<PairingSession, rusqlite::Error> {
             .map(|value| serde_json::from_str(&value).map_err(corrupt_sql))
             .transpose()?,
         grant_planned_at_unix_ms: row.get(14)?,
+        peer_token_digest: row.get::<_, Option<Vec<u8>>>(15)?.map(fixed).transpose()?,
     })
 }
 
@@ -490,7 +498,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    store.claim_pairing_session(&descriptor, &claim, [13; 32], NOW + 1)
+                    store.claim_pairing_session(&descriptor, &claim, [13; 32], [14; 32], NOW + 1)
                 })
             })
             .collect();
@@ -532,7 +540,7 @@ mod tests {
         let descriptor = issued.invitation.descriptor().clone();
         store.create_pairing_session(&descriptor, NOW).unwrap();
         store
-            .claim_pairing_session(&descriptor, &claim, [15; 32], NOW + 1)
+            .claim_pairing_session(&descriptor, &claim, [15; 32], [16; 32], NOW + 1)
             .unwrap();
         drop(store);
         let restarted = SqliteStore::open(&path).unwrap();
@@ -554,7 +562,7 @@ mod tests {
             PairingLifecycle::Expired
         );
         assert!(matches!(
-            restarted.claim_pairing_session(&descriptor, &claim, [15; 32], NOW + 60_001),
+            restarted.claim_pairing_session(&descriptor, &claim, [15; 32], [16; 32], NOW + 60_001,),
             Err(PairingStoreError::Unavailable)
         ));
     }

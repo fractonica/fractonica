@@ -717,6 +717,12 @@ main {
   gap: 1rem;
 }
 
+.confirmation-sequence {
+  display: grid;
+  gap: 1rem;
+  max-width: 34rem;
+}
+
 .confirmation-glyph {
   display: grid;
   min-height: 14rem;
@@ -735,10 +741,29 @@ main {
   filter: drop-shadow(0 0 1.4rem rgba(140, 232, 207, 0.16));
 }
 
-.confirmation-glyph code {
+.confirmation-digit-grid {
+  display: grid;
+  gap: 0.55rem;
+  justify-content: center;
+}
+
+.confirmation-digit-row {
+  display: grid;
+  grid-template-columns: repeat(5, 2.65rem);
+  gap: 0.55rem;
+}
+
+.confirmation-digit-row span {
+  display: grid;
+  height: 2.65rem;
+  place-items: center;
+  border: 1px solid rgba(140, 232, 207, 0.2);
+  border-radius: 0.65rem;
+  background: rgba(4, 9, 10, 0.48);
   color: #dffbf3;
+  font-family: var(--font-mono);
   font-size: 1.15rem;
-  letter-spacing: 0.18em;
+  font-variant-numeric: tabular-nums;
 }
 
 .pairing-complete {

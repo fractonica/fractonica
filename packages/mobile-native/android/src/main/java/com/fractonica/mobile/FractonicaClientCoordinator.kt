@@ -6,6 +6,7 @@ import com.fractonica.mobile.core.MobileClientCore
 import com.fractonica.mobile.core.MobileClientException
 import com.fractonica.mobile.core.MobileClientStatus
 import com.fractonica.mobile.core.MobileIdentityAction
+import com.fractonica.mobile.core.MobilePairingClaim
 import com.fractonica.mobile.core.MobileRecordDetail
 import com.fractonica.mobile.core.MobileRecordPreview
 import com.fractonica.mobile.core.generateIdentityMaterial
@@ -75,6 +76,24 @@ internal class FractonicaClientCoordinator(context: Context) {
       "replayed" to result.replayed,
       "queuedPeers" to safeNumber(result.queuedPeers),
     )
+  }
+
+  @Synchronized
+  fun claimPairingInvitation(options: Map<String, Any?>): Map<String, Any> {
+    if (options.size != 1) throw invalidRequest()
+    val qr = options["qr"] as? String ?: throw invalidRequest()
+    if (qr.isEmpty()) throw invalidRequest()
+    return nativeCall { pairingClaimMap(ensureClient().claimPairingInvitation(qr)) }
+  }
+
+  @Synchronized
+  fun acceptPairingInvitation(options: Map<String, Any?>): Map<String, Any> {
+    if (options.size != 1) throw invalidRequest()
+    val invitationId = options["invitationId"] as? String ?: throw invalidRequest()
+    if (invitationId.isEmpty()) throw invalidRequest()
+    return nativeCall {
+      pairingClaimMap(ensureClient().acceptPairingInvitation(invitationId))
+    }
   }
 
   @Synchronized
@@ -227,6 +246,15 @@ internal class FractonicaClientCoordinator(context: Context) {
     record.documentJson?.let { put("documentJson", it) }
   }
 
+  private fun pairingClaimMap(claim: MobilePairingClaim): Map<String, Any> = mapOf(
+    "invitationId" to claim.invitationId,
+    "responderNodeId" to claim.responderNodeId,
+    "spaceId" to claim.spaceId,
+    "endpoint" to claim.endpoint,
+    "confirmationOctal" to claim.confirmationOctal,
+    "grantOperationId" to claim.grantOperationId,
+  )
+
   private fun safeNumber(value: ULong): Double {
     if (value > MAX_SAFE_JAVASCRIPT_INTEGER) throw unavailable()
     return value.toDouble()
@@ -250,6 +278,10 @@ internal class FractonicaClientCoordinator(context: Context) {
     throw recoveryRequired(error)
   } catch (error: MobileClientException.InvalidRecord) {
     throw invalidRequest(error)
+  } catch (error: MobileClientException.InvalidPairingInvitation) {
+    throw invalidRequest(error)
+  } catch (error: MobileClientException.PairingFailed) {
+    throw pairingFailed(error)
   } catch (error: FractonicaClientBridgeException) {
     throw error
   } catch (error: Throwable) {
@@ -271,6 +303,12 @@ internal class FractonicaClientCoordinator(context: Context) {
   private fun unavailable(cause: Throwable? = null) = FractonicaClientBridgeException(
     "ERR_FRACTONICA_CLIENT_UNAVAILABLE",
     "The local Fractonica client is unavailable.",
+    cause,
+  )
+
+  private fun pairingFailed(cause: Throwable? = null) = FractonicaClientBridgeException(
+    "ERR_FRACTONICA_PAIRING_FAILED",
+    "The pairing invitation could not be claimed or completed. Create a new invitation and try again.",
     cause,
   )
 

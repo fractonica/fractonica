@@ -20,6 +20,7 @@
     "mobile:native:bindings": "./scripts/mobile/generate-bindings.sh",
     "mobile:native:ios": "./scripts/mobile/build-ios.sh",
     "mobile:start": "pnpm --filter @fractonica/mobile run start",
+    "node:dev": "cargo run -p fractonica-node",
     "test": "pnpm --recursive test"
   }
 }

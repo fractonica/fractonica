@@ -39,6 +39,14 @@ class FractonicaClientModule : Module() {
       coordinator().createRecord(options)
     }.runOnQueue(clientScope)
 
+    AsyncFunction("clientClaimPairingInvitation") { options: Map<String, Any?> ->
+      coordinator().claimPairingInvitation(options)
+    }.runOnQueue(clientScope)
+
+    AsyncFunction("clientAcceptPairingInvitation") { options: Map<String, Any?> ->
+      coordinator().acceptPairingInvitation(options)
+    }.runOnQueue(clientScope)
+
     AsyncFunction("clientResetLocalInstallation") { options: Map<String, Any?> ->
       coordinator().resetLocalInstallation(options)
     }.runOnQueue(clientScope)

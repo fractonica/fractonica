@@ -23,7 +23,7 @@ use rusqlite::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CLIENT_SCHEMA_VERSION: u32 = 3;
+pub const CLIENT_SCHEMA_VERSION: u32 = 5;
 pub const MAX_OUTBOX_BATCH: usize = 100;
 pub const MAX_ERROR_BYTES: usize = 2_048;
 pub const MAX_ENDPOINT_BYTES: usize = 2_048;
@@ -35,6 +35,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_client_store.sql"),
     include_str!("../migrations/0002_local_installation.sql"),
     include_str!("../migrations/0003_record_previews.sql"),
+    include_str!("../migrations/0004_peer_delivery_policy.sql"),
+    include_str!("../migrations/0005_peer_transport_credentials.sql"),
 ];
 
 #[derive(Clone)]
@@ -94,6 +96,13 @@ pub struct PeerConfig {
     pub peer_id: NodeId,
     pub endpoint: String,
     pub enabled: bool,
+    /// Whether local operations and media may be queued for this peer.
+    pub push_enabled: bool,
+    /// Whether media downloads are authorized for this peer.
+    pub content_read_enabled: bool,
+    /// Opaque pairing-scoped authorization header payload. Supervisor peers
+    /// use their separately protected bearer-token map instead.
+    pub peer_transport_credential: Option<String>,
     pub added_at_unix_ms: i64,
 }
 
@@ -104,6 +113,14 @@ pub struct PeerSpaceConfig {
     pub read_mode: PeerReadMode,
     pub start_after: u64,
     pub next_pull_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveWorkspace {
+    pub space_id: SpaceId,
+    pub authorization_operation_id: OperationId,
+    pub peer_id: Option<NodeId>,
+    pub activated_at_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -351,6 +368,67 @@ pub enum ClientStoreError {
 }
 
 impl ClientSqliteStore {
+    pub fn active_workspace(&self) -> Result<Option<ActiveWorkspace>, ClientStoreError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT space_id, authorization_operation_id, peer_id, activated_at_unix_ms
+                 FROM client_active_workspace WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|row| {
+                Ok(ActiveWorkspace {
+                    space_id: row
+                        .0
+                        .parse()
+                        .map_err(|error| corrupt(format!("invalid active space ID: {error}")))?,
+                    authorization_operation_id: OperationId::parse(&row.1)
+                        .map_err(|error| corrupt(error.to_string()))?,
+                    peer_id: row
+                        .2
+                        .map(|value| {
+                            NodeId::parse(&value).map_err(|error| corrupt(error.to_string()))
+                        })
+                        .transpose()?,
+                    activated_at_unix_ms: row.3,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn set_active_workspace(&self, workspace: ActiveWorkspace) -> Result<(), ClientStoreError> {
+        if workspace.activated_at_unix_ms < 0 {
+            return Err(ClientStoreError::NegativeTimestamp);
+        }
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO client_active_workspace (
+                singleton, space_id, authorization_operation_id, peer_id, activated_at_unix_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton) DO UPDATE SET
+                space_id=excluded.space_id,
+                authorization_operation_id=excluded.authorization_operation_id,
+                peer_id=excluded.peer_id,
+                activated_at_unix_ms=excluded.activated_at_unix_ms",
+            params![
+                workspace.space_id.to_string(),
+                workspace.authorization_operation_id.to_string(),
+                workspace.peer_id.map(|value| value.to_string()),
+                workspace.activated_at_unix_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ClientStoreError> {
         let requested_path = path.as_ref().to_path_buf();
         let open_path = nofollow_database_path(&requested_path)?;
@@ -562,22 +640,36 @@ impl ClientSqliteStore {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO client_peers (peer_id, endpoint, enabled, added_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(peer_id) DO UPDATE SET endpoint = excluded.endpoint, enabled = excluded.enabled",
+            "INSERT INTO client_peers (
+                peer_id, endpoint, enabled, push_enabled, content_read_enabled,
+                peer_transport_credential, added_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(peer_id) DO UPDATE SET endpoint = excluded.endpoint,
+                enabled = excluded.enabled, push_enabled = excluded.push_enabled,
+                content_read_enabled = excluded.content_read_enabled,
+                peer_transport_credential = excluded.peer_transport_credential",
             params![
                 peer.peer_id.to_string(),
                 peer.endpoint,
                 i64::from(peer.enabled),
+                i64::from(peer.push_enabled),
+                i64::from(peer.content_read_enabled),
+                peer.peer_transport_credential,
                 peer.added_at_unix_ms,
             ],
         )?;
-        if peer.enabled {
+        if peer.enabled && peer.push_enabled {
             transaction.execute(
                 "INSERT OR IGNORE INTO client_deliveries (
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', ?2 FROM client_operations
-                   WHERE schema_id IN ('record', 'event', 'tag', 'profile')",
+                   WHERE schema_id IN ('record', 'event', 'tag', 'profile')
+                     AND ((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
+                       OR EXISTS (
+                         SELECT 1 FROM client_peer_spaces space
+                          WHERE space.peer_id=?1
+                            AND space.space_id=client_operations.space_id
+                       ))",
                 params![peer.peer_id.to_string(), peer.added_at_unix_ms],
             )?;
             queue_known_resources_for_peer(&transaction, peer.peer_id, peer.added_at_unix_ms)?;
@@ -596,13 +688,24 @@ impl ClientSqliteStore {
         if changed != 1 {
             return Err(ClientStoreError::UnknownPeer(peer_id));
         }
-        if enabled {
+        let push_enabled = transaction.query_row(
+            "SELECT push_enabled FROM client_peers WHERE peer_id = ?1",
+            params![peer_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if enabled && push_enabled {
             transaction.execute(
                 "INSERT OR IGNORE INTO client_deliveries (
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', stored_at_unix_ms
                    FROM client_operations
-                  WHERE schema_id IN ('record', 'event', 'tag', 'profile')",
+                  WHERE schema_id IN ('record', 'event', 'tag', 'profile')
+                    AND ((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
+                      OR EXISTS (
+                        SELECT 1 FROM client_peer_spaces space
+                         WHERE space.peer_id=?1
+                           AND space.space_id=client_operations.space_id
+                      ))",
                 params![peer_id.to_string()],
             )?;
             queue_known_resources_for_peer(&transaction, peer_id, 0)?;
@@ -617,7 +720,8 @@ impl ClientSqliteStore {
         }
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT peer_id, endpoint, enabled, added_at_unix_ms
+            "SELECT peer_id, endpoint, enabled, push_enabled, content_read_enabled,
+                    peer_transport_credential, added_at_unix_ms
              FROM client_peers WHERE enabled = 1 ORDER BY peer_id LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit_i64(limit)?], |row| {
@@ -625,7 +729,10 @@ impl ClientSqliteStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, bool>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         rows.map(|row| {
@@ -637,7 +744,10 @@ impl ClientSqliteStore {
                     .map_err(|error| corrupt(format!("invalid peer ID: {error}")))?,
                 endpoint: row.1,
                 enabled: row.2,
-                added_at_unix_ms: row.3,
+                push_enabled: row.3,
+                content_read_enabled: row.4,
+                peer_transport_credential: row.5,
+                added_at_unix_ms: row.6,
             })
         })
         .collect()
@@ -647,8 +757,9 @@ impl ClientSqliteStore {
         if config.next_pull_at_unix_ms < 0 || config.start_after > i64::MAX as u64 {
             return Err(ClientStoreError::InvalidPullCursor);
         }
-        let connection = self.lock()?;
-        let configured = connection
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let configured = transaction
             .query_row(
                 "SELECT 1 FROM client_peers WHERE peer_id = ?1",
                 params![config.peer_id.to_string()],
@@ -670,7 +781,7 @@ impl ClientSqliteStore {
                 Some(grant_operation_id.to_string()),
             ),
         };
-        connection.execute(
+        transaction.execute(
             "INSERT INTO client_peer_spaces (
                 peer_id, space_id, read_mode, session_id, grant_operation_id,
                 pull_after, next_pull_at_unix_ms
@@ -690,6 +801,32 @@ impl ClientSqliteStore {
                 config.next_pull_at_unix_ms,
             ],
         )?;
+        let push_enabled = transaction.query_row(
+            "SELECT enabled AND push_enabled FROM client_peers WHERE peer_id=?1",
+            params![config.peer_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if push_enabled {
+            transaction.execute(
+                "INSERT OR IGNORE INTO client_deliveries (
+                    peer_id, operation_id, state, next_attempt_at_unix_ms
+                 ) SELECT ?1, operation_id, 'pending', ?3 FROM client_operations
+                   WHERE space_id=?2
+                     AND schema_id IN ('record','event','tag','profile')",
+                params![
+                    config.peer_id.to_string(),
+                    config.space_id.to_string(),
+                    config.next_pull_at_unix_ms,
+                ],
+            )?;
+            queue_known_resources_for_peer_space(
+                &transaction,
+                config.peer_id,
+                config.space_id,
+                config.next_pull_at_unix_ms,
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2108,6 +2245,18 @@ fn validate_peer(peer: &PeerConfig) -> Result<(), ClientStoreError> {
     if peer.endpoint.is_empty() || peer.endpoint.len() > MAX_ENDPOINT_BYTES {
         return Err(ClientStoreError::InvalidPeerEndpoint);
     }
+    if peer
+        .peer_transport_credential
+        .as_ref()
+        .is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 256
+                || !value.is_ascii()
+                || value.contains(char::is_whitespace)
+        })
+    {
+        return Err(ClientStoreError::InvalidPeerEndpoint);
+    }
     Ok(())
 }
 
@@ -2184,20 +2333,27 @@ fn apply_resource_source(
                     params![resource.content_id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                transaction.execute(
-                    "INSERT OR IGNORE INTO client_resource_transfers (
-                        peer_id, content_id, direction, state, next_attempt_at_unix_ms,
-                        transferred_bytes, completed_at_unix_ms
-                     ) VALUES (?1, ?2, 'download', ?3, ?4, ?5, ?6)",
-                    params![
-                        source_peer.to_string(),
-                        resource.content_id.to_string(),
-                        if available { "complete" } else { "pending" },
-                        at_unix_ms,
-                        if available { byte_length } else { 0 },
-                        available.then_some(at_unix_ms),
-                    ],
+                let content_read_enabled = transaction.query_row(
+                    "SELECT content_read_enabled FROM client_peers WHERE peer_id = ?1",
+                    params![source_peer.to_string()],
+                    |row| row.get::<_, bool>(0),
                 )?;
+                if content_read_enabled {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO client_resource_transfers (
+                            peer_id, content_id, direction, state, next_attempt_at_unix_ms,
+                            transferred_bytes, completed_at_unix_ms
+                         ) VALUES (?1, ?2, 'download', ?3, ?4, ?5, ?6)",
+                        params![
+                            source_peer.to_string(),
+                            resource.content_id.to_string(),
+                            if available { "complete" } else { "pending" },
+                            at_unix_ms,
+                            if available { byte_length } else { 0 },
+                            available.then_some(at_unix_ms),
+                        ],
+                    )?;
+                }
                 queue_resource_uploads(
                     transaction,
                     resource.content_id,
@@ -2224,7 +2380,15 @@ fn queue_resource_uploads(
                   CASE r.locally_available WHEN 1 THEN 'pending' ELSE 'waiting_local' END,
                   ?2
            FROM client_peers p JOIN client_resources r ON r.content_id = ?1
-          WHERE p.enabled = 1 AND (?3 IS NULL OR p.peer_id <> ?3)",
+          WHERE p.enabled = 1 AND p.push_enabled = 1
+            AND (p.peer_transport_credential IS NULL OR EXISTS (
+                SELECT 1 FROM client_operation_resources link
+                JOIN client_operations operation USING(operation_id)
+                JOIN client_peer_spaces space
+                  ON space.peer_id=p.peer_id AND space.space_id=operation.space_id
+                WHERE link.content_id=r.content_id
+            ))
+            AND (?3 IS NULL OR p.peer_id <> ?3)",
         params![
             content_id.to_string(),
             at_unix_ms,
@@ -2245,8 +2409,43 @@ fn queue_known_resources_for_peer(
          ) SELECT ?1, content_id, 'upload',
                   CASE locally_available WHEN 1 THEN 'pending' ELSE 'waiting_local' END,
                   max(discovered_at_unix_ms, ?2)
-           FROM client_resources",
+           FROM client_resources resource
+          WHERE (SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
+             OR EXISTS (
+              SELECT 1 FROM client_operation_resources link
+              JOIN client_operations operation USING(operation_id)
+              JOIN client_peer_spaces space
+                ON space.peer_id=?1 AND space.space_id=operation.space_id
+              WHERE link.content_id=resource.content_id
+          )",
         params![peer_id.to_string(), fallback_at_unix_ms],
+    )?;
+    Ok(())
+}
+
+fn queue_known_resources_for_peer_space(
+    transaction: &Transaction<'_>,
+    peer_id: NodeId,
+    space_id: SpaceId,
+    fallback_at_unix_ms: i64,
+) -> Result<(), ClientStoreError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO client_resource_transfers (
+            peer_id, content_id, direction, state, next_attempt_at_unix_ms
+         ) SELECT ?1, resource.content_id, 'upload',
+                  CASE resource.locally_available WHEN 1 THEN 'pending' ELSE 'waiting_local' END,
+                  max(resource.discovered_at_unix_ms, ?3)
+           FROM client_resources resource
+          WHERE EXISTS (
+              SELECT 1 FROM client_operation_resources link
+              JOIN client_operations operation USING(operation_id)
+              WHERE link.content_id=resource.content_id AND operation.space_id=?2
+          )",
+        params![
+            peer_id.to_string(),
+            space_id.to_string(),
+            fallback_at_unix_ms,
+        ],
     )?;
     Ok(())
 }
@@ -2258,7 +2457,8 @@ fn load_resource_transfer(
     direction: &str,
 ) -> Result<ResourceTransferItem, ClientStoreError> {
     let row = connection.query_row(
-        "SELECT p.endpoint, p.enabled, p.added_at_unix_ms,
+        "SELECT p.endpoint, p.enabled, p.push_enabled, p.content_read_enabled,
+                p.peer_transport_credential, p.added_at_unix_ms,
                 r.byte_length, r.media_type, r.role, r.original_name,
                 t.attempt_count, t.remote_upload_url, t.transferred_bytes
          FROM client_resource_transfers t
@@ -2270,14 +2470,17 @@ fn load_resource_transfer(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, bool>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, i64>(9)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, i64>(12)?,
             ))
         },
     )?;
@@ -2288,24 +2491,27 @@ fn load_resource_transfer(
                 .map_err(|error| corrupt(format!("invalid peer ID: {error}")))?,
             endpoint: row.0,
             enabled: row.1,
-            added_at_unix_ms: row.2,
+            push_enabled: row.2,
+            content_read_enabled: row.3,
+            peer_transport_credential: row.4,
+            added_at_unix_ms: row.5,
         },
         resource: ResourceRef {
             content_id: parse_content_id(content_id)?,
-            byte_length: nonnegative_u64(row.3)?,
-            media_type: row.4,
-            role: row.5,
-            original_name: row.6,
+            byte_length: nonnegative_u64(row.6)?,
+            media_type: row.7,
+            role: row.8,
+            original_name: row.9,
         },
         direction: match direction {
             "upload" => ResourceTransferDirection::Upload,
             "download" => ResourceTransferDirection::Download,
             _ => return Err(corrupt("invalid resource transfer direction")),
         },
-        attempt_count: u32::try_from(row.7)
+        attempt_count: u32::try_from(row.10)
             .map_err(|_| corrupt("resource attempt count overflow"))?,
-        remote_upload_url: row.8,
-        transferred_bytes: nonnegative_u64(row.9)?,
+        remote_upload_url: row.11,
+        transferred_bytes: nonnegative_u64(row.12)?,
     })
 }
 
@@ -2381,7 +2587,15 @@ fn apply_delivery_source(
                 "INSERT OR IGNORE INTO client_deliveries (
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT peer_id, ?1, 'pending', ?2 FROM client_peers
-                   WHERE enabled = 1 AND (?3 IS NULL OR peer_id <> ?3)",
+                   WHERE enabled = 1 AND push_enabled = 1
+                     AND (client_peers.peer_transport_credential IS NULL OR EXISTS (
+                         SELECT 1 FROM client_peer_spaces space
+                         JOIN client_operations operation
+                           ON operation.operation_id=?1
+                          AND operation.space_id=space.space_id
+                         WHERE space.peer_id=client_peers.peer_id
+                     ))
+                     AND (?3 IS NULL OR peer_id <> ?3)",
                 params![
                     operation_id.to_string(),
                     at_unix_ms,

@@ -243,6 +243,9 @@ fn peer(endpoint: String, seed: u8) -> PeerConfig {
         peer_id: key(seed).node_id(),
         endpoint,
         enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
         added_at_unix_ms: 1,
     }
 }
@@ -325,20 +328,24 @@ async fn worker_commits_a_complete_pull_before_advancing_the_durable_cursor() {
 
 #[derive(Clone)]
 struct HttpState {
-    requests: Arc<Mutex<Vec<(String, Value)>>>,
+    requests: Arc<Mutex<Vec<(String, Value, Option<String>)>>>,
     page: OperationChangePage,
 }
 
 async fn capture_push(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> AxumStatus {
-    state
-        .requests
-        .lock()
-        .unwrap()
-        .push((uri.path().to_owned(), body));
+    state.requests.lock().unwrap().push((
+        uri.path().to_owned(),
+        body,
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
+    ));
     AxumStatus::CREATED
 }
 
@@ -351,7 +358,7 @@ async fn capture_pull(
         .requests
         .lock()
         .unwrap()
-        .push((uri.path().to_owned(), body));
+        .push((uri.path().to_owned(), body, None));
     Json(state.page)
 }
 
@@ -382,7 +389,8 @@ async fn http_transport_uses_signed_admission_and_paired_read_contracts() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let peer = peer(format!("http://{address}"), 10);
+    let mut peer = peer(format!("http://{address}"), 10);
+    peer.peer_transport_credential = Some("07070707070707070707070707070707.test-token".into());
     let transport = NodeHttpTransport::new(
         SoftwarePeerProofCustody::new(key(11), signing_key),
         BTreeMap::new(),
@@ -412,6 +420,10 @@ async fn http_transport_uses_signed_admission_and_paired_read_contracts() {
     let captured = requests.lock().unwrap();
     assert_eq!(captured.len(), 2);
     assert!(captured[0].0.ends_with("/operations"));
+    assert_eq!(
+        captured[0].2.as_deref(),
+        Some("Fractonica-Peer 07070707070707070707070707070707.test-token")
+    );
     assert_eq!(captured[1].1["protocolVersion"], 1);
     assert_eq!(captured[1].1["after"], 0);
     assert_eq!(captured[1].1["limit"], 20);

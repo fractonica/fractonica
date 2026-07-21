@@ -11,7 +11,7 @@ use fractonica_application::{
 };
 use fractonica_core::InstallationMetadata;
 use fractonica_data_model::{
-    CapabilityAction, CapabilityRevocationReason, EntityId, EntitySchema, OperationBody,
+    ActorId, CapabilityAction, CapabilityRevocationReason, EntityId, EntitySchema, OperationBody,
     OperationEnvelope, OperationId, SpaceId, Visibility,
 };
 use fractonica_trust::SignedOperation as TrustSignedOperation;
@@ -476,6 +476,29 @@ impl OperationRepository for SqliteStore {
 }
 
 impl SqliteStore {
+    /// Applies the same recursive, revocation-aware capability evaluation used
+    /// by signed operation admission to a paired transport request.
+    pub fn authorize_stored_capability_action(
+        &self,
+        space_id: SpaceId,
+        actor_id: ActorId,
+        grant_operation_id: OperationId,
+        action: CapabilityAction,
+        now_unix_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        let connection = lock(self)?;
+        let view = SqliteCapabilityView(&connection);
+        authorize_capability_action(
+            space_id,
+            actor_id,
+            &[grant_operation_id],
+            action,
+            now_unix_ms,
+            &view,
+        )
+        .map_err(|_| RepositoryError::PeerUnauthorized)
+    }
+
     /// Recreates the disposable client read model from admitted operations.
     ///
     /// The signed operation log remains authoritative. This operation is safe

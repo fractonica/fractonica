@@ -25,9 +25,9 @@ use fractonica_client::{
 };
 use fractonica_client_content::{ClientContentError, ClientContentStore};
 use fractonica_client_sqlite::{
-    ClientInstallation, ClientInstallationBinding, ClientSqliteStore, ClientStoreError,
-    CommitResult, LocalEntitySummary, LocalRecordPreview, LocalRecordSummary, PeerConfig,
-    PeerReadMode, PeerSpaceConfig,
+    ActiveWorkspace, ClientInstallation, ClientInstallationBinding, ClientSqliteStore,
+    ClientStoreError, CommitResult, LocalEntitySummary, LocalRecordPreview, LocalRecordSummary,
+    PeerConfig, PeerReadMode, PeerSpaceConfig, SyncTarget,
 };
 use fractonica_content::{ContentId, ContentValidationError, ResourceRef};
 use fractonica_data_model::{
@@ -35,11 +35,11 @@ use fractonica_data_model::{
     OperationId, ProfileDocument, ProtectedDocument, RecordDocument, SpaceId, TagDocument,
 };
 use fractonica_keystore::{FileKeyStore, FileKeyStoreError, IdentityBundle, KeyStore};
-use fractonica_peer::{PeerReadChangesFields, PeerReadChangesProof};
+use fractonica_peer::{PeerReadChangesFields, PeerReadChangesProof, PeerSessionId};
 use fractonica_space_bootstrap::build_trusted_space_bootstrap;
 use fractonica_sync::{
-    NodeHttpTransport, PeerProofCustody, SyncConfig, SyncError, SyncStatus, SyncWorker,
-    TransportError,
+    NodeHttpTransport, PeerProofCustody, SyncConfig, SyncError, SyncStatus, SyncTransport,
+    SyncWorker, TransportError,
 };
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -187,10 +187,11 @@ type NativeAuthor = OperationAuthor<EstablishedIdentityCustody, SystemAuthoringR
 pub struct ClientRuntime {
     store: ClientSqliteStore,
     content: ClientContentStore,
-    author: Arc<NativeAuthor>,
+    author: Mutex<Arc<NativeAuthor>>,
+    custody: EstablishedIdentityCustody,
     node_id: NodeId,
     actor_id: ActorId,
-    space_id: SpaceId,
+    local_space_id: SpaceId,
     sync: RuntimeSync,
 }
 
@@ -228,7 +229,10 @@ impl ClientRuntime {
     where
         S: StandaloneIdentityStore,
     {
-        blocking(move || bootstrap_standalone_blocking(config, identities)).await
+        let (mut client, custody) =
+            blocking(move || bootstrap_standalone_blocking(config, identities)).await?;
+        client.start_sync_worker(custody, BTreeMap::new(), SyncConfig::default())?;
+        Ok(client)
     }
 
     pub async fn bootstrap_supervised(
@@ -279,6 +283,9 @@ impl ClientRuntime {
             peer_id: node_id,
             endpoint: endpoint_origin(&endpoint),
             enabled: true,
+            push_enabled: true,
+            content_read_enabled: true,
+            peer_transport_credential: None,
             added_at_unix_ms: now,
         })?;
         store.configure_peer_space(&PeerSpaceConfig {
@@ -287,6 +294,12 @@ impl ClientRuntime {
             read_mode: PeerReadMode::SupervisorBearer,
             start_after: 0,
             next_pull_at_unix_ms: now,
+        })?;
+        store.set_active_workspace(ActiveWorkspace {
+            space_id: space.space_id,
+            authorization_operation_id: space.initial_grant_operation_id,
+            peer_id: Some(node_id),
+            activated_at_unix_ms: now,
         })?;
 
         let content =
@@ -301,7 +314,7 @@ impl ClientRuntime {
         ));
         let mut tokens = BTreeMap::new();
         tokens.insert(node_id, config.bearer_token);
-        let transport = NodeHttpTransport::new(custody, tokens)?;
+        let transport = NodeHttpTransport::new(custody.clone(), tokens)?;
         let (worker, sync_status) =
             SyncWorker::new(store.clone(), content.clone(), transport, config.sync)?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
@@ -310,10 +323,11 @@ impl ClientRuntime {
         Ok(Self {
             store,
             content,
-            author,
+            author: Mutex::new(author),
+            custody,
             node_id,
             actor_id: identity.local_writer_actor_id(),
-            space_id: space.space_id,
+            local_space_id: space.space_id,
             sync: RuntimeSync::Worker {
                 status: sync_status,
                 shutdown,
@@ -324,10 +338,15 @@ impl ClientRuntime {
 
     #[must_use]
     pub fn status(&self) -> ClientRuntimeStatus {
+        let space_id = self
+            .author
+            .lock()
+            .map(|author| author.context().space_id)
+            .unwrap_or(self.local_space_id);
         ClientRuntimeStatus {
             node_id: self.node_id,
             actor_id: self.actor_id,
-            space_id: self.space_id,
+            space_id,
             sync: match &self.sync {
                 RuntimeSync::Static(status) => status.as_ref().clone(),
                 RuntimeSync::Worker { status, .. } => status.borrow().clone(),
@@ -375,7 +394,7 @@ impl ClientRuntime {
         &self,
         payload: ProtectedDocument<RecordDocument>,
     ) -> Result<CommitResult, ClientRuntimeError> {
-        let author = Arc::clone(&self.author);
+        let author = self.active_author()?;
         self.commit_authored(move || author.create_record(payload))
             .await
     }
@@ -395,7 +414,7 @@ impl ClientRuntime {
         &self,
         payload: ProtectedDocument<EventDocument>,
     ) -> Result<CommitResult, ClientRuntimeError> {
-        let author = Arc::clone(&self.author);
+        let author = self.active_author()?;
         self.commit_authored(move || author.create_event(payload))
             .await
     }
@@ -415,7 +434,7 @@ impl ClientRuntime {
         &self,
         payload: ProtectedDocument<TagDocument>,
     ) -> Result<CommitResult, ClientRuntimeError> {
-        let author = Arc::clone(&self.author);
+        let author = self.active_author()?;
         self.commit_authored(move || author.create_tag(payload))
             .await
     }
@@ -436,9 +455,9 @@ impl ClientRuntime {
         document: ProfileDocument,
     ) -> Result<CommitResult, ClientRuntimeError> {
         let store = self.store.clone();
-        let author = Arc::clone(&self.author);
+        let author = self.active_author()?;
         let actor_id = self.actor_id;
-        let space_id = self.space_id;
+        let space_id = author.context().space_id;
         blocking(move || {
             let entity_id = fractonica_data_model::profile_entity_id(actor_id);
             let observed = observed_entity(&store, space_id, entity_id, EntitySchema::Profile)?;
@@ -454,8 +473,8 @@ impl ClientRuntime {
         schema: EntitySchema,
     ) -> Result<CommitResult, ClientRuntimeError> {
         let store = self.store.clone();
-        let author = Arc::clone(&self.author);
-        let space_id = self.space_id;
+        let author = self.active_author()?;
+        let space_id = author.context().space_id;
         blocking(move || {
             let observed = observed_entity(&store, space_id, entity_id, schema)?
                 .ok_or(ClientRuntimeError::EntityNotFound(entity_id))?;
@@ -471,7 +490,7 @@ impl ClientRuntime {
         limit: usize,
     ) -> Result<Vec<LocalEntitySummary>, ClientRuntimeError> {
         let store = self.store.clone();
-        let space_id = self.space_id;
+        let space_id = self.active_space_id()?;
         blocking(move || Ok(store.list_entities(space_id, schema, limit)?)).await
     }
 
@@ -480,7 +499,7 @@ impl ClientRuntime {
         limit: usize,
     ) -> Result<Vec<LocalRecordSummary>, ClientRuntimeError> {
         let store = self.store.clone();
-        let space_id = self.space_id;
+        let space_id = self.active_space_id()?;
         blocking(move || Ok(store.list_records(space_id, limit)?)).await
     }
 
@@ -489,7 +508,7 @@ impl ClientRuntime {
         limit: usize,
     ) -> Result<Vec<LocalRecordPreview>, ClientRuntimeError> {
         let store = self.store.clone();
-        let space_id = self.space_id;
+        let space_id = self.active_space_id()?;
         blocking(move || Ok(store.list_record_previews(space_id, limit)?)).await
     }
 
@@ -499,8 +518,123 @@ impl ClientRuntime {
         operation_id: OperationId,
     ) -> Result<Option<LocalRecordSummary>, ClientRuntimeError> {
         let store = self.store.clone();
-        let space_id = self.space_id;
+        let space_id = self.active_space_id()?;
         blocking(move || Ok(store.record(space_id, entity_id, operation_id)?)).await
+    }
+
+    /// Persists a completed pairing as a bidirectional operation and media
+    /// peer. The credential is Noise-delivered and scoped by the node to the
+    /// completed pairing capability.
+    pub async fn configure_paired_peer(
+        &self,
+        peer_id: NodeId,
+        endpoint: String,
+        space_id: SpaceId,
+        session_id: PeerSessionId,
+        grant_operation_id: OperationId,
+        peer_transport_credential: String,
+    ) -> Result<(), ClientRuntimeError> {
+        let endpoint = validate_paired_endpoint(&endpoint)?;
+        let store = self.store.clone();
+        let now = unix_time_millis()?;
+        let endpoint = endpoint_origin(&endpoint);
+        let peer = PeerConfig {
+            peer_id,
+            endpoint: endpoint.clone(),
+            enabled: true,
+            push_enabled: true,
+            content_read_enabled: true,
+            peer_transport_credential: Some(peer_transport_credential),
+            added_at_unix_ms: now,
+        };
+        let peer_for_store = peer.clone();
+        blocking({
+            let store = store.clone();
+            move || {
+                store.upsert_peer(&peer_for_store)?;
+                store.configure_peer_space(&PeerSpaceConfig {
+                    peer_id,
+                    space_id,
+                    read_mode: PeerReadMode::Paired {
+                        session_id,
+                        grant_operation_id,
+                    },
+                    start_after: 0,
+                    next_pull_at_unix_ms: now,
+                })?;
+                Ok(())
+            }
+        })
+        .await?;
+
+        // Pull from sequence zero before switching the authoring namespace.
+        // This guarantees the remote genesis and exact admitted grant are
+        // durable locally; a paired device never authors against an unseen
+        // authority chain.
+        let transport = NodeHttpTransport::new(self.custody.clone(), BTreeMap::new())?;
+        let mut target = SyncTarget {
+            peer_id,
+            endpoint,
+            space_id,
+            read_mode: PeerReadMode::Paired {
+                session_id,
+                grant_operation_id,
+            },
+            after: 0,
+            pull_failure_count: 0,
+        };
+        let mut admitted_grant = false;
+        for _ in 0..1_024 {
+            let page = transport
+                .pull(
+                    &target,
+                    100,
+                    unix_time_millis()?,
+                    std::time::Duration::from_secs(10),
+                )
+                .await?;
+            let next_after = page.next_after;
+            let has_more = page.has_more;
+            let operations = page.operations;
+            let store_for_commit = store.clone();
+            blocking(move || {
+                for operation in operations {
+                    store_for_commit.commit_from_peer(
+                        &operation,
+                        operation.occurred_at_unix_ms,
+                        peer_id,
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+            admitted_grant = store.operation(grant_operation_id)?.is_some();
+            if admitted_grant || !has_more {
+                break;
+            }
+            target.after = next_after;
+        }
+        if !admitted_grant {
+            return Err(ClientRuntimeError::PairingBootstrap(
+                "the paired node did not return the admitted capability grant",
+            ));
+        }
+        store.set_active_workspace(ActiveWorkspace {
+            space_id,
+            authorization_operation_id: grant_operation_id,
+            peer_id: Some(peer_id),
+            activated_at_unix_ms: unix_time_millis()?,
+        })?;
+        let author = Arc::new(OperationAuthor::new(
+            AuthoringContext::new(space_id, vec![grant_operation_id])?,
+            self.custody.clone(),
+            SystemAuthoringRuntime,
+        ));
+        *self
+            .author
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)? = author;
+        Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientRuntimeError> {
@@ -554,8 +688,8 @@ impl ClientRuntime {
             + 'static,
     {
         let store = self.store.clone();
-        let author = Arc::clone(&self.author);
-        let space_id = self.space_id;
+        let author = self.active_author()?;
+        let space_id = author.context().space_id;
         blocking(move || {
             let observed = observed_entity(&store, space_id, entity_id, schema)?
                 .ok_or(ClientRuntimeError::EntityNotFound(entity_id))?;
@@ -563,6 +697,36 @@ impl ClientRuntime {
             Ok(store.commit_local(&operation, operation.occurred_at_unix_ms)?)
         })
         .await
+    }
+
+    fn active_author(&self) -> Result<Arc<NativeAuthor>, ClientRuntimeError> {
+        self.author
+            .lock()
+            .map(|author| Arc::clone(&author))
+            .map_err(|_| ClientRuntimeError::LifecycleLock)
+    }
+
+    fn active_space_id(&self) -> Result<SpaceId, ClientRuntimeError> {
+        Ok(self.active_author()?.context().space_id)
+    }
+
+    fn start_sync_worker(
+        &mut self,
+        custody: EstablishedIdentityCustody,
+        bearer_tokens: BTreeMap<NodeId, String>,
+        config: SyncConfig,
+    ) -> Result<(), ClientRuntimeError> {
+        let transport = NodeHttpTransport::new(custody, bearer_tokens)?;
+        let (worker, status) =
+            SyncWorker::new(self.store.clone(), self.content.clone(), transport, config)?;
+        let (shutdown, shutdown_receiver) = watch::channel(false);
+        let task = tokio::spawn(worker.run(shutdown_receiver));
+        self.sync = RuntimeSync::Worker {
+            status,
+            shutdown,
+            task: Mutex::new(Some(task)),
+        };
+        Ok(())
     }
 }
 
@@ -577,7 +741,7 @@ impl Drop for ClientRuntime {
 fn bootstrap_standalone_blocking<S: StandaloneIdentityStore>(
     config: StandaloneClientConfig,
     identities: Arc<S>,
-) -> Result<ClientRuntime, ClientRuntimeError> {
+) -> Result<(ClientRuntime, EstablishedIdentityCustody), ClientRuntimeError> {
     let identity_state = identities
         .state()
         .map_err(|error| ClientRuntimeError::Identity(error.to_string()))?;
@@ -611,25 +775,50 @@ fn bootstrap_standalone_blocking<S: StandaloneIdentityStore>(
     let custody = EstablishedIdentityCustody {
         identity: Arc::clone(&identity),
     };
+    let now = unix_time_millis()?;
+    let active = match store.active_workspace()? {
+        Some(active) => active,
+        None => {
+            let active = ActiveWorkspace {
+                space_id: binding.space_id,
+                authorization_operation_id: binding.initial_grant_operation_id,
+                peer_id: None,
+                activated_at_unix_ms: now,
+            };
+            store.set_active_workspace(active)?;
+            active
+        }
+    };
+    if store
+        .operation(active.authorization_operation_id)?
+        .is_none()
+    {
+        return Err(ClientRuntimeError::MissingInstallationAnchor(
+            active.authorization_operation_id,
+        ));
+    }
     let author = Arc::new(OperationAuthor::new(
-        AuthoringContext::new(binding.space_id, vec![binding.initial_grant_operation_id])?,
-        custody,
+        AuthoringContext::new(active.space_id, vec![active.authorization_operation_id])?,
+        custody.clone(),
         SystemAuthoringRuntime,
     ));
-    let now = unix_time_millis()?;
     let sync = SyncStatus {
         counts: Some(store.sync_counts(now)?),
         ..SyncStatus::default()
     };
-    Ok(ClientRuntime {
-        store,
-        content,
-        author,
-        node_id: binding.node_id,
-        actor_id: binding.local_writer_actor_id,
-        space_id: binding.space_id,
-        sync: RuntimeSync::Static(Box::new(sync)),
-    })
+    Ok((
+        ClientRuntime {
+            store,
+            content,
+            author: Mutex::new(author),
+            custody: custody.clone(),
+            node_id: binding.node_id,
+            actor_id: binding.local_writer_actor_id,
+            local_space_id: binding.space_id,
+            sync: RuntimeSync::Static(Box::new(sync)),
+        },
+        custody,
+    ))
 }
 
 fn prepare_standalone_blocking(
@@ -911,6 +1100,35 @@ fn validate_supervised_endpoint(value: &str) -> Result<Url, ClientRuntimeError> 
     Ok(url)
 }
 
+fn validate_paired_endpoint(value: &str) -> Result<Url, ClientRuntimeError> {
+    let url = Url::parse(value).map_err(|error| contract(format!("invalid endpoint: {error}")))?;
+    let local_network = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(|address| match address {
+                IpAddr::V4(address) => {
+                    address.is_loopback() || address.is_private() || address.is_link_local()
+                }
+                IpAddr::V6(address) => {
+                    address.is_loopback()
+                        || address.is_unique_local()
+                        || address.is_unicast_link_local()
+                }
+            })
+    });
+    if url.scheme() != "http"
+        || !local_network
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(contract(
+            "paired endpoint must be a plain HTTP local-network origin",
+        ));
+    }
+    Ok(url)
+}
+
 fn endpoint_origin(endpoint: &Url) -> String {
     let mut origin = endpoint.clone();
     origin.set_path("");
@@ -1020,6 +1238,8 @@ pub enum ClientRuntimeError {
     Join(String),
     #[error("client lifecycle lock was poisoned")]
     LifecycleLock,
+    #[error("paired workspace bootstrap failed: {0}")]
+    PairingBootstrap(&'static str),
 }
 
 #[cfg(test)]

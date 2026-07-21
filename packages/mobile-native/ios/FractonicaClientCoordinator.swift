@@ -31,6 +31,13 @@ final class FractonicaClientModuleError: Exception, @unchecked Sendable {
       reason: "The local Fractonica client is unavailable."
     )
   }
+
+  static var pairingFailed: FractonicaClientModuleError {
+    FractonicaClientModuleError(
+      code: "ERR_FRACTONICA_PAIRING_FAILED",
+      reason: "The pairing invitation could not be claimed or completed. Create a new invitation and try again."
+    )
+  }
 }
 
 /// Serial native owner of the Rust runtime. Paths and protected identity bytes
@@ -123,6 +130,46 @@ final class FractonicaClientCoordinator {
       "operationId": result.operationId,
       "replayed": result.replayed,
       "queuedPeers": try safeNumber(result.queuedPeers),
+    ]
+  }
+
+  func claimPairingInvitation(options: [String: Any]) throws -> [String: Any] {
+    guard options.count == 1,
+      let qr = options["qr"] as? String,
+      !qr.isEmpty
+    else {
+      throw FractonicaClientModuleError.invalidRequest
+    }
+    let claim = try nativeCall {
+      try ensureClient().claimPairingInvitation(qr: qr)
+    }
+    return [
+      "invitationId": claim.invitationId,
+      "responderNodeId": claim.responderNodeId,
+      "spaceId": claim.spaceId,
+      "endpoint": claim.endpoint,
+      "confirmationOctal": claim.confirmationOctal,
+      "grantOperationId": claim.grantOperationId,
+    ]
+  }
+
+  func acceptPairingInvitation(options: [String: Any]) throws -> [String: Any] {
+    guard options.count == 1,
+      let invitationId = options["invitationId"] as? String,
+      !invitationId.isEmpty
+    else {
+      throw FractonicaClientModuleError.invalidRequest
+    }
+    let claim = try nativeCall {
+      try ensureClient().acceptPairingInvitation(invitationId: invitationId)
+    }
+    return [
+      "invitationId": claim.invitationId,
+      "responderNodeId": claim.responderNodeId,
+      "spaceId": claim.spaceId,
+      "endpoint": claim.endpoint,
+      "confirmationOctal": claim.confirmationOctal,
+      "grantOperationId": claim.grantOperationId,
     ]
   }
 
@@ -286,8 +333,12 @@ final class FractonicaClientCoordinator {
       throw FractonicaClientModuleError.recoveryRequired
     } catch MobileClientError.RecoveryRequired {
       throw FractonicaClientModuleError.recoveryRequired
-    } catch MobileClientError.InvalidRecord {
+    } catch MobileClientError.InvalidRecord,
+      MobileClientError.InvalidPairingInvitation
+    {
       throw FractonicaClientModuleError.invalidRequest
+    } catch MobileClientError.PairingFailed {
+      throw FractonicaClientModuleError.pairingFailed
     } catch {
       throw FractonicaClientModuleError.unavailable
     }

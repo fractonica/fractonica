@@ -60,6 +60,12 @@ function client(overrides: Partial<NativeClientPort> = {}): NativeClientPort {
       replayed: false,
       queuedPeers: 0,
     })),
+    claimPairingInvitation: vi.fn(async () => {
+      throw new Error("not used in record tests");
+    }),
+    acceptPairingInvitation: vi.fn(async () => {
+      throw new Error("not used in record tests");
+    }),
     resetLocalInstallation: vi.fn(async () => undefined),
     ...overrides,
   };

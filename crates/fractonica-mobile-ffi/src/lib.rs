@@ -7,20 +7,31 @@
 //! Keychain and Android Keystore adapters persist it as an opaque byte string.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fractonica_client_runtime::{
     ClientRuntime, ClientRuntimeError, StandaloneClientConfig, StandaloneIdentityAction,
     StandaloneIdentityState, StandaloneIdentityStore,
 };
 use fractonica_client_sqlite::ClientStoreError;
-use fractonica_data_model::{EntityId, OperationId, ProtectedDocument, RecordDocument, Visibility};
+use fractonica_data_model::{
+    EntityId, NodeId, OperationId, ProtectedDocument, RecordDocument, Visibility,
+};
 use fractonica_keystore::IdentityBundle;
+use fractonica_pairing::{
+    InvitationId, JoinerClaim, PairingAcceptance, PairingInvitation, PairingReceipt,
+};
+use fractonica_peer::PeerSessionId;
 use fractonica_trust::{SigningKey, SpaceId};
+use reqwest::{Client, Url};
+use serde::Deserialize;
 use tokio::runtime::Runtime;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -43,6 +54,7 @@ const MAX_RECORD_PREVIEW_PAGE_BYTES: usize = 64 * 1_024;
 const RECORD_PREVIEW_FIXED_BUDGET_BYTES: usize = 256;
 const MAX_RECORD_DETAIL_JSON_BYTES: usize = 2 * 1_024 * 1_024;
 const RESET_LOCAL_INSTALLATION_CONFIRMATION: &str = "RESET_LOCAL_INSTALLATION";
+const MAX_PAIRING_QR_BYTES: usize = 8 * 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
 pub struct MobileBridgeStatus {
@@ -123,6 +135,19 @@ pub struct MobileCommitResult {
     pub queued_peers: u64,
 }
 
+/// Verified result of the joiner's Noise handshake. The planned grant id is
+/// not authority by itself: the desktop node must still admit that operation
+/// after the user compares and confirms all ten octal digits.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct MobilePairingClaim {
+    pub invitation_id: String,
+    pub responder_node_id: String,
+    pub space_id: String,
+    pub endpoint: String,
+    pub confirmation_octal: String,
+    pub grant_operation_id: String,
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MobileClientError {
     #[error("Protected identity material is invalid.")]
@@ -141,6 +166,10 @@ pub enum MobileClientError {
     RandomSourceUnavailable,
     #[error("The local client operation failed.")]
     OperationFailed,
+    #[error("The pairing invitation is invalid or is not safe for this transport.")]
+    InvalidPairingInvitation,
+    #[error("The pairing handshake failed.")]
+    PairingFailed,
 }
 
 #[uniffi::export]
@@ -226,7 +255,7 @@ impl MobileClientBootstrap {
         identity_material: Vec<u8>,
     ) -> Result<Arc<MobileClientCore>, MobileClientError> {
         let identity_material = Zeroizing::new(identity_material);
-        let identity = OpaqueIdentity::decode(&identity_material)?;
+        let identity = Arc::new(OpaqueIdentity::decode(&identity_material)?);
 
         let mut opened = self
             .opened
@@ -240,13 +269,15 @@ impl MobileClientBootstrap {
             .executor
             .block_on(ClientRuntime::bootstrap_standalone(
                 self.config.clone(),
-                Arc::new(identity),
+                Arc::clone(&identity),
             ))
             .map_err(map_initialization_error)?;
         *opened = true;
         Ok(Arc::new(MobileClientCore {
             client: Arc::new(client),
+            identity,
             executor: Arc::clone(&self.executor),
+            pending_pairings: Mutex::new(BTreeMap::new()),
             shutdown: Mutex::new(false),
         }))
     }
@@ -275,8 +306,23 @@ impl MobileClientBootstrap {
 pub struct MobileClientCore {
     // Keep the client before its executor so it is dropped first.
     client: Arc<ClientRuntime>,
+    identity: Arc<OpaqueIdentity>,
     executor: Arc<Runtime>,
+    pending_pairings: Mutex<BTreeMap<String, PendingPairing>>,
     shutdown: Mutex<bool>,
+}
+
+#[derive(Clone)]
+struct PendingPairing {
+    claim: MobilePairingClaim,
+    invitation_id: InvitationId,
+    responder_node_id: NodeId,
+    space_id: SpaceId,
+    endpoint: String,
+    claim_digest: [u8; 32],
+    handshake_hash: [u8; 32],
+    grant_operation_id: OperationId,
+    peer_transport_credential: String,
 }
 
 #[uniffi::export]
@@ -434,6 +480,78 @@ impl MobileClientCore {
         })
     }
 
+    /// Claims a short-lived local-network invitation using the protected device
+    /// identity. The raw QR secret is used only for this call and is neither
+    /// logged nor persisted. Endpoint hints are restricted to loopback or
+    /// private/link-local addresses; the transport credential is returned only
+    /// inside the encrypted Noise receipt.
+    pub fn claim_pairing_invitation(
+        &self,
+        qr: String,
+    ) -> Result<MobilePairingClaim, MobileClientError> {
+        if qr.is_empty() || qr.len() > MAX_PAIRING_QR_BYTES {
+            return Err(MobileClientError::InvalidPairingInvitation);
+        }
+        let now = unix_time_millis().ok_or(MobileClientError::PairingFailed)?;
+        let invitation = PairingInvitation::decode(&qr, now)
+            .map_err(|_| MobileClientError::InvalidPairingInvitation)?;
+        let invitation_id = invitation.descriptor().invitation_id.to_string();
+        if let Some(existing) = self
+            .pending_pairings
+            .lock()
+            .map_err(|_| MobileClientError::PairingFailed)?
+            .get(&invitation_id)
+            .cloned()
+        {
+            return Ok(existing.claim);
+        }
+        let identity = self
+            .identity
+            .bundle()
+            .map_err(|_| MobileClientError::InvalidIdentity)?;
+        let verified = self
+            .executor
+            .block_on(claim_pairing(invitation, now, identity))?;
+        let claim = verified.claim.clone();
+        self.pending_pairings
+            .lock()
+            .map_err(|_| MobileClientError::PairingFailed)?
+            .insert(claim.invitation_id.clone(), verified);
+        Ok(claim)
+    }
+
+    /// Admits a claimed pairing only after the user has compared the complete
+    /// ten-octal transcript. The acceptance is dual-signed below JavaScript;
+    /// after the node returns the completed grant, the peer is persisted as
+    /// bidirectional operation/media peer and the background worker discovers
+    /// it without exposing transport credentials to JavaScript.
+    pub fn accept_pairing_invitation(
+        &self,
+        invitation_id: String,
+    ) -> Result<MobilePairingClaim, MobileClientError> {
+        let pending = self
+            .pending_pairings
+            .lock()
+            .map_err(|_| MobileClientError::PairingFailed)?
+            .get(&invitation_id)
+            .cloned()
+            .ok_or(MobileClientError::PairingFailed)?;
+        let identity = self
+            .identity
+            .bundle()
+            .map_err(|_| MobileClientError::InvalidIdentity)?;
+        self.executor.block_on(accept_pairing(
+            &pending,
+            &identity,
+            Arc::clone(&self.client),
+        ))?;
+        self.pending_pairings
+            .lock()
+            .map_err(|_| MobileClientError::PairingFailed)?
+            .remove(&invitation_id);
+        Ok(pending.claim)
+    }
+
     pub fn shutdown(&self) -> Result<(), MobileClientError> {
         let mut shutdown = self
             .shutdown
@@ -448,6 +566,274 @@ impl MobileClientCore {
         *shutdown = true;
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingHandshakeResponse {
+    response_frame_base64url: String,
+    receipt_frame_base64url: String,
+    session: PairingSessionResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingSessionResponse {
+    invitation_id: String,
+    space_id: String,
+    state: String,
+    expires_at_unix_ms: i64,
+    joiner_node_id: Option<String>,
+    subject_actor_id: Option<String>,
+    confirmation_octal: Option<String>,
+    grant_operation_id: Option<String>,
+}
+
+async fn claim_pairing(
+    invitation: PairingInvitation,
+    now: i64,
+    identity: IdentityBundle,
+) -> Result<PendingPairing, MobileClientError> {
+    let descriptor = invitation.descriptor();
+    let endpoint = descriptor
+        .endpoint_hints
+        .iter()
+        .find_map(|hint| safe_pairing_endpoint(hint).ok())
+        .ok_or(MobileClientError::InvalidPairingInvitation)?;
+
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| MobileClientError::RandomSourceUnavailable)?;
+    let claim = JoinerClaim::sign(
+        descriptor,
+        identity.node_transport_key(),
+        identity.local_writer_key(),
+        nonce,
+    );
+    let mut handshake = invitation
+        .start_initiator(now)
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    let first_frame = handshake
+        .write_message(
+            &claim
+                .canonical_bytes()
+                .map_err(|_| MobileClientError::PairingFailed)?,
+        )
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    let url = endpoint
+        .join("api/pairing/handshake")
+        .map_err(|_| MobileClientError::InvalidPairingInvitation)?;
+    let response = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| MobileClientError::PairingFailed)?
+        .post(url)
+        .json(&serde_json::json!({
+            "invitationId": descriptor.invitation_id.to_string(),
+            "frameBase64url": URL_SAFE_NO_PAD.encode(first_frame),
+        }))
+        .send()
+        .await
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    if !response.status().is_success() {
+        return Err(MobileClientError::PairingFailed);
+    }
+    let response: PairingHandshakeResponse = response
+        .json()
+        .await
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    let response_frame = URL_SAFE_NO_PAD
+        .decode(response.response_frame_base64url)
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    let receipt_frame = URL_SAFE_NO_PAD
+        .decode(response.receipt_frame_base64url)
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    if !handshake
+        .read_message(&response_frame)
+        .map_err(|_| MobileClientError::PairingFailed)?
+        .is_empty()
+    {
+        return Err(MobileClientError::PairingFailed);
+    }
+    let mut transport = handshake
+        .finish()
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    let receipt = PairingReceipt::from_canonical_bytes(
+        &transport
+            .read_message(&receipt_frame)
+            .map_err(|_| MobileClientError::PairingFailed)?,
+    )
+    .map_err(|_| MobileClientError::PairingFailed)?;
+    receipt
+        .verify_for(descriptor, &claim, transport.handshake_hash())
+        .map_err(|_| MobileClientError::PairingFailed)?;
+
+    let session = response.session;
+    let confirmation = transport.confirmation_octal().to_owned();
+    let expected_joiner_node_id = identity.node_id().to_string();
+    let expected_subject_actor_id = identity.local_writer_actor_id().to_string();
+    let grant_operation_id = session
+        .grant_operation_id
+        .ok_or(MobileClientError::PairingFailed)?;
+    if session.invitation_id != descriptor.invitation_id.to_string()
+        || session.space_id != descriptor.space_id.to_string()
+        || session.state != "claimed"
+        || session.expires_at_unix_ms != descriptor.expires_at_unix_ms
+        || session.joiner_node_id.as_deref() != Some(expected_joiner_node_id.as_str())
+        || session.subject_actor_id.as_deref() != Some(expected_subject_actor_id.as_str())
+        || session.confirmation_octal.as_deref() != Some(confirmation.as_str())
+        || OperationId::parse(&grant_operation_id).is_err()
+    {
+        return Err(MobileClientError::PairingFailed);
+    }
+
+    let public = MobilePairingClaim {
+        invitation_id: descriptor.invitation_id.to_string(),
+        responder_node_id: descriptor.responder_node_id.to_string(),
+        space_id: descriptor.space_id.to_string(),
+        endpoint: endpoint_origin(&endpoint),
+        confirmation_octal: confirmation,
+        grant_operation_id: grant_operation_id.clone(),
+    };
+    Ok(PendingPairing {
+        claim: public,
+        invitation_id: descriptor.invitation_id,
+        responder_node_id: descriptor.responder_node_id,
+        space_id: descriptor.space_id,
+        endpoint: endpoint_origin(&endpoint),
+        claim_digest: claim.digest(),
+        handshake_hash: *transport.handshake_hash(),
+        grant_operation_id: OperationId::parse(&grant_operation_id)
+            .map_err(|_| MobileClientError::PairingFailed)?,
+        peer_transport_credential: format!(
+            "{}.{}",
+            descriptor.invitation_id,
+            URL_SAFE_NO_PAD.encode(receipt.peer_access_token())
+        ),
+    })
+}
+
+async fn accept_pairing(
+    pending: &PendingPairing,
+    identity: &IdentityBundle,
+    client_runtime: Arc<ClientRuntime>,
+) -> Result<(), MobileClientError> {
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| MobileClientError::RandomSourceUnavailable)?;
+    let acceptance = PairingAcceptance::sign(
+        pending.invitation_id,
+        pending.claim_digest,
+        pending.handshake_hash,
+        pending.responder_node_id,
+        pending.space_id,
+        pending.grant_operation_id,
+        identity.node_transport_key(),
+        identity.local_writer_key(),
+        nonce,
+    );
+    let endpoint = Url::parse(&pending.endpoint).map_err(|_| MobileClientError::PairingFailed)?;
+    let url = endpoint
+        .join(&format!(
+            "api/pairing/invitations/{}/accept",
+            pending.invitation_id
+        ))
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    let response = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| MobileClientError::PairingFailed)?
+        .post(url)
+        .json(&serde_json::json!({
+            "acceptanceBase64url": URL_SAFE_NO_PAD.encode(
+                acceptance
+                    .canonical_bytes()
+                    .map_err(|_| MobileClientError::PairingFailed)?,
+            ),
+        }))
+        .send()
+        .await
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    if !response.status().is_success() {
+        return Err(MobileClientError::PairingFailed);
+    }
+    let session: PairingSessionResponse = response
+        .json()
+        .await
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    if session.invitation_id != pending.claim.invitation_id
+        || session.space_id != pending.claim.space_id
+        || session.state != "completed"
+        || session.joiner_node_id.as_deref() != Some(identity.node_id().to_string().as_str())
+        || session.subject_actor_id.as_deref()
+            != Some(identity.local_writer_actor_id().to_string().as_str())
+        || session.confirmation_octal.as_deref() != Some(pending.claim.confirmation_octal.as_str())
+        || session.grant_operation_id.as_deref() != Some(pending.claim.grant_operation_id.as_str())
+    {
+        return Err(MobileClientError::PairingFailed);
+    }
+    let session_id: PeerSessionId = pending
+        .claim
+        .invitation_id
+        .parse()
+        .map_err(|_| MobileClientError::PairingFailed)?;
+    client_runtime
+        .configure_paired_peer(
+            pending.responder_node_id,
+            pending.endpoint.clone(),
+            pending.space_id,
+            session_id,
+            pending.grant_operation_id,
+            pending.peer_transport_credential.clone(),
+        )
+        .await
+        .map_err(|_| MobileClientError::PairingFailed)
+}
+
+fn safe_pairing_endpoint(value: &str) -> Result<Url, MobileClientError> {
+    let mut url = Url::parse(value).map_err(|_| MobileClientError::InvalidPairingInvitation)?;
+    let host_is_local = url.host_str().is_some_and(is_local_network_host);
+    if url.scheme() != "http"
+        || !host_is_local
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(MobileClientError::InvalidPairingInvitation);
+    }
+    url.set_path("/");
+    Ok(url)
+}
+
+fn is_local_network_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| match address {
+            std::net::IpAddr::V4(address) => {
+                address.is_loopback() || address.is_private() || address.is_link_local()
+            }
+            std::net::IpAddr::V6(address) => {
+                address.is_loopback()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local()
+            }
+        })
+}
+
+fn endpoint_origin(url: &Url) -> String {
+    let mut value = url.clone();
+    value.set_path("");
+    value.to_string().trim_end_matches('/').to_owned()
+}
+
+fn unix_time_millis() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
 
 impl Drop for MobileClientCore {
@@ -614,6 +1000,12 @@ uniffi::setup_scaffolding!();
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+    use fractonica_data_model::CapabilityAction;
+    use fractonica_pairing::{
+        CapabilityGrantTemplate, InvitationParameters, IssuedInvitation, PairingReceipt,
+    };
+    use serde::Deserialize;
     use tempfile::tempdir;
 
     #[test]
@@ -637,6 +1029,143 @@ mod tests {
             OpaqueIdentity::decode(b"not-an-identity"),
             Err(MobileClientError::InvalidIdentity)
         ));
+    }
+
+    #[test]
+    fn pairing_transport_accepts_only_plain_http_local_network_origins() {
+        assert_eq!(
+            safe_pairing_endpoint("http://127.0.0.1:8787/path")
+                .expect("loopback")
+                .as_str(),
+            "http://127.0.0.1:8787/"
+        );
+        assert!(safe_pairing_endpoint("http://localhost:8787").is_ok());
+        assert!(safe_pairing_endpoint("http://192.168.1.20:8787").is_ok());
+        assert!(safe_pairing_endpoint("https://127.0.0.1:8787").is_err());
+        assert!(safe_pairing_endpoint("http://8.8.8.8:8787").is_err());
+        assert!(safe_pairing_endpoint("http://user@127.0.0.1:8787").is_err());
+        assert!(safe_pairing_endpoint("http://127.0.0.1:8787?secret=x").is_err());
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TestHandshakeRequest {
+        invitation_id: String,
+        frame_base64url: String,
+    }
+
+    struct TestResponder {
+        issued: IssuedInvitation,
+        responder_key: SigningKey,
+        grant_operation_id: OperationId,
+    }
+
+    async fn test_pairing_handshake(
+        State(state): State<Arc<Mutex<Option<TestResponder>>>>,
+        Json(request): Json<TestHandshakeRequest>,
+    ) -> Json<serde_json::Value> {
+        let fixture = state.lock().expect("fixture lock").take().expect("one use");
+        let descriptor = fixture.issued.invitation.descriptor();
+        assert_eq!(request.invitation_id, descriptor.invitation_id.to_string());
+        let first = URL_SAFE_NO_PAD
+            .decode(request.frame_base64url)
+            .expect("first frame");
+        let mut responder = fixture.issued.secret.start_responder().expect("responder");
+        let claim =
+            JoinerClaim::from_canonical_bytes(&responder.read_message(&first).expect("read claim"))
+                .expect("claim");
+        claim.verify_for(descriptor).expect("claim proof");
+        let response_frame = responder.write_message(&[]).expect("response");
+        let mut transport = responder.finish().expect("transport");
+        let receipt = PairingReceipt::sign(
+            descriptor,
+            &claim,
+            *transport.handshake_hash(),
+            [21; 32],
+            &fixture.responder_key,
+        );
+        let receipt_frame = transport
+            .write_message(&receipt.canonical_bytes().expect("receipt"))
+            .expect("receipt frame");
+        Json(serde_json::json!({
+            "responseFrameBase64url": URL_SAFE_NO_PAD.encode(response_frame),
+            "receiptFrameBase64url": URL_SAFE_NO_PAD.encode(receipt_frame),
+            "session": {
+                "invitationId": descriptor.invitation_id.to_string(),
+                "spaceId": descriptor.space_id.to_string(),
+                "state": "claimed",
+                "expiresAtUnixMs": descriptor.expires_at_unix_ms,
+                "joinerNodeId": claim.joiner_node_id.to_string(),
+                "subjectActorId": claim.subject_actor_id.to_string(),
+                "confirmationOctal": transport.confirmation_octal(),
+                "grantOperationId": fixture.grant_operation_id.to_string(),
+            }
+        }))
+    }
+
+    #[test]
+    fn mobile_joiner_verifies_a_real_noise_receipt_and_confirmation() {
+        let executor = Runtime::new().expect("runtime");
+        executor.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+            let now = unix_time_millis().expect("clock");
+            let responder_key = SigningKey::from_seed([11; 32]);
+            let issued = PairingInvitation::issue(
+                &responder_key,
+                InvitationParameters {
+                    space_id: SpaceId::from_bytes([12; 32]),
+                    genesis_operation_id: OperationId::from_bytes([13; 32]),
+                    now_unix_ms: now,
+                    expires_at_unix_ms: now + 60_000,
+                    endpoint_hints: vec![endpoint.clone()],
+                    capability: CapabilityGrantTemplate {
+                        actions: vec![CapabilityAction::ReadSpace],
+                        schemas: vec![],
+                        visibilities: vec![],
+                        content_roles: vec![],
+                        max_resource_byte_length: None,
+                        not_before_unix_ms: None,
+                        expires_at_unix_ms: None,
+                        delegation_depth: 0,
+                        label: "mobile test".to_owned(),
+                    },
+                },
+            )
+            .expect("invitation");
+            let qr = issued.invitation.to_qr_string().expect("qr");
+            let state = Arc::new(Mutex::new(Some(TestResponder {
+                issued,
+                responder_key,
+                grant_operation_id: OperationId::from_bytes([14; 32]),
+            })));
+            let server = tokio::spawn(
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/api/pairing/handshake", post(test_pairing_handshake))
+                        .with_state(state),
+                )
+                .into_future(),
+            );
+            let identity = IdentityBundle::from_keys(
+                SigningKey::from_seed([21; 32]),
+                SigningKey::from_seed([22; 32]),
+                SigningKey::from_seed([23; 32]),
+                SpaceId::from_bytes([24; 32]),
+            )
+            .expect("identity");
+            let invitation = PairingInvitation::decode(&qr, now).expect("decode invitation");
+            let result = claim_pairing(invitation, now, identity)
+                .await
+                .expect("verified claim");
+            assert_eq!(result.endpoint, endpoint);
+            assert_eq!(result.claim.confirmation_octal.len(), 10);
+            assert_eq!(result.grant_operation_id, OperationId::from_bytes([14; 32]));
+            server.abort();
+        });
     }
 
     #[test]

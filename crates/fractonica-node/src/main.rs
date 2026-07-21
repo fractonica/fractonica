@@ -17,7 +17,7 @@ use fractonica_node::{
     default_data_dir,
     durable_pairing::{DurablePairingStore, NodePairingControl},
     installation::{InstallationManifest, InstallationPhase, NodeInstallation},
-    validate_bind,
+    validate_bind_policy,
 };
 use fractonica_store_sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
@@ -34,6 +34,11 @@ struct Arguments {
     /// Loopback address used by the node API.
     #[arg(long, env = "FRACTONICA_BIND", default_value = "127.0.0.1:8789")]
     bind: SocketAddr,
+
+    /// Explicitly expose the authenticated node transport on private LAN
+    /// interfaces. This requires a supervisor-provided bootstrap bearer.
+    #[arg(long, default_value_t = false)]
+    allow_private_lan: bool,
 
     /// Runtime profile. `full` owns local storage; `saros` is a stateless,
     /// read-only Saros engine.
@@ -69,6 +74,11 @@ struct Arguments {
         hide_env_values = true
     )]
     bootstrap_token: Option<String>,
+
+    /// Optional supervisor process. A supervised node exits when this process
+    /// disappears, preventing an orphan from retaining the installation lock.
+    #[arg(long, hide = true)]
+    parent_pid: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -99,7 +109,11 @@ async fn main() -> Result<()> {
         .init();
 
     let arguments = Arguments::parse();
-    let bind = validate_bind(arguments.bind)?;
+    let bind = validate_bind_policy(
+        arguments.bind,
+        arguments.allow_private_lan,
+        arguments.bootstrap_token.is_some(),
+    )?;
     validate_profile_arguments(&arguments)?;
 
     // The guard remains in scope for the duration of the HTTP server. The
@@ -205,7 +219,7 @@ async fn main() -> Result<()> {
     }
 
     axum::serve(listener, fractonica_api::router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(arguments.parent_pid))
         .await
         .context("node HTTP server failed")?;
 
@@ -370,7 +384,22 @@ fn unix_time_millis() -> Result<i64> {
         .context("system clock is outside the supported Unix-millisecond range")
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(parent_pid: Option<u32>) {
+    let parent_shutdown = async move {
+        let Some(parent_pid) = parent_pid else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if !process_is_alive(parent_pid) {
+                tracing::warn!(parent_pid, "node supervisor disappeared");
+                return;
+            }
+        }
+    };
+
     #[cfg(unix)]
     {
         let mut terminate = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
@@ -391,13 +420,37 @@ async fn shutdown_signal() {
                 }
             }
             _ = terminate.recv() => {}
+            _ = parent_shutdown => {}
         }
     }
 
     #[cfg(not(unix))]
-    if let Err(error) = signal::ctrl_c().await {
-        tracing::error!(%error, "failed to install shutdown handler");
+    tokio::select! {
+        result = signal::ctrl_c() => {
+            if let Err(error) = result {
+                tracing::error!(%error, "failed to install shutdown handler");
+            }
+        }
+        _ = parent_shutdown => {}
     }
+}
+
+#[cfg(unix)]
+fn process_is_alive(process_id: u32) -> bool {
+    let Ok(process_id) = libc::pid_t::try_from(process_id) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs no mutation; it only asks the kernel whether
+    // the process exists and is visible to this user.
+    let result = unsafe { libc::kill(process_id, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_process_id: u32) -> bool {
+    // Tauri's child handle remains the Windows lifecycle boundary until an
+    // equivalent process-handle watcher is added there.
+    true
 }
 
 #[cfg(test)]

@@ -35,6 +35,9 @@ paths:
     post:
       tags: [Operations]
       summary: Admit a complete signed operation
+      security:
+        - bootstrapBearer: []
+        - pairedTransport: []
       description: >-
         Validates the JSON projection against the embedded deterministic-CBOR
         payload, recomputes the operation ID, verifies the exact COSE Sign1
@@ -375,6 +378,35 @@ paths:
         "403": { $ref: "#/components/responses/PairingConfirmationMismatch" }
         "404": { $ref: "#/components/responses/PairingNotFound" }
         "410": { $ref: "#/components/responses/PairingUnavailable" }
+  /api/pairing/invitations/{invitationId}/accept:
+    post:
+      tags: [Pairing]
+      summary: Accept the displayed transcript from the joining device
+      operationId: acceptPairingInvitation
+      security: []
+      description: >-
+        The joining node and actor dual-sign an acceptance bound to the exact
+        invitation, claim, Noise transcript, and planned grant. The grant is
+        admitted only after this proof verifies. Replays are harmless because
+        the pairing lifecycle and admitted grant operation are idempotent.
+      parameters:
+        - $ref: "#/components/parameters/InvitationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PairingAcceptRequest" }
+      responses:
+        "200":
+          description: The controller-signed capability grant was admitted and the session completed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairingSession" }
+        "400": { $ref: "#/components/responses/MalformedPairing" }
+        "404": { $ref: "#/components/responses/PairingNotFound" }
+        "410": { $ref: "#/components/responses/PairingUnavailable" }
+        "413": { $ref: "#/components/responses/PairingTooLarge" }
+        "503": { $ref: "#/components/responses/ProfileUnavailable" }
 components:
   securitySchemes:
     bootstrapBearer:
@@ -386,6 +418,15 @@ components:
         contract requires it exactly when the running process has a bootstrap
         token. It is not an actor identity, capability grant, operation
         signature, or replacement for signed-operation authorization.
+    pairedTransport:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >-
+        Pairing-scoped credential delivered only inside the encrypted Noise
+        receipt. The value is `Fractonica-Peer <invitationId>.<token>`. The
+        node stores only the token digest and rechecks the completed pairing
+        plus its active capability grant on every supported data-plane call.
   parameters:
     SpaceId:
       name: spaceId
@@ -1255,7 +1296,14 @@ components:
         sessionId: { type: string, pattern: '^[0-9a-f]{32}$' }
         nodeId: { $ref: "#/components/schemas/NodeId" }
         actorId: { $ref: "#/components/schemas/ActorId" }
-        grantOperationId: { $ref: "#/components/schemas/OperationId" }
+        grantOperationId:
+          allOf:
+            - $ref: "#/components/schemas/OperationId"
+          description: >-
+            Immutable id of the signed capability grant prepared after the
+            Noise claim. Before state is completed the operation is only a
+            plan and grants no authority; admission still requires explicit
+            confirmation of the matching octal transcript.
         after:
           type: integer
           format: int64
@@ -1320,6 +1368,12 @@ components:
       required: [confirmationOctal]
       properties:
         confirmationOctal: { type: string, pattern: '^[0-7]{10}$' }
+    PairingAcceptRequest:
+      type: object
+      additionalProperties: false
+      required: [acceptanceBase64url]
+      properties:
+        acceptanceBase64url: { type: string, minLength: 1, maxLength: 5464, pattern: '^[A-Za-z0-9_-]+$' }
     PairingHandshakeRequest:
       type: object
       additionalProperties: false

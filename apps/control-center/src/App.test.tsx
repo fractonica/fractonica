@@ -20,6 +20,7 @@ function deferred<T>() {
 function makeClient(readStatus: NodeClient["readStatus"]): NodeClient {
   return {
     baseUrl: "http://127.0.0.1:8789",
+    pairingEndpointHints: ["http://127.0.0.1:8789"],
     readStatus,
     createPairing: vi.fn(),
     readPairing: vi.fn(),
@@ -144,7 +145,9 @@ describe("control center", () => {
       qr: "fractonica-pairing:v1:Abc_123",
       session: created,
     });
-    vi.mocked(client.readPairing).mockResolvedValue(claimed);
+    vi.mocked(client.readPairing)
+      .mockResolvedValueOnce(created)
+      .mockResolvedValue(claimed);
     vi.mocked(client.confirmPairing).mockResolvedValue(completed);
     const user = userEvent.setup();
 
@@ -154,19 +157,27 @@ describe("control center", () => {
     await user.click(screen.getByRole("button", { name: "Create invitation" }));
 
     expect(await screen.findByText("Scan from the joining client")).toBeInTheDocument();
+    expect(screen.queryByText(invitationId)).not.toBeInTheDocument();
     expect(client.createPairing).toHaveBeenCalledWith(
-      expect.objectContaining({ spaceId, expiresInMs: 300_000 }),
+      expect.objectContaining({
+        spaceId,
+        expiresInMs: 300_000,
+        endpointHints: [client.baseUrl],
+      }),
     );
 
     await user.click(screen.getByRole("button", { name: "Check claim" }));
-    expect(await screen.findByText("Compare both glyphs")).toBeInTheDocument();
-    expect(screen.getByText("01234")).toBeInTheDocument();
-    expect(screen.getByText("56701")).toBeInTheDocument();
+    expect(await screen.findByText("Scan from the joining client")).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Codes match · authorize" }));
+    await user.click(screen.getByRole("button", { name: "Check claim" }));
+    expect(await screen.findByText("Compare both glyphs")).toBeInTheDocument();
+    expect(screen.getByLabelText("Confirmation code 0123456701")).toBeInTheDocument();
+
+    expect(screen.queryByText(claimed.joinerNodeId)).not.toBeInTheDocument();
+    vi.mocked(client.readPairing).mockResolvedValue(completed);
+    await user.click(screen.getByRole("button", { name: "Refresh status" }));
     expect(await screen.findByText("Device authorized")).toBeInTheDocument();
-    expect(screen.getByText(completed.grantOperationId)).toBeInTheDocument();
-    expect(client.confirmPairing).toHaveBeenCalledWith(invitationId, "0123456701");
+    expect(screen.queryByText(completed.grantOperationId)).not.toBeInTheDocument();
   });
 
   it("creates a record through the native local-first client", async () => {

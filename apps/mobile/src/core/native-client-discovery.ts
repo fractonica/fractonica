@@ -25,6 +25,8 @@ function isBridge(value: unknown): value is NativeClientBridge {
     typeof candidate.clientListRecords === "function" &&
     typeof candidate.clientGetRecord === "function" &&
     typeof candidate.clientCreateRecord === "function" &&
+    typeof candidate.clientClaimPairingInvitation === "function" &&
+    typeof candidate.clientAcceptPairingInvitation === "function" &&
     typeof candidate.clientResetLocalInstallation === "function"
   );
 }

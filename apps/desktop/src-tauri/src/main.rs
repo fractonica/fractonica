@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
+    collections::HashSet,
     ffi::OsString,
     fs,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
@@ -31,6 +32,7 @@ const CONNECTION_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 struct NodeConnection {
     base_url: String,
     bearer_token: String,
+    pairing_endpoint_hints: Vec<String>,
 }
 
 #[derive(Default)]
@@ -40,6 +42,7 @@ struct NodeSidecar {
     ready_file: Mutex<Option<PathBuf>>,
     client: Mutex<Option<Arc<ClientRuntime>>>,
     client_error: Mutex<Option<String>>,
+    stderr_tail: Mutex<String>,
 }
 
 #[derive(Serialize)]
@@ -151,6 +154,11 @@ async fn node_connection(sidecar: State<'_, NodeSidecar>) -> Result<NodeConnecti
             && let Some(connection) = connection.clone()
         {
             return Ok(connection);
+        }
+        if let Ok(error) = sidecar.client_error.lock()
+            && let Some(error) = error.clone()
+        {
+            return Err(error);
         }
         tokio::time::sleep(CONNECTION_WAIT_INTERVAL).await;
     }
@@ -432,6 +440,7 @@ fn main() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            supervise_development_parent(&handle);
             let application_data = app.path().app_data_dir()?;
             prepare_private_directory(&application_data)?;
             let node_data = application_data.join("node");
@@ -446,11 +455,14 @@ fn main() {
 
             let arguments = vec![
                 OsString::from("--bind"),
-                OsString::from("127.0.0.1:0"),
+                OsString::from("0.0.0.0:0"),
+                OsString::from("--allow-private-lan"),
                 OsString::from("--data-dir"),
                 node_data.as_os_str().to_owned(),
                 OsString::from("--ready-file"),
                 ready_file.as_os_str().to_owned(),
+                OsString::from("--parent-pid"),
+                OsString::from(std::process::id().to_string()),
             ];
             let command = handle
                 .shell()
@@ -473,12 +485,22 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 for _ in 0..CONNECTION_WAIT_ATTEMPTS {
                     if let Some(base_url) = read_private_loopback_endpoint(&ready_file) {
+                        let pairing_endpoint_hints = pairing_endpoint_hints(&base_url);
+                        eprintln!(
+                            "Fractonica node handoff ready at {base_url}; pairing endpoints: {}",
+                            if pairing_endpoint_hints.is_empty() {
+                                "none".to_owned()
+                            } else {
+                                pairing_endpoint_hints.join(", ")
+                            }
+                        );
                         if let Ok(mut connection) =
                             readiness_handle.state::<NodeSidecar>().connection.lock()
                         {
                             *connection = Some(NodeConnection {
                                 base_url: base_url.clone(),
                                 bearer_token: bearer_token.clone(),
+                                pairing_endpoint_hints,
                             });
                         }
                         match ClientRuntime::bootstrap_supervised(SupervisedNodeConfig {
@@ -537,7 +559,20 @@ fn main() {
                             eprint!("{}", String::from_utf8_lossy(&bytes));
                         }
                         tauri_plugin_shell::process::CommandEvent::Stderr(bytes) => {
-                            eprint!("{}", String::from_utf8_lossy(&bytes));
+                            let text = String::from_utf8_lossy(&bytes);
+                            eprint!("{text}");
+                            if let Ok(mut tail) =
+                                events_handle.state::<NodeSidecar>().stderr_tail.lock()
+                            {
+                                tail.push_str(&text);
+                                if tail.len() > 4_096 {
+                                    let mut boundary = tail.len() - 4_096;
+                                    while !tail.is_char_boundary(boundary) {
+                                        boundary += 1;
+                                    }
+                                    tail.drain(..boundary);
+                                }
+                            }
                         }
                         tauri_plugin_shell::process::CommandEvent::Terminated(status) => {
                             if let Ok(mut client) =
@@ -554,8 +589,19 @@ fn main() {
                             if let Ok(mut client_error) =
                                 events_handle.state::<NodeSidecar>().client_error.lock()
                             {
-                                *client_error =
-                                    Some("The supervised Fractonica node exited.".to_owned());
+                                let detail = events_handle
+                                    .state::<NodeSidecar>()
+                                    .stderr_tail
+                                    .lock()
+                                    .ok()
+                                    .map(|tail| tail.trim().to_owned())
+                                    .filter(|tail| !tail.is_empty());
+                                *client_error = Some(match detail {
+                                    Some(detail) => {
+                                        format!("The supervised Fractonica node exited: {detail}")
+                                    }
+                                    None => "The supervised Fractonica node exited.".to_owned(),
+                                });
                             }
                             if let Ok(mut child) = events_handle.state::<NodeSidecar>().child.lock()
                             {
@@ -580,12 +626,152 @@ fn main() {
     });
 }
 
+#[cfg(all(debug_assertions, unix))]
+fn supervise_development_parent(handle: &tauri::AppHandle) {
+    // `tauri dev` owns this process. If its CLI is interrupted or crashes,
+    // terminate the development app as well so it cannot keep the node lock
+    // while a later `pnpm desktop:dev` launch starts a replacement.
+    // SAFETY: getppid only reads process metadata.
+    let parent_pid = unsafe { libc::getppid() };
+    let handle = handle.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            // SAFETY: signal 0 performs an existence check without delivering
+            // a signal to the captured parent process.
+            if unsafe { libc::kill(parent_pid, 0) } != 0 {
+                handle.exit(0);
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(not(all(debug_assertions, unix)))]
+fn supervise_development_parent(_handle: &tauri::AppHandle) {}
+
 fn read_private_loopback_endpoint(path: &Path) -> Option<String> {
     let contents = fs::read_to_string(path).ok()?;
     let base_url = contents.trim();
     let authority = base_url.strip_prefix("http://")?;
     let address = SocketAddr::from_str(authority).ok()?;
     address.ip().is_loopback().then(|| base_url.to_owned())
+}
+
+fn pairing_endpoint_hints(control_base_url: &str) -> Vec<String> {
+    let Some(port) = control_base_url
+        .strip_prefix("http://")
+        .and_then(|authority| SocketAddr::from_str(authority).ok())
+        .map(|address| address.port())
+    else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+
+    // UDP connect performs route selection without sending traffic. Keep this
+    // fast cross-platform path, then augment it with direct interface
+    // enumeration on Unix because sandboxed app processes can lack a usable
+    // route even while Wi-Fi is connected.
+    for destination in ["192.0.2.1:9", "1.1.1.1:53", "8.8.8.8:53"] {
+        let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if socket.connect(destination).is_err() {
+            continue;
+        }
+        let Ok(address) = socket.local_addr() else {
+            continue;
+        };
+        let std::net::IpAddr::V4(ip) = address.ip() else {
+            continue;
+        };
+        if ip.is_private() || ip.is_link_local() {
+            candidates.push((interface_preference("route", ip), ip));
+        }
+    }
+    candidates.extend(private_interface_ipv4s());
+    candidates.sort_by_key(|(preference, ip)| (*preference, ip.octets()));
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|(_, ip)| seen.insert(ip).then_some(format!("http://{ip}:{port}")))
+        .take(3)
+        .collect()
+}
+
+fn interface_preference(name: &str, ip: Ipv4Addr) -> u8 {
+    let name = name.to_ascii_lowercase();
+    let virtual_interface = [
+        "awdl", "bridge", "docker", "llw", "tap", "tun", "utun", "veth", "vmnet",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix));
+    let physical_interface = name == "en0"
+        || name.starts_with("eth")
+        || name.starts_with("wlan")
+        || name.starts_with("wl");
+    let address_preference = match ip.octets() {
+        [192, 168, _, _] => 0,
+        [172, second, _, _] if (16..=31).contains(&second) => 1,
+        [10, _, _, _] => 2,
+        _ if ip.is_link_local() => 4,
+        _ => 3,
+    };
+    address_preference
+        + if physical_interface { 0 } else { 10 }
+        + if virtual_interface { 50 } else { 0 }
+}
+
+#[cfg(unix)]
+fn private_interface_ipv4s() -> Vec<(u8, Ipv4Addr)> {
+    use std::{ffi::CStr, ptr};
+
+    let mut head: *mut libc::ifaddrs = ptr::null_mut();
+    // SAFETY: getifaddrs initializes `head` on success. Every pointer is read
+    // only until the matching freeifaddrs call below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+        return Vec::new();
+    }
+
+    let mut addresses = Vec::new();
+    let mut current = head;
+    while !current.is_null() {
+        // SAFETY: `current` belongs to the live getifaddrs list.
+        let interface = unsafe { &*current };
+        let is_up = interface.ifa_flags & libc::IFF_UP as u32 != 0;
+        let is_loopback = interface.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
+        if is_up && !is_loopback && !interface.ifa_addr.is_null() {
+            // SAFETY: the family check precedes the sockaddr_in cast.
+            let family = unsafe { (*interface.ifa_addr).sa_family as i32 };
+            if family == libc::AF_INET {
+                // SAFETY: AF_INET entries use sockaddr_in and ifa_name is a
+                // NUL-terminated interface name owned by the list.
+                let address = unsafe { &*(interface.ifa_addr as *const libc::sockaddr_in) };
+                let ip = Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes());
+                if ip.is_private() || ip.is_link_local() {
+                    let name = if interface.ifa_name.is_null() {
+                        ""
+                    } else {
+                        // SAFETY: ifa_name is valid for the list lifetime.
+                        unsafe { CStr::from_ptr(interface.ifa_name) }
+                            .to_str()
+                            .unwrap_or("")
+                    };
+                    addresses.push((interface_preference(name, ip), ip));
+                }
+            }
+        }
+        current = interface.ifa_next;
+    }
+    // SAFETY: `head` was returned by a successful getifaddrs call.
+    unsafe { libc::freeifaddrs(head) };
+    addresses
+}
+
+#[cfg(not(unix))]
+fn private_interface_ipv4s() -> Vec<(u8, Ipv4Addr)> {
+    Vec::new()
 }
 
 fn prepare_private_directory(path: &Path) -> std::io::Result<()> {
@@ -668,5 +854,35 @@ mod tests {
         assert_eq!(serialized["startAtUnixMs"], 1_784_265_600_000_i64);
         assert!(serialized.get("endAtUnixMs").is_none());
         assert!(serialized.get("sortText").is_none());
+    }
+
+    #[test]
+    fn node_connection_wire_shape_is_camel_case() {
+        let serialized = serde_json::to_value(NodeConnection {
+            base_url: "http://127.0.0.1:49152".to_owned(),
+            bearer_token: "a".repeat(64),
+            pairing_endpoint_hints: vec!["http://192.168.1.12:49152".to_owned()],
+        })
+        .expect("connection serializes");
+
+        assert_eq!(serialized["baseUrl"], "http://127.0.0.1:49152");
+        assert_eq!(serialized["bearerToken"], "a".repeat(64));
+        assert_eq!(
+            serialized["pairingEndpointHints"],
+            serde_json::json!(["http://192.168.1.12:49152"])
+        );
+        assert!(serialized.get("base_url").is_none());
+    }
+
+    #[test]
+    fn physical_private_interfaces_are_preferred_for_pairing() {
+        assert!(
+            interface_preference("en0", Ipv4Addr::new(192, 168, 1, 20))
+                < interface_preference("utun3", Ipv4Addr::new(10, 0, 0, 2))
+        );
+        assert!(
+            interface_preference("wlan0", Ipv4Addr::new(10, 0, 0, 20))
+                < interface_preference("docker0", Ipv4Addr::new(192, 168, 65, 1))
+        );
     }
 }

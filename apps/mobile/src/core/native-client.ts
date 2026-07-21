@@ -5,6 +5,7 @@ import type {
   CommitResult,
   EntityReference,
   JsonValue,
+  PairingClaim,
   PublicRecordPayload,
   RecordDocument,
   ResourceReference,
@@ -40,6 +41,8 @@ export interface NativeClientPort {
   listRecords(limit?: number): Promise<ClientRecordPreview[]>;
   getRecord(operationId: string, entityId: string): Promise<ClientRecordDetail | undefined>;
   createRecord(payload: PublicRecordPayload): Promise<CommitResult>;
+  claimPairingInvitation(qr: string): Promise<PairingClaim>;
+  acceptPairingInvitation(invitationId: string): Promise<PairingClaim>;
   resetLocalInstallation(confirmation: LocalInstallationResetConfirmation): Promise<void>;
 }
 
@@ -49,6 +52,8 @@ export interface NativeClientBridge {
   clientListRecords(options: { limit: number }): Promise<unknown>;
   clientGetRecord(options: { operationId: string; entityId: string }): Promise<unknown>;
   clientCreateRecord(options: { payload: PublicRecordPayload }): Promise<unknown>;
+  clientClaimPairingInvitation(options: { qr: string }): Promise<unknown>;
+  clientAcceptPairingInvitation(options: { invitationId: string }): Promise<unknown>;
   clientResetLocalInstallation(options: { confirmation: string }): Promise<unknown>;
 }
 
@@ -62,6 +67,9 @@ const NODE_ID = /^node:ed25519:[0-9a-f]{64}$/;
 const ACTOR_ID = /^actor:ed25519:[0-9a-f]{64}$/;
 const SPACE_ID = /^space:[0-9a-f]{64}$/;
 const CONTENT_ID = /^sha-256:[0-9a-f]{64}$/;
+const INVITATION_ID = /^[0-9a-f]{32}$/;
+const CONFIRMATION_OCTAL = /^[0-7]{10}$/;
+const PAIRING_QR = /^fractonica-pairing:v1:[A-Za-z0-9_-]+$/;
 
 function contractError(message: string): never {
   throw new NativeContractError(message);
@@ -300,6 +308,78 @@ function decodeCommit(value: unknown): CommitResult {
   return value as unknown as CommitResult;
 }
 
+function decodePairingClaim(value: unknown): PairingClaim {
+  if (
+    !isObject(value) ||
+    !hasOnlyKeys(
+      value,
+      [
+        "invitationId",
+        "responderNodeId",
+        "spaceId",
+        "endpoint",
+        "confirmationOctal",
+        "grantOperationId",
+      ],
+      [],
+    ) ||
+    typeof value.invitationId !== "string" ||
+    !INVITATION_ID.test(value.invitationId) ||
+    typeof value.responderNodeId !== "string" ||
+    !NODE_ID.test(value.responderNodeId) ||
+    typeof value.spaceId !== "string" ||
+    !SPACE_ID.test(value.spaceId) ||
+    typeof value.endpoint !== "string" ||
+    !isPrivatePairingEndpoint(value.endpoint) ||
+    typeof value.confirmationOctal !== "string" ||
+    !CONFIRMATION_OCTAL.test(value.confirmationOctal) ||
+    typeof value.grantOperationId !== "string" ||
+    !OPERATION_ID.test(value.grantOperationId)
+  ) {
+    contractError("The native pairing claim did not match the expected schema.");
+  }
+  return value as unknown as PairingClaim;
+}
+
+function isPrivatePairingEndpoint(value: string): boolean {
+  try {
+    const endpoint = new URL(value);
+    if (
+      endpoint.protocol !== "http:" ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.pathname !== "/" ||
+      endpoint.search ||
+      endpoint.hash ||
+      !endpoint.port
+    ) {
+      return false;
+    }
+    const port = Number(endpoint.port);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return false;
+    if (["localhost", "[::1]", "::1"].includes(endpoint.hostname)) return true;
+
+    const octets = endpoint.hostname.split(".").map(Number);
+    if (
+      octets.length !== 4 ||
+      octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+    ) {
+      return false;
+    }
+    const first = octets[0]!;
+    const second = octets[1]!;
+    return (
+      first === 127 ||
+      first === 10 ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168) ||
+      (first === 169 && second === 254)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function decodeRecordPreview(value: unknown): ClientRecordPreview {
   if (
     !isObject(value) ||
@@ -450,6 +530,20 @@ export function createNativeClientPort(bridge: NativeClientBridge): NativeClient
     createRecord: async (payload) => {
       assertPublicPayload(payload);
       return decodeCommit(await bridge.clientCreateRecord({ payload }));
+    },
+    claimPairingInvitation: async (qr) => {
+      if (!PAIRING_QR.test(qr) || utf8ByteLength(qr) > 8 * 1_024) {
+        contractError("Pairing requires a bounded Fractonica version 1 invitation.");
+      }
+      return decodePairingClaim(await bridge.clientClaimPairingInvitation({ qr }));
+    },
+    acceptPairingInvitation: async (invitationId) => {
+      if (!INVITATION_ID.test(invitationId)) {
+        contractError("Pairing acceptance requires a canonical invitation identifier.");
+      }
+      return decodePairingClaim(
+        await bridge.clientAcceptPairingInvitation({ invitationId }),
+      );
     },
     resetLocalInstallation: async (confirmation) => {
       if (
