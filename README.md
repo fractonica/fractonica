@@ -60,7 +60,9 @@ pnpm node:dev
 ```
 
 The standalone node listens on `http://127.0.0.1:8789` by default. The desktop
-application uses a private random loopback port instead. Useful endpoints:
+application uses the same stable port: loopback remains its private control
+plane, while authenticated pairing traffic is reachable on the private LAN.
+Keeping the port stable is part of the durable device-link contract. Useful endpoints:
 
 - `GET /health/live`
 - `GET /health/ready`

@@ -29,6 +29,9 @@ use uuid::Uuid;
 
 const CONNECTION_WAIT_ATTEMPTS: usize = 100;
 const CONNECTION_WAIT_INTERVAL: Duration = Duration::from_millis(50);
+/// Paired devices persist the authenticated endpoint, so the desktop node must
+/// not ask the OS for a different ephemeral port after every restart.
+const DESKTOP_NODE_BIND: &str = "0.0.0.0:8789";
 const RESET_MARKER_FILE: &str = ".reset-local-installation";
 const RESET_MARKER_BYTES: &[u8] = b"fractonica-reset-local-installation-v1\n";
 
@@ -590,7 +593,7 @@ fn main() {
 
             let arguments = vec![
                 OsString::from("--bind"),
-                OsString::from("0.0.0.0:0"),
+                OsString::from(DESKTOP_NODE_BIND),
                 OsString::from("--allow-private-lan"),
                 OsString::from("--data-dir"),
                 node_data.as_os_str().to_owned(),

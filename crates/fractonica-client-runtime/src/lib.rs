@@ -347,6 +347,13 @@ impl ClientRuntime {
                 active
             }
         };
+        // A restarted desktop must immediately retry durable work for the
+        // workspace it was using before shutdown. This is especially
+        // important after a peer credential was replaced while deliveries
+        // were offline or rejected.
+        if let Some(peer_id) = active.peer_id {
+            store.requeue_unacknowledged_peer_space(peer_id, active.space_id, now)?;
+        }
         if store
             .operation(active.authorization_operation_id)?
             .is_none()
@@ -604,14 +611,18 @@ impl ClientRuntime {
         let invitation = PairingInvitation::decode(&qr, now)
             .map_err(|_| ClientRuntimeError::InvalidPairingInvitation)?;
         let invitation_id = invitation.descriptor().invitation_id.to_string();
-        if let Some(existing) = self
-            .pending_pairings
-            .lock()
-            .map_err(|_| ClientRuntimeError::LifecycleLock)?
-            .get(&invitation_id)
-            .cloned()
         {
-            return Ok(existing.claim);
+            let mut pending = self
+                .pending_pairings
+                .lock()
+                .map_err(|_| ClientRuntimeError::LifecycleLock)?;
+            // Pending ceremonies are intentionally ephemeral. Scanning a new
+            // invitation abandons an older failed/cancelled attempt so the app
+            // never needs to be relaunched to begin again.
+            pending.retain(|id, _| id == &invitation_id);
+            if let Some(existing) = pending.get(&invitation_id).cloned() {
+                return Ok(existing.claim);
+            }
         }
 
         let mut pending =
@@ -804,6 +815,7 @@ impl ClientRuntime {
                     start_after: 0,
                     next_pull_at_unix_ms: now,
                 })?;
+                store.requeue_unacknowledged_peer_space(peer_id, space_id, now)?;
                 Ok(())
             }
         })
@@ -973,6 +985,13 @@ fn bootstrap_standalone_blocking<S: StandaloneIdentityStore>(
             active
         }
     };
+    // Startup is an anti-entropy opportunity even before the inventory wire
+    // protocol is available. Reopen work that may have been terminally
+    // rejected by a stale/revoked transport credential so an already-paired
+    // installation repairs itself without requiring another pairing ceremony.
+    if let Some(peer_id) = active.peer_id {
+        store.requeue_unacknowledged_peer_space(peer_id, active.space_id, now)?;
+    }
     if store
         .operation(active.authorization_operation_id)?
         .is_none()
@@ -1409,9 +1428,9 @@ async fn claim_pairing(
                         "Fractonica pairing endpoint {endpoint} rejected the handshake with HTTP {}",
                         value.status()
                     ),
-                    Err(error) => eprintln!(
-                        "Fractonica pairing endpoint {endpoint} was unreachable: {error}"
-                    ),
+                    Err(error) => {
+                        eprintln!("Fractonica pairing endpoint {endpoint} was unreachable: {error}")
+                    }
                 }
             }
         }
@@ -1586,14 +1605,11 @@ async fn accept_pairing(
         "Fractonica pairing acceptance acknowledged by responder {}; validating completed session",
         pending.endpoint
     );
-    let session: PairingSessionResponse = response
-        .json()
-        .await
-        .map_err(|error| {
-            ClientRuntimeError::PairingCompletion(format!(
-                "responder returned an invalid completed session: {error}"
-            ))
-        })?;
+    let session: PairingSessionResponse = response.json().await.map_err(|error| {
+        ClientRuntimeError::PairingCompletion(format!(
+            "responder returned an invalid completed session: {error}"
+        ))
+    })?;
     if session.invitation_id != pending.claim.invitation_id
         || session.space_id != pending.claim.space_id
         || session.state != "completed"
@@ -1607,15 +1623,11 @@ async fn accept_pairing(
             "completed session did not match the authenticated claim".to_owned(),
         ));
     }
-    let session_id: PeerSessionId = pending
-        .claim
-        .invitation_id
-        .parse()
-        .map_err(|error| {
-            ClientRuntimeError::PairingCompletion(format!(
-                "completed session identifier is invalid: {error}"
-            ))
-        })?;
+    let session_id: PeerSessionId = pending.claim.invitation_id.parse().map_err(|error| {
+        ClientRuntimeError::PairingCompletion(format!(
+            "completed session identifier is invalid: {error}"
+        ))
+    })?;
     eprintln!(
         "Fractonica pairing session validated; bootstrapping admitted workspace from {}",
         pending.endpoint

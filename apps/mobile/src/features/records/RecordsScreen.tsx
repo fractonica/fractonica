@@ -326,6 +326,19 @@ function PairingModal({
     autoSubmitted.current = false;
   }, [open]);
 
+  useEffect(() => {
+    if (!open || !invitation) return;
+    // Deep links can replace a cancelled/failed invitation while this screen
+    // remains mounted. Treat the new signed payload as a fresh ceremony.
+    setQr(invitation);
+    setClaim(null);
+    setAccepted(false);
+    setError(null);
+    setWorking(false);
+    setRecordPolicy("merge");
+    autoSubmitted.current = false;
+  }, [invitation, open]);
+
   const submit = async (value = qr) => {
     if (!client || working) return;
     setWorking(true);

@@ -18,6 +18,7 @@ members = [
     "crates/fractonica-node",
     "crates/fractonica-pairing",
     "crates/fractonica-peer",
+    "crates/fractonica-replication",
     "crates/fractonica-saros-engine",
     "crates/fractonica-saros-geo",
     "crates/fractonica-space-bootstrap",
@@ -58,6 +59,7 @@ fractonica-keystore = { path = "crates/fractonica-keystore" }
 fractonica-mobile-ffi = { path = "crates/fractonica-mobile-ffi" }
 fractonica-pairing = { path = "crates/fractonica-pairing" }
 fractonica-peer = { path = "crates/fractonica-peer" }
+fractonica-replication = { path = "crates/fractonica-replication" }
 fractonica-saros-engine = { path = "crates/fractonica-saros-engine" }
 fractonica-saros-geo = { path = "crates/fractonica-saros-geo" }
 fractonica-space-bootstrap = { path = "crates/fractonica-space-bootstrap" }

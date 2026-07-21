@@ -742,6 +742,71 @@ fn retry_backoff_and_terminal_rejection_are_durable() {
 }
 
 #[test]
+fn a_new_peer_session_reopens_rejected_offline_history() {
+    let (store, signing_key, genesis) = seeded_store();
+    let peer = PeerConfig {
+        peer_id: key(15).node_id(),
+        endpoint: "https://repaired.example".into(),
+        enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: Some("old-session.token".into()),
+        added_at_unix_ms: 2,
+    };
+    store.upsert_peer(&peer).unwrap();
+    store
+        .configure_peer_space(&PeerSpaceConfig {
+            peer_id: peer.peer_id,
+            space_id: space(),
+            read_mode: PeerReadMode::Paired {
+                session_id: PeerSessionId::from_bytes([1; 16]),
+                grant_operation_id: genesis.operation_id,
+            },
+            start_after: 0,
+            next_pull_at_unix_ms: 2,
+        })
+        .unwrap();
+    let operation = record(
+        &signing_key,
+        entity(15),
+        Vec::new(),
+        genesis.operation_id,
+        15,
+        100,
+        "created while the peer was unavailable",
+    );
+    store.commit_local(&operation, 3).unwrap();
+    let lease = DeliveryLeaseId::new();
+    store
+        .lease_due(peer.peer_id, 3, Duration::from_secs(1), 10, lease)
+        .unwrap();
+    store
+        .reject(
+            peer.peer_id,
+            operation.operation_id,
+            lease,
+            4,
+            "old credential revoked",
+        )
+        .unwrap();
+
+    store
+        .requeue_unacknowledged_peer_space(peer.peer_id, space(), 5)
+        .unwrap();
+    let replay = store
+        .lease_due(
+            peer.peer_id,
+            5,
+            Duration::from_secs(1),
+            10,
+            DeliveryLeaseId::new(),
+        )
+        .unwrap();
+    assert!(replay.iter().any(|item| item.operation == operation));
+    assert_eq!(store.outbox_counts(peer.peer_id).unwrap().rejected, 0);
+}
+
+#[test]
 fn missing_dependencies_roll_back_without_partial_history() {
     let store = ClientSqliteStore::open_in_memory().unwrap();
     let signing_key = key(7);

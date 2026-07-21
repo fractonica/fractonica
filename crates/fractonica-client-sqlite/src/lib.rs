@@ -870,6 +870,77 @@ impl ClientSqliteStore {
         Ok(())
     }
 
+    /// Reopens durable work that did not receive an acknowledgement from a
+    /// peer after a new authenticated session has been installed.
+    ///
+    /// A rejection is terminal only for the credential/session that produced
+    /// it. Re-pairing may replace a revoked credential, so leaving those rows
+    /// rejected would permanently strand valid offline operations and media.
+    pub fn requeue_unacknowledged_peer_space(
+        &self,
+        peer_id: NodeId,
+        space_id: SpaceId,
+        now_unix_ms: i64,
+    ) -> Result<(), ClientStoreError> {
+        if now_unix_ms < 0 {
+            return Err(ClientStoreError::NegativeTimestamp);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let configured = transaction
+            .query_row(
+                "SELECT 1 FROM client_peer_spaces WHERE peer_id=?1 AND space_id=?2",
+                params![peer_id.to_string(), space_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !configured {
+            return Err(ClientStoreError::UnknownPeer(peer_id));
+        }
+
+        transaction.execute(
+            "INSERT OR IGNORE INTO client_deliveries (
+                peer_id, operation_id, state, next_attempt_at_unix_ms
+             ) SELECT ?1, operation_id, 'pending', ?3 FROM client_operations
+                WHERE space_id=?2
+                  AND schema_id IN ('record','event','tag','profile')",
+            params![peer_id.to_string(), space_id.to_string(), now_unix_ms,],
+        )?;
+        transaction.execute(
+            "UPDATE client_deliveries SET
+                state='pending', attempt_count=0, next_attempt_at_unix_ms=?3,
+                lease_id=NULL, lease_expires_at_unix_ms=NULL,
+                acknowledged_at_unix_ms=NULL, last_error=NULL
+             WHERE peer_id=?1 AND state<>'acknowledged' AND operation_id IN (
+                SELECT operation_id FROM client_operations WHERE space_id=?2
+             )",
+            params![peer_id.to_string(), space_id.to_string(), now_unix_ms,],
+        )?;
+
+        queue_known_resources_for_peer_space(&transaction, peer_id, space_id, now_unix_ms)?;
+        transaction.execute(
+            "UPDATE client_resource_transfers SET
+                state=CASE
+                    WHEN (SELECT locally_available FROM client_resources resource
+                          WHERE resource.content_id=client_resource_transfers.content_id)=1
+                    THEN 'pending' ELSE 'waiting_local' END,
+                attempt_count=0, next_attempt_at_unix_ms=?3,
+                lease_id=NULL, lease_expires_at_unix_ms=NULL,
+                remote_upload_url=NULL, transferred_bytes=0,
+                completed_at_unix_ms=NULL, last_error=NULL
+             WHERE peer_id=?1 AND direction='upload' AND state<>'complete'
+               AND content_id IN (
+                 SELECT link.content_id FROM client_operation_resources link
+                 JOIN client_operations operation USING(operation_id)
+                 WHERE operation.space_id=?2
+               )",
+            params![peer_id.to_string(), space_id.to_string(), now_unix_ms,],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn due_sync_targets(
         &self,
         now_unix_ms: i64,
