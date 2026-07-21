@@ -346,7 +346,7 @@ internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
         }
     }
 }
-// Initial value and increment amount for handles.
+// Initial value and increment amount for handles. 
 // These ensure that Kotlin-generated handles always have the lowest bit set
 private const val UNIFFI_HANDLEMAP_INITIAL = 1.toLong()
 private const val UNIFFI_HANDLEMAP_DELTA = 2.toLong()
@@ -356,7 +356,7 @@ private const val UNIFFI_HANDLEMAP_DELTA = 2.toLong()
 // This is used pass an opaque 64-bit handle representing a foreign object to the Rust code.
 internal class UniffiHandleMap<T: Any> {
     private val map = ConcurrentHashMap<Long, T>()
-    // Start
+    // Start 
     private val counter = java.util.concurrent.atomic.AtomicLong(UNIFFI_HANDLEMAP_INITIAL)
 
     val size: Int
@@ -704,62 +704,62 @@ internal object IntegrityCheckingUniffiLib {
     external fun ffi_fractonica_mobile_ffi_uniffi_contract_version(
     ): Int
 
-
+        
 }
 
 internal object UniffiLib {
-
+    
     // The Cleaner for the whole library
     internal val CLEANER: UniffiCleaner by lazy {
         UniffiCleaner.create()
     }
-
+    
 
     init {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "fractonica_mobile_ffi"))
-
+        
     }
-    external fun uniffi_fractonica_mobile_ffi_fn_clone_mobileclientbootstrap(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_clone_mobileclientbootstrap(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-    external fun uniffi_fractonica_mobile_ffi_fn_free_mobileclientbootstrap(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_free_mobileclientbootstrap(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_fractonica_mobile_ffi_fn_constructor_mobileclientbootstrap_new(`storageDir`: RustBuffer.ByValue,`displayName`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_constructor_mobileclientbootstrap_new(`storageDir`: RustBuffer.ByValue,`displayName`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_open(`ptr`: Long,`identityMaterial`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_open(`ptr`: Long,`identityMaterial`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_prepare(`ptr`: Long,`identityPresent`: Byte,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_prepare(`ptr`: Long,`identityPresent`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_reset_local_installation(`ptr`: Long,`confirmation`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_reset_local_installation(`ptr`: Long,`confirmation`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_fractonica_mobile_ffi_fn_clone_mobileclientcore(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_clone_mobileclientcore(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
-    external fun uniffi_fractonica_mobile_ffi_fn_free_mobileclientcore(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_free_mobileclientcore(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(`ptr`: Long,`invitationId`: RustBuffer.ByValue,`recordPolicy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(`ptr`: Long,`invitationId`: RustBuffer.ByValue,`recordPolicy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_claim_pairing_invitation(`ptr`: Long,`qr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_claim_pairing_invitation(`ptr`: Long,`qr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_create_public_record(`ptr`: Long,`payloadJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_create_public_record(`ptr`: Long,`payloadJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_get_record(`ptr`: Long,`operationId`: RustBuffer.ByValue,`entityId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_get_record(`ptr`: Long,`operationId`: RustBuffer.ByValue,`entityId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_list_records(`ptr`: Long,`limit`: Int,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_list_records(`ptr`: Long,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_func_generate_identity_material(uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_func_generate_identity_material(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_fractonica_mobile_ffi_fn_func_mobile_core_bridge_status(uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_func_mobile_core_bridge_status(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun ffi_fractonica_mobile_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun ffi_fractonica_mobile_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun ffi_fractonica_mobile_ffi_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -767,7 +767,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_u8(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -775,7 +775,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_i8(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -783,7 +783,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_u16(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -791,7 +791,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_i16(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Short
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -799,7 +799,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_u32(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -807,7 +807,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_i32(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -815,7 +815,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_u64(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -823,7 +823,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_i64(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -831,7 +831,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_f32(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Float
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -839,7 +839,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_f64(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Double
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -847,7 +847,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_rust_buffer(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_fractonica_mobile_ffi_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -855,10 +855,10 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_fractonica_mobile_ffi_rust_future_free_void(`handle`: Long,
     ): Unit
-    external fun ffi_fractonica_mobile_ffi_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun ffi_fractonica_mobile_ffi_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
 
-
+        
 }
 
 private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
@@ -986,7 +986,7 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
         }
     }
 
-/**
+/** 
  * Placeholder object used to signal that we're constructing an interface with a FFI handle.
  *
  * This is the first argument for interface constructors that input a raw handle. It exists is that
@@ -997,7 +997,7 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
  * */
 object UniffiWithHandle
 
-/**
+/** 
  * Used to instantiate an interface without an actual pointer, for fakes in tests, mostly.
  *
  * @suppress
@@ -1337,11 +1337,11 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
  * platform module and is never returned to JavaScript.
  */
 public interface MobileClientBootstrapInterface {
-
+    
     fun `open`(`identityMaterial`: kotlin.ByteArray): MobileClientCore
-
+    
     fun `prepare`(`identityPresent`: kotlin.Boolean): MobileIdentityAction
-
+    
     /**
      * Deletes this client's app-private database and content only after the
      * native adapter supplies the explicit destructive confirmation token.
@@ -1350,7 +1350,7 @@ public interface MobileClientBootstrapInterface {
      * identity while its old database is still present.
      */
     fun `resetLocalInstallation`(`confirmation`: kotlin.String)
-
+    
     companion object
 }
 
@@ -1383,11 +1383,11 @@ open class MobileClientBootstrap: Disposable, AutoCloseable, MobileClientBootstr
         this.cleanable = null
     }
     constructor(`storageDir`: kotlin.String, `displayName`: kotlin.String) :
-        this(UniffiWithHandle,
+        this(UniffiWithHandle, 
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_constructor_mobileclientbootstrap_new(
-
-
+    
+        
         FfiConverterString.lower(`storageDir`),
         FfiConverterString.lower(`displayName`),_status)
 }
@@ -1469,37 +1469,37 @@ open class MobileClientBootstrap: Disposable, AutoCloseable, MobileClientBootstr
         }
     }
 
-
+    
     @Throws(MobileClientException::class)override fun `open`(`identityMaterial`: kotlin.ByteArray): MobileClientCore {
             return FfiConverterTypeMobileClientCore.lift(
     callWithHandle {
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_open(
         it,
-
+        
         FfiConverterByteArray.lower(`identityMaterial`),_status)
 }
     }
     )
     }
+    
 
-
-
+    
     @Throws(MobileClientException::class)override fun `prepare`(`identityPresent`: kotlin.Boolean): MobileIdentityAction {
             return FfiConverterTypeMobileIdentityAction.lift(
     callWithHandle {
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_prepare(
         it,
-
+        
         FfiConverterBoolean.lower(`identityPresent`),_status)
 }
     }
     )
     }
+    
 
-
-
+    
     /**
      * Deletes this client's app-private database and content only after the
      * native adapter supplies the explicit destructive confirmation token.
@@ -1508,30 +1508,30 @@ open class MobileClientBootstrap: Disposable, AutoCloseable, MobileClientBootstr
      * identity while its old database is still present.
      */
     @Throws(MobileClientException::class)override fun `resetLocalInstallation`(`confirmation`: kotlin.String)
-        =
+        = 
     callWithHandle {
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientbootstrap_reset_local_installation(
         it,
-
+        
         FfiConverterString.lower(`confirmation`),_status)
 }
     }
+    
+    
+
+    
+
+    
 
 
-
-
-
-
-
-
-
-
+    
+    
     /**
      * @suppress
      */
     companion object
-
+    
 }
 
 
@@ -1655,7 +1655,7 @@ public object FfiConverterTypeMobileClientBootstrap: FfiConverter<MobileClientBo
 
 
 public interface MobileClientCoreInterface {
-
+    
     /**
      * Admits a claimed pairing only after the user has compared the complete
      * ten-octal transcript. The acceptance is dual-signed below JavaScript;
@@ -1664,7 +1664,7 @@ public interface MobileClientCoreInterface {
      * it without exposing transport credentials to JavaScript.
      */
     fun `acceptPairingInvitation`(`invitationId`: kotlin.String, `recordPolicy`: MobilePrePairRecordPolicy): MobilePairingClaim
-
+    
     /**
      * Claims a short-lived local-network invitation using the protected device
      * identity. The raw QR secret is used only for this call and is neither
@@ -1673,9 +1673,9 @@ public interface MobileClientCoreInterface {
      * inside the encrypted Noise receipt.
      */
     fun `claimPairingInvitation`(`qr`: kotlin.String): MobilePairingClaim
-
+    
     fun `createPublicRecord`(`payloadJson`: kotlin.String): MobileCommitResult
-
+    
     /**
      * Reads one exact live record head. Both identifiers are required so a
      * stale or mismatched list item fails closed instead of opening another
@@ -1683,13 +1683,13 @@ public interface MobileClientCoreInterface {
      * string across native/JavaScript boundaries.
      */
     fun `getRecord`(`operationId`: kotlin.String, `entityId`: kotlin.String): MobileRecordDetail?
-
+    
     fun `listRecords`(`limit`: kotlin.UInt): List<MobileRecordPreview>
-
+    
     fun `shutdown`()
-
+    
     fun `status`(): MobileClientStatus
-
+    
     companion object
 }
 
@@ -1794,7 +1794,7 @@ open class MobileClientCore: Disposable, AutoCloseable, MobileClientCoreInterfac
         }
     }
 
-
+    
     /**
      * Admits a claimed pairing only after the user has compared the complete
      * ten-octal transcript. The acceptance is dual-signed below JavaScript;
@@ -1808,16 +1808,16 @@ open class MobileClientCore: Disposable, AutoCloseable, MobileClientCoreInterfac
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(
         it,
-
+        
         FfiConverterString.lower(`invitationId`),
         FfiConverterTypeMobilePrePairRecordPolicy.lower(`recordPolicy`),_status)
 }
     }
     )
     }
+    
 
-
-
+    
     /**
      * Claims a short-lived local-network invitation using the protected device
      * identity. The raw QR secret is used only for this call and is neither
@@ -1831,30 +1831,30 @@ open class MobileClientCore: Disposable, AutoCloseable, MobileClientCoreInterfac
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_claim_pairing_invitation(
         it,
-
+        
         FfiConverterString.lower(`qr`),_status)
 }
     }
     )
     }
+    
 
-
-
+    
     @Throws(MobileClientException::class)override fun `createPublicRecord`(`payloadJson`: kotlin.String): MobileCommitResult {
             return FfiConverterTypeMobileCommitResult.lift(
     callWithHandle {
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_create_public_record(
         it,
-
+        
         FfiConverterString.lower(`payloadJson`),_status)
 }
     }
     )
     }
+    
 
-
-
+    
     /**
      * Reads one exact live record head. Both identifiers are required so a
      * stale or mismatched list item fails closed instead of opening another
@@ -1867,33 +1867,33 @@ open class MobileClientCore: Disposable, AutoCloseable, MobileClientCoreInterfac
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_get_record(
         it,
-
+        
         FfiConverterString.lower(`operationId`),
         FfiConverterString.lower(`entityId`),_status)
 }
     }
     )
     }
+    
 
-
-
+    
     @Throws(MobileClientException::class)override fun `listRecords`(`limit`: kotlin.UInt): List<MobileRecordPreview> {
             return FfiConverterSequenceTypeMobileRecordPreview.lift(
     callWithHandle {
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_list_records(
         it,
-
+        
         FfiConverterUInt.lower(`limit`),_status)
 }
     }
     )
     }
+    
 
-
-
+    
     @Throws(MobileClientException::class)override fun `shutdown`()
-        =
+        = 
     callWithHandle {
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_shutdown(
@@ -1901,8 +1901,8 @@ open class MobileClientCore: Disposable, AutoCloseable, MobileClientCoreInterfac
         _status)
 }
     }
-
-
+    
+    
 
     override fun `status`(): MobileClientStatus {
             return FfiConverterTypeMobileClientStatus.lift(
@@ -1915,20 +1915,20 @@ open class MobileClientCore: Disposable, AutoCloseable, MobileClientCoreInterfac
     }
     )
     }
+    
+
+    
+
+    
 
 
-
-
-
-
-
-
-
+    
+    
     /**
      * @suppress
      */
     companion object
-
+    
 }
 
 
@@ -1959,17 +1959,17 @@ public object FfiConverterTypeMobileClientCore: FfiConverter<MobileClientCore, L
 
 data class MobileBridgeStatus (
     val `apiVersion`: kotlin.UInt
-    ,
+    , 
     val `implementation`: kotlin.String
-    ,
+    , 
     val `rustCoreLinked`: kotlin.Boolean
-
+    
 ){
+    
 
+    
 
-
-
-
+    
     companion object
 }
 
@@ -2002,41 +2002,41 @@ public object FfiConverterTypeMobileBridgeStatus: FfiConverterRustBuffer<MobileB
 
 data class MobileClientStatus (
     val `phase`: kotlin.String
-    ,
+    , 
     val `nodeId`: kotlin.String?
-    ,
+    , 
     val `actorId`: kotlin.String?
-    ,
+    , 
     val `spaceId`: kotlin.String?
-    ,
+    , 
     val `syncRunning`: kotlin.Boolean
-    ,
+    , 
     val `cycle`: kotlin.ULong
-    ,
+    , 
     val `pendingOperations`: kotlin.ULong
-    ,
+    , 
     val `rejectedOperations`: kotlin.ULong
-    ,
+    , 
     val `waitingUploads`: kotlin.ULong
-    ,
+    , 
     val `pendingUploads`: kotlin.ULong
-    ,
+    , 
     val `pendingDownloads`: kotlin.ULong
-    ,
+    , 
     val `rejectedResources`: kotlin.ULong
-    ,
+    , 
     val `synchronizedBytes`: kotlin.ULong
-    ,
+    , 
     val `totalBytes`: kotlin.ULong
-    ,
+    , 
     val `lastError`: kotlin.String?
-
+    
 ){
+    
 
+    
 
-
-
-
+    
     companion object
 }
 
@@ -2105,19 +2105,19 @@ public object FfiConverterTypeMobileClientStatus: FfiConverterRustBuffer<MobileC
 
 data class MobileCommitResult (
     val `localSequence`: kotlin.ULong
-    ,
+    , 
     val `operationId`: kotlin.String
-    ,
+    , 
     val `replayed`: kotlin.Boolean
-    ,
+    , 
     val `queuedPeers`: kotlin.ULong
-
+    
 ){
+    
 
+    
 
-
-
-
+    
     companion object
 }
 
@@ -2158,25 +2158,25 @@ public object FfiConverterTypeMobileCommitResult: FfiConverterRustBuffer<MobileC
  */
 data class MobilePairingClaim (
     val `invitationId`: kotlin.String
-    ,
+    , 
     val `responderNodeId`: kotlin.String
-    ,
+    , 
     val `spaceId`: kotlin.String
-    ,
+    , 
     val `endpoint`: kotlin.String
-    ,
+    , 
     val `confirmationOctal`: kotlin.String
-    ,
+    , 
     val `grantOperationId`: kotlin.String
-    ,
+    , 
     val `localRecordCount`: kotlin.ULong
-
+    
 ){
+    
 
+    
 
-
-
-
+    
     companion object
 }
 
@@ -2221,40 +2221,40 @@ public object FfiConverterTypeMobilePairingClaim: FfiConverterRustBuffer<MobileP
 
 data class MobileRecordDetail (
     val `operationId`: kotlin.String
-    ,
+    , 
     val `entityId`: kotlin.String
-    ,
+    , 
     val `schema`: kotlin.String
-    ,
+    , 
     val `visibility`: kotlin.String
-    ,
+    , 
     val `conflicted`: kotlin.Boolean
-    ,
+    , 
     val `tombstone`: kotlin.Boolean
-    ,
+    , 
     val `startAtUnixMs`: kotlin.Long?
-    ,
+    , 
     val `endAtUnixMs`: kotlin.Long?
-    ,
+    , 
     val `sortText`: kotlin.String?
-    ,
+    , 
     val `resourceCount`: kotlin.ULong
-    ,
+    , 
     val `mediaBytes`: kotlin.ULong
-    ,
+    , 
     /**
      * Exact public `RecordDocument` JSON, bounded and kept opaque by native
      * wrappers so metadata integers are never rounded through NSNumber or
      * JavaScript Number. Private encrypted envelopes never cross this API.
      */
     val `documentJson`: kotlin.String?
-
+    
 ){
+    
 
+    
 
-
-
-
+    
     companion object
 }
 
@@ -2314,43 +2314,43 @@ public object FfiConverterTypeMobileRecordDetail: FfiConverterRustBuffer<MobileR
 
 data class MobileRecordPreview (
     val `operationId`: kotlin.String
-    ,
+    , 
     val `entityId`: kotlin.String
-    ,
+    , 
     val `schema`: kotlin.String
-    ,
+    , 
     val `visibility`: kotlin.String
-    ,
+    , 
     val `conflicted`: kotlin.Boolean
-    ,
+    , 
     val `tombstone`: kotlin.Boolean
-    ,
+    , 
     val `startAtUnixMs`: kotlin.Long?
-    ,
+    , 
     val `endAtUnixMs`: kotlin.Long?
-    ,
+    , 
     val `sortText`: kotlin.String?
-    ,
+    , 
     val `resourceCount`: kotlin.ULong
-    ,
+    , 
     val `mediaBytes`: kotlin.ULong
-    ,
+    , 
     /**
      * Bounded public display fields only. Metadata, references, resource
      * descriptors, and encrypted private content never cross list calls.
      */
     val `emoji`: kotlin.String?
-    ,
+    , 
     val `textPreview`: kotlin.String?
-    ,
+    , 
     val `previewTruncated`: kotlin.Boolean
-
+    
 ){
+    
 
+    
 
-
-
-
+    
     companion object
 }
 
@@ -2417,76 +2417,76 @@ public object FfiConverterTypeMobileRecordPreview: FfiConverterRustBuffer<Mobile
 
 
 sealed class MobileClientException: kotlin.Exception() {
-
+    
     class InvalidIdentity(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class InvalidConfiguration(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class InvalidRecord(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class AlreadyOpened(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class RecoveryRequired(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class InitializationFailed(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class RandomSourceUnavailable(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class OperationFailed(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class InvalidPairingInvitation(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
-
+    
     class PairingFailed(
         ) : MobileClientException() {
         override val message
             get() = ""
     }
+    
 
-
-
+    
 
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<MobileClientException> {
         override fun lift(error_buf: RustBuffer.ByValue): MobileClientException = FfiConverterTypeMobileClientError.lift(error_buf)
     }
 
-
+    
 }
 
 /**
@@ -2494,7 +2494,7 @@ sealed class MobileClientException: kotlin.Exception() {
  */
 public object FfiConverterTypeMobileClientError : FfiConverterRustBuffer<MobileClientException> {
     override fun read(buf: ByteBuffer): MobileClientException {
-
+        
 
         return when(buf.getInt()) {
             1 -> MobileClientException.InvalidIdentity()
@@ -2607,11 +2607,11 @@ public object FfiConverterTypeMobileClientError : FfiConverterRustBuffer<MobileC
 
 
 enum class MobileIdentityAction {
-
+    
     CREATE_OR_RESUME,
     OPEN_EXISTING;
 
-
+    
 
 
     companion object
@@ -2623,9 +2623,9 @@ enum class MobileIdentityAction {
  */
 public object FfiConverterTypeMobileIdentityAction: FfiConverterRustBuffer<MobileIdentityAction> {
     override fun read(buf: ByteBuffer) = try {
-
+        
         MobileIdentityAction.entries[buf.getInt() - 1]
-
+        
     } catch (e: IndexOutOfBoundsException) {
         throw RuntimeException("invalid enum value, something is very wrong!!", e)
     }
@@ -2643,11 +2643,11 @@ public object FfiConverterTypeMobileIdentityAction: FfiConverterRustBuffer<Mobil
 
 
 enum class MobilePrePairRecordPolicy {
-
+    
     MERGE,
     DISCARD;
 
-
+    
 
 
     companion object
@@ -2659,9 +2659,9 @@ enum class MobilePrePairRecordPolicy {
  */
 public object FfiConverterTypeMobilePrePairRecordPolicy: FfiConverterRustBuffer<MobilePrePairRecordPolicy> {
     override fun read(buf: ByteBuffer) = try {
-
+        
         MobilePrePairRecordPolicy.entries[buf.getInt() - 1]
-
+        
     } catch (e: IndexOutOfBoundsException) {
         throw RuntimeException("invalid enum value, something is very wrong!!", e)
     }
@@ -2809,21 +2809,21 @@ public object FfiConverterSequenceTypeMobileRecordPreview: FfiConverterRustBuffe
             return FfiConverterByteArray.lift(
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_func_generate_identity_material(
-
+    
         _status)
 }
     )
     }
-
+    
  fun `mobileCoreBridgeStatus`(): MobileBridgeStatus {
             return FfiConverterTypeMobileBridgeStatus.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_func_mobile_core_bridge_status(
-
+    
         _status)
 }
     )
     }
-
+    
 
 

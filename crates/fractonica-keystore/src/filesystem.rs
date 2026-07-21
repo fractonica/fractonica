@@ -623,12 +623,14 @@ fn unprotect_key_material(
     role: KeyRole,
     path: &Path,
 ) -> Result<Zeroizing<[u8; MATERIAL_BYTES]>, FileKeyStoreError> {
-    let output = Zeroizing::new(fractonica_windows_protection::unprotect(bytes, key_entropy(role)).map_err(
-        |source| FileKeyStoreError::ProtectedMaterial {
-            path: path.to_owned(),
-            source,
-        },
-    )?);
+    let output = Zeroizing::new(
+        fractonica_windows_protection::unprotect(bytes, key_entropy(role)).map_err(|source| {
+            FileKeyStoreError::ProtectedMaterial {
+                path: path.to_owned(),
+                source,
+            }
+        })?,
+    );
     if output.len() == MATERIAL_BYTES {
         let mut material = Zeroizing::new([0; MATERIAL_BYTES]);
         material.copy_from_slice(&output);
@@ -1079,7 +1081,12 @@ mod tests {
             #[cfg(windows)]
             assert!(length > 32);
         }
-        assert_eq!(fs::metadata(identity_dir.join(SPACE_ID_FILE)).unwrap().len(), 32);
+        assert_eq!(
+            fs::metadata(identity_dir.join(SPACE_ID_FILE))
+                .unwrap()
+                .len(),
+            32
+        );
         assert_eq!(
             fs::read(identity_dir.join(MANIFEST_FILE)).unwrap(),
             MANIFEST_BYTES
@@ -1159,7 +1166,11 @@ mod tests {
         create_private_dir(&identity_dir);
         write_private(&identity_dir.join(STARTED_FILE), STARTED_BYTES);
         let seed = [7_u8; 32];
-        write_key(&identity_dir.join(NODE_TRANSPORT_FILE), &seed, KeyRole::NodeTransport);
+        write_key(
+            &identity_dir.join(NODE_TRANSPORT_FILE),
+            &seed,
+            KeyRole::NodeTransport,
+        );
         let expected = SigningKey::from_seed(seed).node_id();
 
         let loaded = FileKeyStore::new(&identity_dir).load_or_create().unwrap();
@@ -1201,9 +1212,21 @@ mod tests {
         let identity_dir = temporary.path().join("identity");
         create_private_dir(&identity_dir);
         write_private(&identity_dir.join(MANIFEST_FILE), MANIFEST_BYTES);
-        write_key(&identity_dir.join(NODE_TRANSPORT_FILE), &[1_u8; 32], KeyRole::NodeTransport);
-        write_key(&identity_dir.join(SPACE_CONTROLLER_FILE), &[2_u8; 32], KeyRole::SpaceController);
-        write_key(&identity_dir.join(LOCAL_WRITER_FILE), &[2_u8; 32], KeyRole::LocalWriter);
+        write_key(
+            &identity_dir.join(NODE_TRANSPORT_FILE),
+            &[1_u8; 32],
+            KeyRole::NodeTransport,
+        );
+        write_key(
+            &identity_dir.join(SPACE_CONTROLLER_FILE),
+            &[2_u8; 32],
+            KeyRole::SpaceController,
+        );
+        write_key(
+            &identity_dir.join(LOCAL_WRITER_FILE),
+            &[2_u8; 32],
+            KeyRole::LocalWriter,
+        );
         write_private(&identity_dir.join(SPACE_ID_FILE), &[3_u8; 32]);
         let error = FileKeyStore::new(&identity_dir)
             .load_or_create()
@@ -1220,9 +1243,21 @@ mod tests {
         let identity_dir = temporary.path().join("identity");
         create_private_dir(&identity_dir);
         write_private(&identity_dir.join(MANIFEST_FILE), MANIFEST_BYTES);
-        write_key(&identity_dir.join(NODE_TRANSPORT_FILE), &[1_u8; 32], KeyRole::NodeTransport);
-        write_key(&identity_dir.join(SPACE_CONTROLLER_FILE), &[2_u8; 32], KeyRole::SpaceController);
-        write_key(&identity_dir.join(LOCAL_WRITER_FILE), &[3_u8; 32], KeyRole::LocalWriter);
+        write_key(
+            &identity_dir.join(NODE_TRANSPORT_FILE),
+            &[1_u8; 32],
+            KeyRole::NodeTransport,
+        );
+        write_key(
+            &identity_dir.join(SPACE_CONTROLLER_FILE),
+            &[2_u8; 32],
+            KeyRole::SpaceController,
+        );
+        write_key(
+            &identity_dir.join(LOCAL_WRITER_FILE),
+            &[3_u8; 32],
+            KeyRole::LocalWriter,
+        );
         write_private(&identity_dir.join(SPACE_ID_FILE), &[0_u8; 32]);
         assert!(matches!(
             FileKeyStore::new(&identity_dir).load_or_create(),

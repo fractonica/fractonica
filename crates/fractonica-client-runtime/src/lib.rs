@@ -80,10 +80,12 @@ struct PendingPairing {
     responder_node_id: NodeId,
     space_id: SpaceId,
     endpoint: String,
-    claim_digest: [u8; 32],
-    handshake_hash: [u8; 32],
     grant_operation_id: OperationId,
     peer_transport_credential: String,
+    /// Exact signed acceptance bytes. Retries must replay this message rather
+    /// than generate a fresh nonce after the responder may already have
+    /// completed the one-shot invitation.
+    acceptance: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -671,26 +673,6 @@ impl ClientRuntime {
             peer_transport_credential: Some(peer_transport_credential),
             added_at_unix_ms: now,
         };
-        let peer_for_store = peer.clone();
-        blocking({
-            let store = store.clone();
-            move || {
-                store.upsert_peer(&peer_for_store)?;
-                store.configure_peer_space(&PeerSpaceConfig {
-                    peer_id,
-                    space_id,
-                    read_mode: PeerReadMode::Paired {
-                        session_id,
-                        grant_operation_id,
-                    },
-                    start_after: 0,
-                    next_pull_at_unix_ms: now,
-                })?;
-                Ok(())
-            }
-        })
-        .await?;
-
         // Pull from sequence zero before switching the authoring namespace.
         // This guarantees the remote genesis and exact admitted grant are
         // durable locally; a paired device never authors against an unseen
@@ -786,6 +768,29 @@ impl ClientRuntime {
                     .unwrap_or(after_local_sequence);
             }
         }
+        // Only publish the new peer session after its grant and any requested
+        // local import have succeeded. A failed re-pair therefore leaves the
+        // previous peer configuration untouched instead of exposing a
+        // half-configured credential/session to the background sync worker.
+        let peer_for_store = peer.clone();
+        blocking({
+            let store = store.clone();
+            move || {
+                store.upsert_peer(&peer_for_store)?;
+                store.configure_peer_space(&PeerSpaceConfig {
+                    peer_id,
+                    space_id,
+                    read_mode: PeerReadMode::Paired {
+                        session_id,
+                        grant_operation_id,
+                    },
+                    start_after: 0,
+                    next_pull_at_unix_ms: now,
+                })?;
+                Ok(())
+            }
+        })
+        .await?;
         store.set_active_workspace(ActiveWorkspace {
             space_id,
             authorization_operation_id: grant_operation_id,
@@ -1458,21 +1463,37 @@ async fn claim_pairing(
         grant_operation_id: grant_operation_id.clone(),
         local_record_count: 0,
     };
+    let mut acceptance_nonce = [0_u8; 32];
+    getrandom::fill(&mut acceptance_nonce)
+        .map_err(|_| ClientRuntimeError::RandomSourceUnavailable)?;
+    let parsed_grant_operation_id =
+        OperationId::parse(&grant_operation_id).map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let acceptance = PairingAcceptance::sign(
+        descriptor.invitation_id,
+        claim.digest(),
+        *transport.handshake_hash(),
+        descriptor.responder_node_id,
+        descriptor.space_id,
+        parsed_grant_operation_id,
+        identity.node_transport_key(),
+        identity.local_writer_key(),
+        acceptance_nonce,
+    )
+    .canonical_bytes()
+    .map_err(|_| ClientRuntimeError::PairingFailed)?;
     Ok(PendingPairing {
         claim: public,
         invitation_id: descriptor.invitation_id,
         responder_node_id: descriptor.responder_node_id,
         space_id: descriptor.space_id,
         endpoint,
-        claim_digest: claim.digest(),
-        handshake_hash: *transport.handshake_hash(),
-        grant_operation_id: OperationId::parse(&grant_operation_id)
-            .map_err(|_| ClientRuntimeError::PairingFailed)?,
+        grant_operation_id: parsed_grant_operation_id,
         peer_transport_credential: format!(
             "{}.{}",
             descriptor.invitation_id,
             URL_SAFE_NO_PAD.encode(receipt.peer_access_token())
         ),
+        acceptance,
     })
 }
 
@@ -1482,19 +1503,6 @@ async fn accept_pairing(
     record_policy: PrePairRecordPolicy,
 ) -> Result<(), ClientRuntimeError> {
     let identity = &runtime.custody.identity;
-    let mut nonce = [0_u8; 32];
-    getrandom::fill(&mut nonce).map_err(|_| ClientRuntimeError::RandomSourceUnavailable)?;
-    let acceptance = PairingAcceptance::sign(
-        pending.invitation_id,
-        pending.claim_digest,
-        pending.handshake_hash,
-        pending.responder_node_id,
-        pending.space_id,
-        pending.grant_operation_id,
-        identity.node_transport_key(),
-        identity.local_writer_key(),
-        nonce,
-    );
     let endpoint = Url::parse(&pending.endpoint).map_err(|_| ClientRuntimeError::PairingFailed)?;
     let url = endpoint
         .join(&format!(
@@ -1502,25 +1510,34 @@ async fn accept_pairing(
             pending.invitation_id
         ))
         .map_err(|_| ClientRuntimeError::PairingFailed)?;
-    let response = Client::builder()
+    let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|_| ClientRuntimeError::PairingFailed)?
-        .post(url)
-        .json(&serde_json::json!({
-            "acceptanceBase64url": URL_SAFE_NO_PAD.encode(
-                acceptance
-                    .canonical_bytes()
-                    .map_err(|_| ClientRuntimeError::PairingFailed)?,
-            ),
-        }))
-        .send()
-        .await
         .map_err(|_| ClientRuntimeError::PairingFailed)?;
-    if !response.status().is_success() {
-        return Err(ClientRuntimeError::PairingFailed);
+    let request = serde_json::json!({
+        "acceptanceBase64url": URL_SAFE_NO_PAD.encode(&pending.acceptance),
+    });
+    let mut response = None;
+    for attempt in 0..5_u32 {
+        match client.post(url.clone()).json(&request).send().await {
+            Ok(value) if value.status().is_success() => {
+                response = Some(value);
+                break;
+            }
+            // A responder may have completed the invitation even when its
+            // response was lost. Retrying the exact signed acceptance is
+            // idempotent; the completed session is returned on replay.
+            Ok(_) | Err(_) if attempt < 4 => {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    400_u64.saturating_mul(u64::from(attempt + 1)),
+                ))
+                .await;
+            }
+            Ok(_) | Err(_) => break,
+        }
     }
+    let response = response.ok_or(ClientRuntimeError::PairingFailed)?;
     let session: PairingSessionResponse = response
         .json()
         .await

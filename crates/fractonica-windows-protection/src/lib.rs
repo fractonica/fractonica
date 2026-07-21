@@ -60,8 +60,8 @@ fn transform(data: &[u8], entropy: &[u8], encrypt: bool) -> io::Result<Vec<u8>> 
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the successful API call returned `cbData` initialized bytes.
-    let result = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }
-        .to_vec();
+    let result =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
     // SAFETY: DPAPI documents LocalFree as the matching deallocator.
     unsafe { LocalFree(output.pbData.cast()) };
     Ok(result)
