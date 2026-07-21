@@ -150,18 +150,23 @@ final class FractonicaClientCoordinator {
       "endpoint": claim.endpoint,
       "confirmationOctal": claim.confirmationOctal,
       "grantOperationId": claim.grantOperationId,
+      "localRecordCount": try safeNumber(claim.localRecordCount),
     ]
   }
 
   func acceptPairingInvitation(options: [String: Any]) throws -> [String: Any] {
-    guard options.count == 1,
+    guard options.count == 2,
       let invitationId = options["invitationId"] as? String,
-      !invitationId.isEmpty
+      !invitationId.isEmpty,
+      let recordPolicyValue = options["recordPolicy"] as? String,
+      let recordPolicy = recordPolicyValue == "merge"
+        ? MobilePrePairRecordPolicy.merge
+        : recordPolicyValue == "discard" ? MobilePrePairRecordPolicy.discard : nil
     else {
       throw FractonicaClientModuleError.invalidRequest
     }
     let claim = try nativeCall {
-      try ensureClient().acceptPairingInvitation(invitationId: invitationId)
+      try ensureClient().acceptPairingInvitation(invitationId: invitationId, recordPolicy: recordPolicy)
     }
     return [
       "invitationId": claim.invitationId,
@@ -170,6 +175,7 @@ final class FractonicaClientCoordinator {
       "endpoint": claim.endpoint,
       "confirmationOctal": claim.confirmationOctal,
       "grantOperationId": claim.grantOperationId,
+      "localRecordCount": try safeNumber(claim.localRecordCount),
     ]
   }
 

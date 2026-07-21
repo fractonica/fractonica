@@ -15,6 +15,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fractonica_application::{
     SpaceDescriptor, StoredOperation, TrustedSpaceBootstrapRequest,
     validate_trusted_space_bootstrap,
@@ -35,6 +36,9 @@ use fractonica_data_model::{
     OperationId, ProfileDocument, ProtectedDocument, RecordDocument, SpaceId, TagDocument,
 };
 use fractonica_keystore::{FileKeyStore, FileKeyStoreError, IdentityBundle, KeyStore};
+use fractonica_pairing::{
+    InvitationId, JoinerClaim, PairingAcceptance, PairingInvitation, PairingReceipt,
+};
 use fractonica_peer::{PeerReadChangesFields, PeerReadChangesProof, PeerSessionId};
 use fractonica_space_bootstrap::build_trusted_space_bootstrap;
 use fractonica_sync::{
@@ -49,6 +53,38 @@ use tokio::{sync::watch, task::JoinHandle};
 const CLIENT_DATABASE_FILE: &str = "client.sqlite3";
 const CLIENT_CONTENT_DIRECTORY: &str = "content";
 pub const RECORD_MEDIA_ROLE: &str = "record.media";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrePairRecordPolicy {
+    Merge,
+    Discard,
+}
+
+/// Public, verified half of a pending pairing. Transport credentials and
+/// signing material remain inside the runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairingClaim {
+    pub invitation_id: String,
+    pub responder_node_id: String,
+    pub space_id: String,
+    pub endpoint: String,
+    pub confirmation_octal: String,
+    pub grant_operation_id: String,
+    pub local_record_count: u64,
+}
+
+#[derive(Clone)]
+struct PendingPairing {
+    claim: PairingClaim,
+    invitation_id: InvitationId,
+    responder_node_id: NodeId,
+    space_id: SpaceId,
+    endpoint: String,
+    claim_digest: [u8; 32],
+    handshake_hash: [u8; 32],
+    grant_operation_id: OperationId,
+    peer_transport_credential: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct SupervisedNodeConfig {
@@ -192,6 +228,7 @@ pub struct ClientRuntime {
     node_id: NodeId,
     actor_id: ActorId,
     local_space_id: SpaceId,
+    pending_pairings: Mutex<BTreeMap<String, PendingPairing>>,
     sync: RuntimeSync,
 }
 
@@ -295,12 +332,27 @@ impl ClientRuntime {
             start_after: 0,
             next_pull_at_unix_ms: now,
         })?;
-        store.set_active_workspace(ActiveWorkspace {
-            space_id: space.space_id,
-            authorization_operation_id: space.initial_grant_operation_id,
-            peer_id: Some(node_id),
-            activated_at_unix_ms: now,
-        })?;
+        let active = match store.active_workspace()? {
+            Some(active) => active,
+            None => {
+                let active = ActiveWorkspace {
+                    space_id: space.space_id,
+                    authorization_operation_id: space.initial_grant_operation_id,
+                    peer_id: Some(node_id),
+                    activated_at_unix_ms: now,
+                };
+                store.set_active_workspace(active)?;
+                active
+            }
+        };
+        if store
+            .operation(active.authorization_operation_id)?
+            .is_none()
+        {
+            return Err(ClientRuntimeError::MissingInstallationAnchor(
+                active.authorization_operation_id,
+            ));
+        }
 
         let content =
             ClientContentStore::open(config.client_data_dir.join(CLIENT_CONTENT_DIRECTORY))?;
@@ -308,7 +360,7 @@ impl ClientRuntime {
             identity: Arc::clone(&identity),
         };
         let author = Arc::new(OperationAuthor::new(
-            AuthoringContext::new(space.space_id, vec![space.initial_grant_operation_id])?,
+            AuthoringContext::new(active.space_id, vec![active.authorization_operation_id])?,
             custody.clone(),
             SystemAuthoringRuntime,
         ));
@@ -328,6 +380,7 @@ impl ClientRuntime {
             node_id,
             actor_id: identity.local_writer_actor_id(),
             local_space_id: space.space_id,
+            pending_pairings: Mutex::new(BTreeMap::new()),
             sync: RuntimeSync::Worker {
                 status: sync_status,
                 shutdown,
@@ -522,6 +575,76 @@ impl ClientRuntime {
         blocking(move || Ok(store.record(space_id, entity_id, operation_id)?)).await
     }
 
+    /// Number of current records in the installation's original standalone
+    /// space. This stays stable after pairing and is used to make the first
+    /// workspace transition an explicit user decision.
+    pub async fn pre_pair_record_count(&self) -> Result<u64, ClientRuntimeError> {
+        if self.active_space_id()? != self.local_space_id {
+            return Ok(0);
+        }
+        let store = self.store.clone();
+        let space_id = self.local_space_id;
+        blocking(move || Ok(store.record_import_count(space_id)?)).await
+    }
+
+    /// Claims a one-shot local-network invitation using the runtime's
+    /// protected node and actor keys. The verified transcript remains pending
+    /// until the user compares all ten octal digits and explicitly accepts it.
+    pub async fn claim_pairing_invitation(
+        &self,
+        qr: String,
+    ) -> Result<PairingClaim, ClientRuntimeError> {
+        const MAX_PAIRING_QR_BYTES: usize = 8 * 1_024;
+        if qr.is_empty() || qr.len() > MAX_PAIRING_QR_BYTES {
+            return Err(ClientRuntimeError::InvalidPairingInvitation);
+        }
+        let now = unix_time_millis()?;
+        let invitation = PairingInvitation::decode(&qr, now)
+            .map_err(|_| ClientRuntimeError::InvalidPairingInvitation)?;
+        let invitation_id = invitation.descriptor().invitation_id.to_string();
+        if let Some(existing) = self
+            .pending_pairings
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)?
+            .get(&invitation_id)
+            .cloned()
+        {
+            return Ok(existing.claim);
+        }
+
+        let mut pending =
+            claim_pairing(invitation, now, Arc::clone(&self.custody.identity)).await?;
+        pending.claim.local_record_count = self.pre_pair_record_count().await?;
+        let claim = pending.claim.clone();
+        self.pending_pairings
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)?
+            .insert(invitation_id, pending);
+        Ok(claim)
+    }
+
+    /// Completes a pending pairing after human transcript verification and
+    /// persists the remote node as a bidirectional operation/media peer.
+    pub async fn accept_pairing_invitation(
+        &self,
+        invitation_id: String,
+        record_policy: PrePairRecordPolicy,
+    ) -> Result<PairingClaim, ClientRuntimeError> {
+        let pending = self
+            .pending_pairings
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)?
+            .get(&invitation_id)
+            .cloned()
+            .ok_or(ClientRuntimeError::PairingNotPending)?;
+        accept_pairing(self, &pending, record_policy).await?;
+        self.pending_pairings
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)?
+            .remove(&invitation_id);
+        Ok(pending.claim)
+    }
+
     /// Persists a completed pairing as a bidirectional operation and media
     /// peer. The credential is Noise-delivered and scoped by the node to the
     /// completed pairing capability.
@@ -533,6 +656,7 @@ impl ClientRuntime {
         session_id: PeerSessionId,
         grant_operation_id: OperationId,
         peer_transport_credential: String,
+        record_policy: PrePairRecordPolicy,
     ) -> Result<(), ClientRuntimeError> {
         let endpoint = validate_paired_endpoint(&endpoint)?;
         let store = self.store.clone();
@@ -619,17 +743,55 @@ impl ClientRuntime {
                 "the paired node did not return the admitted capability grant",
             ));
         }
+        let author = Arc::new(OperationAuthor::new(
+            AuthoringContext::new(space_id, vec![grant_operation_id])?,
+            self.custody.clone(),
+            SystemAuthoringRuntime,
+        ));
+        if record_policy == PrePairRecordPolicy::Merge && self.local_space_id != space_id {
+            let mut after_local_sequence = 0;
+            loop {
+                let source_store = store.clone();
+                let source_space_id = self.local_space_id;
+                let batch = blocking(move || {
+                    Ok(source_store.record_import_batch(
+                        source_space_id,
+                        after_local_sequence,
+                        100,
+                    )?)
+                })
+                .await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for record in &batch {
+                    if let Some(existing) = store.entity(space_id, record.entity_id)? {
+                        let already_imported = existing.heads.len() == 1
+                            && matches!(
+                                &existing.heads[0].body,
+                                OperationBody::PutRecord { payload } if payload == &record.payload
+                            );
+                        if already_imported {
+                            continue;
+                        }
+                        return Err(ClientRuntimeError::PairingImportCollision(record.entity_id));
+                    }
+                    let operation =
+                        author.import_record(record.entity_id, record.payload.clone())?;
+                    store.commit_local(&operation, operation.occurred_at_unix_ms)?;
+                }
+                after_local_sequence = batch
+                    .last()
+                    .map(|record| record.local_sequence)
+                    .unwrap_or(after_local_sequence);
+            }
+        }
         store.set_active_workspace(ActiveWorkspace {
             space_id,
             authorization_operation_id: grant_operation_id,
             peer_id: Some(peer_id),
             activated_at_unix_ms: unix_time_millis()?,
         })?;
-        let author = Arc::new(OperationAuthor::new(
-            AuthoringContext::new(space_id, vec![grant_operation_id])?,
-            self.custody.clone(),
-            SystemAuthoringRuntime,
-        ));
         *self
             .author
             .lock()
@@ -815,6 +977,7 @@ fn bootstrap_standalone_blocking<S: StandaloneIdentityStore>(
             node_id: binding.node_id,
             actor_id: binding.local_writer_actor_id,
             local_space_id: binding.space_id,
+            pending_pairings: Mutex::new(BTreeMap::new()),
             sync: RuntimeSync::Static(Box::new(sync)),
         },
         custody,
@@ -1129,6 +1292,249 @@ fn validate_paired_endpoint(value: &str) -> Result<Url, ClientRuntimeError> {
     Ok(url)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingHandshakeResponse {
+    response_frame_base64url: String,
+    receipt_frame_base64url: String,
+    session: PairingSessionResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingSessionResponse {
+    invitation_id: String,
+    space_id: String,
+    state: String,
+    expires_at_unix_ms: i64,
+    joiner_node_id: Option<String>,
+    subject_actor_id: Option<String>,
+    confirmation_octal: Option<String>,
+    grant_operation_id: Option<String>,
+}
+
+async fn claim_pairing(
+    invitation: PairingInvitation,
+    now: i64,
+    identity: Arc<IdentityBundle>,
+) -> Result<PendingPairing, ClientRuntimeError> {
+    let descriptor = invitation.descriptor();
+    let endpoint = descriptor
+        .endpoint_hints
+        .iter()
+        .find_map(|hint| validate_paired_endpoint(hint).ok())
+        .ok_or(ClientRuntimeError::InvalidPairingInvitation)?;
+
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| ClientRuntimeError::RandomSourceUnavailable)?;
+    let claim = JoinerClaim::sign(
+        descriptor,
+        identity.node_transport_key(),
+        identity.local_writer_key(),
+        nonce,
+    );
+    let mut handshake = invitation
+        .start_initiator(now)
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let first_frame = handshake
+        .write_message(
+            &claim
+                .canonical_bytes()
+                .map_err(|_| ClientRuntimeError::PairingFailed)?,
+        )
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let url = endpoint
+        .join("api/pairing/handshake")
+        .map_err(|_| ClientRuntimeError::InvalidPairingInvitation)?;
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let request = serde_json::json!({
+        "invitationId": descriptor.invitation_id.to_string(),
+        "frameBase64url": URL_SAFE_NO_PAD.encode(&first_frame),
+    });
+
+    // iOS can suspend the original request while presenting its local-network
+    // permission sheet. The responder durably replays the exact Noise response
+    // for this exact frame, so retrying here is safe even if the first response
+    // was lost after the invitation had already been claimed.
+    let mut response = None;
+    for attempt in 0..5_u32 {
+        match client.post(url.clone()).json(&request).send().await {
+            Ok(value) => {
+                response = Some(value);
+                break;
+            }
+            Err(_) if attempt < 4 => {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    500_u64.saturating_mul(u64::from(attempt + 1)),
+                ))
+                .await;
+            }
+            Err(_) => return Err(ClientRuntimeError::PairingFailed),
+        }
+    }
+    let response = response.ok_or(ClientRuntimeError::PairingFailed)?;
+    if !response.status().is_success() {
+        return Err(ClientRuntimeError::PairingFailed);
+    }
+    let response: PairingHandshakeResponse = response
+        .json()
+        .await
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let response_frame = URL_SAFE_NO_PAD
+        .decode(response.response_frame_base64url)
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let receipt_frame = URL_SAFE_NO_PAD
+        .decode(response.receipt_frame_base64url)
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    if !handshake
+        .read_message(&response_frame)
+        .map_err(|_| ClientRuntimeError::PairingFailed)?
+        .is_empty()
+    {
+        return Err(ClientRuntimeError::PairingFailed);
+    }
+    let mut transport = handshake
+        .finish()
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let receipt = PairingReceipt::from_canonical_bytes(
+        &transport
+            .read_message(&receipt_frame)
+            .map_err(|_| ClientRuntimeError::PairingFailed)?,
+    )
+    .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    receipt
+        .verify_for(descriptor, &claim, transport.handshake_hash())
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+
+    let session = response.session;
+    let confirmation = transport.confirmation_octal().to_owned();
+    let expected_joiner_node_id = identity.node_id().to_string();
+    let expected_subject_actor_id = identity.local_writer_actor_id().to_string();
+    let grant_operation_id = session
+        .grant_operation_id
+        .ok_or(ClientRuntimeError::PairingFailed)?;
+    if session.invitation_id != descriptor.invitation_id.to_string()
+        || session.space_id != descriptor.space_id.to_string()
+        || session.state != "claimed"
+        || session.expires_at_unix_ms != descriptor.expires_at_unix_ms
+        || session.joiner_node_id.as_deref() != Some(expected_joiner_node_id.as_str())
+        || session.subject_actor_id.as_deref() != Some(expected_subject_actor_id.as_str())
+        || session.confirmation_octal.as_deref() != Some(confirmation.as_str())
+        || OperationId::parse(&grant_operation_id).is_err()
+    {
+        return Err(ClientRuntimeError::PairingFailed);
+    }
+
+    let endpoint = endpoint_origin(&endpoint);
+    let public = PairingClaim {
+        invitation_id: descriptor.invitation_id.to_string(),
+        responder_node_id: descriptor.responder_node_id.to_string(),
+        space_id: descriptor.space_id.to_string(),
+        endpoint: endpoint.clone(),
+        confirmation_octal: confirmation,
+        grant_operation_id: grant_operation_id.clone(),
+        local_record_count: 0,
+    };
+    Ok(PendingPairing {
+        claim: public,
+        invitation_id: descriptor.invitation_id,
+        responder_node_id: descriptor.responder_node_id,
+        space_id: descriptor.space_id,
+        endpoint,
+        claim_digest: claim.digest(),
+        handshake_hash: *transport.handshake_hash(),
+        grant_operation_id: OperationId::parse(&grant_operation_id)
+            .map_err(|_| ClientRuntimeError::PairingFailed)?,
+        peer_transport_credential: format!(
+            "{}.{}",
+            descriptor.invitation_id,
+            URL_SAFE_NO_PAD.encode(receipt.peer_access_token())
+        ),
+    })
+}
+
+async fn accept_pairing(
+    runtime: &ClientRuntime,
+    pending: &PendingPairing,
+    record_policy: PrePairRecordPolicy,
+) -> Result<(), ClientRuntimeError> {
+    let identity = &runtime.custody.identity;
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| ClientRuntimeError::RandomSourceUnavailable)?;
+    let acceptance = PairingAcceptance::sign(
+        pending.invitation_id,
+        pending.claim_digest,
+        pending.handshake_hash,
+        pending.responder_node_id,
+        pending.space_id,
+        pending.grant_operation_id,
+        identity.node_transport_key(),
+        identity.local_writer_key(),
+        nonce,
+    );
+    let endpoint = Url::parse(&pending.endpoint).map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let url = endpoint
+        .join(&format!(
+            "api/pairing/invitations/{}/accept",
+            pending.invitation_id
+        ))
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    let response = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| ClientRuntimeError::PairingFailed)?
+        .post(url)
+        .json(&serde_json::json!({
+            "acceptanceBase64url": URL_SAFE_NO_PAD.encode(
+                acceptance
+                    .canonical_bytes()
+                    .map_err(|_| ClientRuntimeError::PairingFailed)?,
+            ),
+        }))
+        .send()
+        .await
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    if !response.status().is_success() {
+        return Err(ClientRuntimeError::PairingFailed);
+    }
+    let session: PairingSessionResponse = response
+        .json()
+        .await
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    if session.invitation_id != pending.claim.invitation_id
+        || session.space_id != pending.claim.space_id
+        || session.state != "completed"
+        || session.joiner_node_id.as_deref() != Some(identity.node_id().to_string().as_str())
+        || session.subject_actor_id.as_deref()
+            != Some(identity.local_writer_actor_id().to_string().as_str())
+        || session.confirmation_octal.as_deref() != Some(pending.claim.confirmation_octal.as_str())
+        || session.grant_operation_id.as_deref() != Some(pending.claim.grant_operation_id.as_str())
+    {
+        return Err(ClientRuntimeError::PairingFailed);
+    }
+    let session_id: PeerSessionId = pending
+        .claim
+        .invitation_id
+        .parse()
+        .map_err(|_| ClientRuntimeError::PairingFailed)?;
+    runtime
+        .configure_paired_peer(
+            pending.responder_node_id,
+            pending.endpoint.clone(),
+            pending.space_id,
+            session_id,
+            pending.grant_operation_id,
+            pending.peer_transport_credential.clone(),
+            record_policy,
+        )
+        .await
+}
+
 fn endpoint_origin(endpoint: &Url) -> String {
     let mut origin = endpoint.clone();
     origin.set_path("");
@@ -1240,6 +1646,16 @@ pub enum ClientRuntimeError {
     LifecycleLock,
     #[error("paired workspace bootstrap failed: {0}")]
     PairingBootstrap(&'static str),
+    #[error("local record {0} already exists in the paired workspace")]
+    PairingImportCollision(EntityId),
+    #[error("pairing invitation is invalid or unsafe for local-network transport")]
+    InvalidPairingInvitation,
+    #[error("pairing ceremony failed")]
+    PairingFailed,
+    #[error("pairing invitation is not pending human confirmation")]
+    PairingNotPending,
+    #[error("secure random source is unavailable")]
+    RandomSourceUnavailable,
 }
 
 #[cfg(test)]

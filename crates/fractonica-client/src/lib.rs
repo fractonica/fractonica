@@ -214,6 +214,29 @@ where
         self.create(EntitySchema::Record, OperationBody::PutRecord { payload })
     }
 
+    /// Authors an imported record under its existing stable entity id.
+    ///
+    /// This is intentionally narrower than the normal create API. It lets a
+    /// local-first client move an unpaired record into a newly paired space
+    /// without breaking references to that entity. The destination must not
+    /// already contain the entity; callers establish that invariant while
+    /// importing.
+    pub fn import_record(
+        &self,
+        entity_id: EntityId,
+        payload: ProtectedDocument<RecordDocument>,
+    ) -> Result<OperationEnvelope, ClientError> {
+        if entity_id.as_uuid().is_nil() {
+            return Err(ClientError::Runtime(RuntimeError::NilEntityId));
+        }
+        self.author(
+            entity_id,
+            EntitySchema::Record,
+            Vec::new(),
+            OperationBody::PutRecord { payload },
+        )
+    }
+
     pub fn update_record(
         &self,
         entity: &ObservedEntity,

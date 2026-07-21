@@ -11,7 +11,9 @@ use std::{
     time::Duration,
 };
 
-use fractonica_client_runtime::{ClientRuntime, SupervisedNodeConfig};
+use fractonica_client_runtime::{
+    ClientRuntime, PairingClaim, PrePairRecordPolicy, SupervisedNodeConfig,
+};
 use fractonica_client_sqlite::{CommitResult, LocalEntitySummary, LocalRecordSummary};
 use fractonica_content::ResourceRef;
 use fractonica_data_model::{
@@ -76,6 +78,32 @@ struct CommitResponse {
     operation_id: String,
     replayed: bool,
     queued_peers: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingClaimResponse {
+    invitation_id: String,
+    responder_node_id: String,
+    space_id: String,
+    endpoint: String,
+    confirmation_octal: String,
+    grant_operation_id: String,
+    local_record_count: u64,
+}
+
+impl From<PairingClaim> for PairingClaimResponse {
+    fn from(value: PairingClaim) -> Self {
+        Self {
+            invitation_id: value.invitation_id,
+            responder_node_id: value.responder_node_id,
+            space_id: value.space_id,
+            endpoint: value.endpoint,
+            confirmation_octal: value.confirmation_octal,
+            grant_operation_id: value.grant_operation_id,
+            local_record_count: value.local_record_count,
+        }
+    }
 }
 
 impl From<CommitResult> for CommitResponse {
@@ -394,6 +422,36 @@ async fn client_import_attachments(
     Ok(resources)
 }
 
+#[tauri::command]
+async fn client_claim_pairing_invitation(
+    sidecar: State<'_, NodeSidecar>,
+    qr: String,
+) -> Result<PairingClaimResponse, String> {
+    Ok(client(&sidecar)?
+        .claim_pairing_invitation(qr)
+        .await
+        .map_err(command_error)?
+        .into())
+}
+
+#[tauri::command]
+async fn client_accept_pairing_invitation(
+    sidecar: State<'_, NodeSidecar>,
+    invitation_id: String,
+    record_policy: String,
+) -> Result<PairingClaimResponse, String> {
+    let record_policy = match record_policy.as_str() {
+        "merge" => PrePairRecordPolicy::Merge,
+        "discard" => PrePairRecordPolicy::Discard,
+        _ => return Err("The pre-pair record policy is invalid.".to_owned()),
+    };
+    Ok(client(&sidecar)?
+        .accept_pairing_invitation(invitation_id, record_policy)
+        .await
+        .map_err(command_error)?
+        .into())
+}
+
 fn client(sidecar: &NodeSidecar) -> Result<Arc<ClientRuntime>, String> {
     sidecar
         .client
@@ -437,6 +495,8 @@ fn main() {
             client_list,
             client_list_records,
             client_import_attachments,
+            client_claim_pairing_invitation,
+            client_accept_pairing_invitation,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

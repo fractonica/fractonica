@@ -113,4 +113,29 @@ describe("native client core adapter", () => {
     await expect(malformed.importAttachments(64)).rejects.toThrow("expected schema");
     await expect(client.importAttachments(0)).rejects.toThrow("between 1 and 64");
   });
+
+  it("claims and accepts pairing below the desktop JavaScript boundary", async () => {
+    const claim = {
+      invitationId: "1".repeat(32),
+      responderNodeId: `node:ed25519:${"2".repeat(64)}`,
+      spaceId: `space:${"3".repeat(64)}`,
+      endpoint: "http://192.168.1.20:8787",
+      confirmationOctal: "0123456701",
+      grantOperationId: `sha-256:${"4".repeat(64)}`,
+      localRecordCount: 3,
+    };
+    const invoke = vi.fn().mockResolvedValue(claim);
+    const client = createClientCore(invoke);
+    const invitation = "fractonica-pairing:v1:Abc_123";
+
+    await expect(client.claimPairing(invitation)).resolves.toEqual(claim);
+    await expect(client.acceptPairing(claim.invitationId, "merge")).resolves.toEqual(claim);
+    expect(invoke).toHaveBeenNthCalledWith(1, "client_claim_pairing_invitation", {
+      qr: invitation,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "client_accept_pairing_invitation", {
+      invitationId: claim.invitationId,
+      recordPolicy: "merge",
+    });
+  });
 });

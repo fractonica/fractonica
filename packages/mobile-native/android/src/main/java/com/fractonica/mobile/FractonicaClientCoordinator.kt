@@ -7,6 +7,7 @@ import com.fractonica.mobile.core.MobileClientException
 import com.fractonica.mobile.core.MobileClientStatus
 import com.fractonica.mobile.core.MobileIdentityAction
 import com.fractonica.mobile.core.MobilePairingClaim
+import com.fractonica.mobile.core.MobilePrePairRecordPolicy
 import com.fractonica.mobile.core.MobileRecordDetail
 import com.fractonica.mobile.core.MobileRecordPreview
 import com.fractonica.mobile.core.generateIdentityMaterial
@@ -88,11 +89,16 @@ internal class FractonicaClientCoordinator(context: Context) {
 
   @Synchronized
   fun acceptPairingInvitation(options: Map<String, Any?>): Map<String, Any> {
-    if (options.size != 1) throw invalidRequest()
+    if (options.size != 2) throw invalidRequest()
     val invitationId = options["invitationId"] as? String ?: throw invalidRequest()
     if (invitationId.isEmpty()) throw invalidRequest()
+    val recordPolicy = when (options["recordPolicy"] as? String) {
+      "merge" -> MobilePrePairRecordPolicy.MERGE
+      "discard" -> MobilePrePairRecordPolicy.DISCARD
+      else -> throw invalidRequest()
+    }
     return nativeCall {
-      pairingClaimMap(ensureClient().acceptPairingInvitation(invitationId))
+      pairingClaimMap(ensureClient().acceptPairingInvitation(invitationId, recordPolicy))
     }
   }
 
@@ -253,6 +259,7 @@ internal class FractonicaClientCoordinator(context: Context) {
     "endpoint" to claim.endpoint,
     "confirmationOctal" to claim.confirmationOctal,
     "grantOperationId" to claim.grantOperationId,
+    "localRecordCount" to safeNumber(claim.localRecordCount),
   )
 
   private fun safeNumber(value: ULong): Double {

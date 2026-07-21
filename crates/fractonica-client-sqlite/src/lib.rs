@@ -278,6 +278,16 @@ pub struct LocalRecordPreview {
     pub preview_truncated: bool,
 }
 
+/// One current record head read in bounded local-sequence order for an
+/// explicit workspace import. The complete protected payload remains native;
+/// private envelopes are never projected through JavaScript.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalRecordImport {
+    pub local_sequence: u64,
+    pub entity_id: EntityId,
+    pub payload: ProtectedDocument<RecordDocument>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutboxCounts {
     pub pending: u64,
@@ -1782,6 +1792,79 @@ impl ClientSqliteStore {
                     conflicted: row.9,
                 },
                 document: operation,
+            })
+        })
+        .collect()
+    }
+
+    pub fn record_import_count(&self, space_id: SpaceId) -> Result<u64, ClientStoreError> {
+        let connection = self.lock()?;
+        let count = connection.query_row(
+            "SELECT count(*)
+             FROM client_projections p
+             JOIN client_entity_heads h ON h.operation_id = p.operation_id
+             WHERE p.space_id = ?1 AND p.schema_id = 'record' AND p.tombstone = 0",
+            params![space_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        nonnegative_u64(count)
+    }
+
+    pub fn record_import_batch(
+        &self,
+        space_id: SpaceId,
+        after_local_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<LocalRecordImport>, ClientStoreError> {
+        if !(1..=200).contains(&limit) {
+            return Err(ClientStoreError::InvalidEntityLimit);
+        }
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT o.local_sequence, p.entity_id, o.projection_json
+             FROM client_projections p
+             JOIN client_entity_heads h ON h.operation_id = p.operation_id
+             JOIN client_operations o ON o.operation_id = p.operation_id
+             WHERE p.space_id = ?1 AND p.schema_id = 'record' AND p.tombstone = 0
+               AND o.local_sequence > ?2
+             ORDER BY o.local_sequence
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                space_id.to_string(),
+                i64::try_from(after_local_sequence)
+                    .map_err(|_| ClientStoreError::InvalidEntityLimit)?,
+                limit_i64(limit)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (local_sequence, entity_id, json) = row?;
+            let operation = decode_operation(&json)?;
+            let entity_id =
+                EntityId::parse(&entity_id).map_err(|error| corrupt(error.to_string()))?;
+            if operation.space_id != space_id
+                || operation.entity_id != entity_id
+                || operation.schema != EntitySchema::Record
+            {
+                return Err(corrupt(
+                    "record import projection does not match its operation",
+                ));
+            }
+            let OperationBody::PutRecord { payload } = operation.body else {
+                return Err(corrupt("record import projection has a non-record body"));
+            };
+            Ok(LocalRecordImport {
+                local_sequence: positive_u64(local_sequence)?,
+                entity_id,
+                payload,
             })
         })
         .collect()

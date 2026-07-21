@@ -12,6 +12,8 @@ use fractonica_data_model::{
     CapabilityAction, CapabilityGrant, EntitySchema, OperationBody, OperationNonce, Visibility,
 };
 use fractonica_keystore::KeyStore;
+use fractonica_pairing::{CapabilityGrantTemplate, InvitationParameters};
+use fractonica_trust::SigningKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -306,6 +308,134 @@ fn rejects_non_loopback_supervisor_endpoints_before_touching_identity() {
         validate_supervised_endpoint("http://192.168.0.24:8789"),
         Err(ClientRuntimeError::NodeContract(_))
     ));
+}
+
+#[test]
+fn paired_transport_accepts_only_plain_http_local_network_origins() {
+    assert!(validate_paired_endpoint("http://127.0.0.1:8787/path").is_ok());
+    assert!(validate_paired_endpoint("http://localhost:8787").is_ok());
+    assert!(validate_paired_endpoint("http://192.168.1.20:8787").is_ok());
+    assert!(validate_paired_endpoint("https://127.0.0.1:8787").is_err());
+    assert!(validate_paired_endpoint("http://8.8.8.8:8787").is_err());
+    assert!(validate_paired_endpoint("http://user@127.0.0.1:8787").is_err());
+    assert!(validate_paired_endpoint("http://127.0.0.1:8787?secret=x").is_err());
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingTestRequest {
+    invitation_id: String,
+    frame_base64url: String,
+}
+
+struct PairingTestResponder {
+    issued: fractonica_pairing::IssuedInvitation,
+    responder_key: SigningKey,
+    grant_operation_id: OperationId,
+}
+
+async fn pairing_test_handler(
+    State(state): State<Arc<Mutex<Option<PairingTestResponder>>>>,
+    Json(request): Json<PairingTestRequest>,
+) -> Json<Value> {
+    let fixture = state.lock().unwrap().take().unwrap();
+    let descriptor = fixture.issued.invitation.descriptor();
+    assert_eq!(request.invitation_id, descriptor.invitation_id.to_string());
+    let first = URL_SAFE_NO_PAD.decode(request.frame_base64url).unwrap();
+    let mut responder = fixture.issued.secret.start_responder().unwrap();
+    let claim =
+        JoinerClaim::from_canonical_bytes(&responder.read_message(&first).unwrap()).unwrap();
+    claim.verify_for(descriptor).unwrap();
+    let response_frame = responder.write_message(&[]).unwrap();
+    let mut transport = responder.finish().unwrap();
+    let receipt = PairingReceipt::sign(
+        descriptor,
+        &claim,
+        *transport.handshake_hash(),
+        [21; 32],
+        &fixture.responder_key,
+    );
+    let receipt_frame = transport
+        .write_message(&receipt.canonical_bytes().unwrap())
+        .unwrap();
+    Json(json!({
+        "responseFrameBase64url": URL_SAFE_NO_PAD.encode(response_frame),
+        "receiptFrameBase64url": URL_SAFE_NO_PAD.encode(receipt_frame),
+        "session": {
+            "invitationId": descriptor.invitation_id.to_string(),
+            "spaceId": descriptor.space_id.to_string(),
+            "state": "claimed",
+            "expiresAtUnixMs": descriptor.expires_at_unix_ms,
+            "joinerNodeId": claim.joiner_node_id.to_string(),
+            "subjectActorId": claim.subject_actor_id.to_string(),
+            "confirmationOctal": transport.confirmation_octal(),
+            "grantOperationId": fixture.grant_operation_id.to_string(),
+        }
+    }))
+}
+
+#[tokio::test]
+async fn pairing_joiner_retries_a_lost_first_transport_and_verifies_the_noise_receipt() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let now = unix_time_millis().unwrap();
+    let responder_key = SigningKey::from_seed([11; 32]);
+    let issued = PairingInvitation::issue(
+        &responder_key,
+        InvitationParameters {
+            space_id: SpaceId::from_bytes([12; 32]),
+            genesis_operation_id: OperationId::from_bytes([13; 32]),
+            now_unix_ms: now,
+            expires_at_unix_ms: now + 60_000,
+            endpoint_hints: vec![endpoint.clone()],
+            capability: CapabilityGrantTemplate {
+                actions: vec![CapabilityAction::ReadSpace],
+                schemas: vec![],
+                visibilities: vec![],
+                content_roles: vec![],
+                max_resource_byte_length: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                delegation_depth: 0,
+                label: "desktop test".into(),
+            },
+        },
+    )
+    .unwrap();
+    let invitation =
+        PairingInvitation::decode(&issued.invitation.to_qr_string().unwrap(), now).unwrap();
+    let state = Arc::new(Mutex::new(Some(PairingTestResponder {
+        issued,
+        responder_key,
+        grant_operation_id: OperationId::from_bytes([14; 32]),
+    })));
+    let server = tokio::spawn(async move {
+        let (first_connection, _) = listener.accept().await.unwrap();
+        drop(first_connection);
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/api/pairing/handshake", post(pairing_test_handler))
+                .with_state(state),
+        )
+        .await
+        .unwrap();
+    });
+    let identity = Arc::new(
+        IdentityBundle::from_keys(
+            SigningKey::from_seed([21; 32]),
+            SigningKey::from_seed([22; 32]),
+            SigningKey::from_seed([23; 32]),
+            SpaceId::from_bytes([24; 32]),
+        )
+        .unwrap(),
+    );
+
+    let result = claim_pairing(invitation, now, identity).await.unwrap();
+    assert_eq!(result.claim.endpoint, endpoint);
+    assert_eq!(result.claim.confirmation_octal.len(), 10);
+    assert_eq!(result.grant_operation_id, OperationId::from_bytes([14; 32]));
+    server.abort();
 }
 
 fn standalone_config(root: &std::path::Path) -> StandaloneClientConfig {

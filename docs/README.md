@@ -4,12 +4,13 @@ Fractonica is a local-first personal data network. This directory records the
 system boundaries and the decisions that implementations must preserve.
 
 The current stateful contract is the signed, space-scoped operation protocol.
-Capability grants and revocations are enforced for operation admission. The first
-loopback-only Noise pairing ceremony is implemented through explicit human
-confirmation. Confirmation atomically converges on one controller-signed
-capability grant, and the local control center renders its QR and complete
-two-glyph confirmation. Non-loopback transport, actor-authenticated reads, and
-space-authorized content transfer remain deferred.
+Capability grants and revocations are enforced for operation admission. The
+private-LAN Noise pairing ceremony uses explicit human confirmation and works
+for mobile and desktop joiners. Confirmation atomically converges on one
+controller-signed capability grant, and the local control center renders its QR
+and complete two-glyph confirmation. Pairing-scoped actor-authenticated reads,
+operation delivery, and content transfer are implemented; public transport and
+automatic discovery remain deferred.
 
 - [Architecture](architecture.md)
 - [Trust-kernel threat model](threat-model.md)

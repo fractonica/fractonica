@@ -167,6 +167,11 @@ created ----------------> expired
 - A valid first handshake message atomically changes `created` to `claimed`.
   Exactly one concurrent caller can win. The invitation cannot return to
   `created`, even if the process crashes or the user cancels.
+- The claimed row also stores the first-frame digest and the exact opaque Noise
+  response and receipt frames. An identical first frame may replay those bytes
+  while the claimed session is live. This recovers a response lost when an OS
+  local-network permission prompt interrupts the HTTP request without opening
+  the invitation to a second claim or persisting plaintext secrets.
 - The controller deterministically prepares and signs the candidate
   `capability.grant` while recording that claim, and returns its immutable
   operation ID to the joiner. The operation is not admitted and conveys no
@@ -202,8 +207,9 @@ not the user-facing completion path.
 - Capability label: existing data-model bound.
 - Invitation lifetime: one second through ten minutes.
 - Claimed but unfinished session lifetime: two minutes.
-- One invitation permits one claim attempt that passes cryptographic
-  validation; replay and simultaneous valid use are rejected transactionally.
+- One invitation permits one distinct claim that passes cryptographic
+  validation. An identical first frame receives the exact cached response;
+  altered replay and simultaneous different use are rejected transactionally.
 - Error bodies, metrics, and traces contain only stable codes and redacted
   invitation IDs. They never contain QR payloads, secrets, private keys,
   plaintext claims, handshake frames, or transcript hashes.

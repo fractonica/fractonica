@@ -12,18 +12,13 @@ publish = false
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-base64.workspace = true
 fractonica-client-runtime.workspace = true
 fractonica-client-sqlite.workspace = true
 fractonica-content.workspace = true
 fractonica-data-model.workspace = true
 fractonica-keystore.workspace = true
-fractonica-pairing.workspace = true
-fractonica-peer.workspace = true
 fractonica-trust.workspace = true
 getrandom.workspace = true
-reqwest.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -31,5 +26,4 @@ uniffi.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 tempfile.workspace = true

@@ -15,12 +15,18 @@ For a full node it also drives the loopback pairing administration routes:
 - `POST /api/pairing/invitations`
 - `GET` and `DELETE /api/pairing/invitations/{invitationId}`
 - `POST /api/pairing/invitations/{invitationId}/confirm`
+- `GET /api/pairing/devices`
+- `DELETE /api/pairing/devices/{invitationId}`
 
 The invitation view renders the canonical QR payload. Once a joining client
 claims it, the UI displays the complete confirmation as two five-digit,
 MSB-first octal glyphs and issues the bounded capability only after explicit
 local confirmation. The QR secret is retained only in component memory and is
 discarded from the UI as soon as the invitation leaves `created`.
+Completed sessions form the paired-device registry. The UI reports recent
+authenticated activity as online and revokes access by admitting a
+controller-signed `capability.revoke` operation; revoked rows remain visible
+as an audit trail.
 
 It validates the reported profile from both endpoints before rendering. The
 `node` profile reports ready SQLite storage and its schema version; the
@@ -50,5 +56,6 @@ The UI polls every 15 seconds and also checks again when the browser regains
 connectivity or the page becomes visible. A five-second request timeout moves
 the surface into its retryable offline state.
 
-Pairing does not relax the listener boundary: the node remains loopback-only,
-and the UI says so. LAN discovery and peer transport are a later protocol.
+The desktop keeps its control URL and bootstrap bearer private while exposing
+only the pairing/data plane on an explicitly selected private-LAN address.
+Public listener exposure remains unsupported.

@@ -19,7 +19,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, head, options, post},
+    routing::{delete, get, head, options, post},
 };
 use base64::{
     Engine as _,
@@ -323,6 +323,33 @@ pub trait PairingControl: Send + Sync {
         now_unix_ms: i64,
     ) -> Result<PairingSessionView, PairingControlError>;
 
+    fn paired_devices(
+        &self,
+        _now_unix_ms: i64,
+    ) -> Result<Vec<PairedDeviceView>, PairingControlError> {
+        Err(PairingControlError::ProfileUnavailable)
+    }
+
+    fn revoke_paired_device(
+        &self,
+        _id: InvitationId,
+        _now_unix_ms: i64,
+    ) -> Result<PairedDeviceView, PairingControlError> {
+        Err(PairingControlError::ProfileUnavailable)
+    }
+
+    fn record_paired_activity(
+        &self,
+        _id: InvitationId,
+        _space_id: SpaceId,
+        _node_id: NodeId,
+        _actor_id: ActorId,
+        _grant_operation_id: OperationId,
+        _now_unix_ms: i64,
+    ) -> Result<(), PairingControlError> {
+        Err(PairingControlError::ProfileUnavailable)
+    }
+
     /// Authenticates a short pairing-scoped credential for one bounded data
     /// plane action. Implementations must also verify that the completed
     /// pairing grant is still active for the requested action.
@@ -394,6 +421,20 @@ pub struct PairingSessionView {
     pub subject_actor_id: Option<fractonica_trust::ActorId>,
     pub confirmation_octal: Option<String>,
     pub grant_operation_id: Option<OperationId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairedDeviceView {
+    pub invitation_id: InvitationId,
+    pub space_id: SpaceId,
+    pub node_id: NodeId,
+    pub actor_id: fractonica_trust::ActorId,
+    pub grant_operation_id: OperationId,
+    pub paired_at_unix_ms: i64,
+    pub last_seen_at_unix_ms: Option<i64>,
+    pub online: bool,
+    pub revocation_operation_id: Option<OperationId>,
+    pub revoked_at_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Error)]
@@ -477,6 +518,11 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/pairing/invitations/{invitation_id}/accept",
             post(accept_pairing_invitation).layer(DefaultBodyLimit::max(MAX_PAIRING_JSON_BYTES)),
+        )
+        .route("/api/pairing/devices", get(paired_devices))
+        .route(
+            "/api/pairing/devices/{invitation_id}",
+            delete(revoke_paired_device),
         )
         .route("/api/uploads", post(create_upload))
         .route(
@@ -1317,6 +1363,41 @@ impl From<PairingSessionView> for PairingSessionResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairedDeviceResponse {
+    invitation_id: String,
+    space_id: SpaceId,
+    node_id: NodeId,
+    actor_id: fractonica_trust::ActorId,
+    grant_operation_id: OperationId,
+    paired_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_at_unix_ms: Option<i64>,
+    online: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revocation_operation_id: Option<OperationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revoked_at_unix_ms: Option<i64>,
+}
+
+impl From<PairedDeviceView> for PairedDeviceResponse {
+    fn from(value: PairedDeviceView) -> Self {
+        Self {
+            invitation_id: value.invitation_id.to_string(),
+            space_id: value.space_id,
+            node_id: value.node_id,
+            actor_id: value.actor_id,
+            grant_operation_id: value.grant_operation_id,
+            paired_at_unix_ms: value.paired_at_unix_ms,
+            last_seen_at_unix_ms: value.last_seen_at_unix_ms,
+            online: value.online,
+            revocation_operation_id: value.revocation_operation_id,
+            revoked_at_unix_ms: value.revoked_at_unix_ms,
+        }
+    }
+}
+
 async fn create_pairing_invitation(
     State(state): State<ApiState>,
     payload: Result<Json<PairingCreateRequest>, JsonRejection>,
@@ -1445,6 +1526,32 @@ async fn cancel_pairing_invitation(
         .map_err(|_| ApiError::storage_unavailable())?
         .map_err(pairing_error)?;
     Ok(Json(session.into()))
+}
+
+async fn paired_devices(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<PairedDeviceResponse>>, ApiError> {
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let devices = tokio::task::spawn_blocking(move || control.paired_devices(now))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(pairing_error)?;
+    Ok(Json(devices.into_iter().map(Into::into).collect()))
+}
+
+async fn revoke_paired_device(
+    State(state): State<ApiState>,
+    Path(invitation_id): Path<String>,
+) -> Result<Json<PairedDeviceResponse>, ApiError> {
+    let id = parse_invitation_id(&invitation_id)?;
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let device = tokio::task::spawn_blocking(move || control.revoke_paired_device(id, now))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(pairing_error)?;
+    Ok(Json(device.into()))
 }
 
 fn pairing_control(state: &ApiState) -> Result<Arc<dyn PairingControl>, ApiError> {
@@ -1589,7 +1696,6 @@ async fn submit_operation(
     let application = signed_operation_application(&state)?;
     let Json(operation) = payload.map_err(signed_operation_json_error)?;
     let received_at_unix_ms = unix_time_millis().map_err(|_| ApiError::storage_unavailable())?;
-
     let result = tokio::task::spawn_blocking(move || {
         application.submit_operation(
             space_id,
@@ -1680,6 +1786,13 @@ async fn peer_operation_changes(
             .map_err(|_| peer_malformed())?,
     };
     let received_at_unix_ms = unix_time_millis().map_err(|_| ApiError::storage_unavailable())?;
+    let activity = (
+        InvitationId::from_bytes(*proof.session_id.as_bytes()),
+        proof.space_id,
+        proof.node_id,
+        proof.actor_id,
+        proof.grant_operation_id,
+    );
     let page = tokio::task::spawn_blocking(move || {
         application.peer_changes(
             space_id,
@@ -1692,6 +1805,20 @@ async fn peer_operation_changes(
     .await
     .map_err(|_| ApiError::storage_unavailable())?
     .map_err(peer_application_error)?;
+    if let Some(control) = &state.pairing {
+        let control = Arc::clone(control);
+        let _ = tokio::task::spawn_blocking(move || {
+            control.record_paired_activity(
+                activity.0,
+                activity.1,
+                activity.2,
+                activity.3,
+                activity.4,
+                received_at_unix_ms,
+            )
+        })
+        .await;
+    }
     Ok(Json(page))
 }
 

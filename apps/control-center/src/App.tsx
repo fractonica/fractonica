@@ -7,12 +7,13 @@ import type {
   NodeClient,
   NodeSnapshot,
   PairingInvitation,
+  PairedDevice,
   PairingSession,
   SpaceDescriptor,
 } from "./api";
 import { formatCheckedAt, formatLocalDateTime, formatUptime } from "./format";
 import { createRuntimeClientCore } from "./client-core";
-import type { ClientCore } from "./client-core";
+import type { ClientCore, PairingClaim, PrePairRecordPolicy } from "./client-core";
 import { RecordsWorkspace } from "./RecordsWorkspace";
 import { useNodeStatus } from "./use-node-status";
 import "./app.css";
@@ -220,21 +221,49 @@ function pairingDeepLink(invitation: string) {
 
 interface PairingPanelProps {
   client: NodeClient;
+  clientCore: ClientCore | null;
   snapshot: NodeSnapshot;
 }
 
-function PairingPanel({ client, snapshot }: PairingPanelProps) {
+function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
   const spaces = snapshot.node.spaces ?? [];
   const [spaceId, setSpaceId] = useState(spaces[0]?.spaceId ?? "");
   const [invitation, setInvitation] = useState<PairingInvitation | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [devices, setDevices] = useState<PairedDevice[]>([]);
+  const [revoking, setRevoking] = useState<string | null>(null);
+  const [joinPayload, setJoinPayload] = useState("");
+  const [joinClaim, setJoinClaim] = useState<PairingClaim | null>(null);
+  const [joinComplete, setJoinComplete] = useState(false);
+  const [joining, setJoining] = useState(false);
   const pairingAvailable = snapshot.node.capabilities.includes("noise-pairing");
   const pairingEndpointAvailable = client.pairingEndpointHints.length > 0;
   const session = invitation?.session;
   const qr = invitation?.qr ?? "";
   const terminal = session && ["completed", "cancelled", "expired"].includes(session.state);
+
+  useEffect(() => {
+    if (!pairingAvailable || snapshot.node.profile !== "node") return;
+    let stopped = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const next = await client.listPairedDevices();
+        if (!stopped) setDevices(next);
+      } catch (reason) {
+        if (!stopped) setError(reason instanceof Error ? reason.message : "Could not read paired devices.");
+      } finally {
+        if (!stopped) timer = window.setTimeout(() => void poll(), 5_000);
+      }
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [client, pairingAvailable, snapshot.node.profile]);
 
   useEffect(() => {
     if (!session || terminal) return;
@@ -333,6 +362,52 @@ function PairingPanel({ client, snapshot }: PairingPanelProps) {
     setInvitation(null);
     setError(null);
     setCopied(false);
+  };
+
+  const revoke = async (device: PairedDevice) => {
+    if (!window.confirm("Revoke this device's access? Its signed audit entry will remain visible.")) return;
+    setRevoking(device.invitationId);
+    setError(null);
+    try {
+      const revoked = await client.revokePairedDevice(device.invitationId);
+      setDevices((current) => current.map((item) => item.invitationId === revoked.invitationId ? revoked : item));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not revoke the paired device.");
+    } finally {
+      setRevoking(null);
+    }
+  };
+
+  const claimRemote = async () => {
+    if (!clientCore) return;
+    setJoining(true);
+    setError(null);
+    try {
+      const value = joinPayload.trim();
+      const payload = value.startsWith("fractonica://")
+        ? new URL(value).searchParams.get("invitation") ?? ""
+        : value;
+      setJoinClaim(await clientCore.claimPairing(payload));
+      setJoinComplete(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not claim the remote invitation.");
+    } finally {
+      setJoining(false);
+    }
+  };
+
+  const acceptRemote = async (recordPolicy: PrePairRecordPolicy) => {
+    if (!clientCore || !joinClaim) return;
+    setJoining(true);
+    setError(null);
+    try {
+      await clientCore.acceptPairing(joinClaim.invitationId, recordPolicy);
+      setJoinComplete(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not complete desktop pairing.");
+    } finally {
+      setJoining(false);
+    }
   };
 
   return (
@@ -463,6 +538,118 @@ function PairingPanel({ client, snapshot }: PairingPanelProps) {
         </Panel>
       ) : null}
 
+      {pairingAvailable && snapshot.node.profile === "node" ? (
+        <Panel className="pairing-card paired-devices">
+          <div>
+            <p className="pairing-step">Authorized peers</p>
+            <h3>Paired devices</h3>
+            <p>Online means the node verified this device's token and active capability within the last 15 seconds.</p>
+          </div>
+          {devices.length === 0 ? <p className="empty-note">No devices have completed pairing yet.</p> : (
+            <ul className="paired-device-list">
+              {devices.map((device) => {
+                const revoked = Boolean(device.revocationOperationId);
+                return (
+                  <li className="paired-device" key={device.invitationId}>
+                    <div>
+                      <div className="paired-device__title">
+                        <strong>{device.nodeId.slice(0, 22)}…</strong>
+                        <StatusBadge tone={revoked ? "offline" : device.online ? "ready" : "busy"}>
+                          {revoked ? "Revoked" : device.online ? "Online" : "Offline"}
+                        </StatusBadge>
+                      </div>
+                      <span>Paired {new Date(device.pairedAtUnixMs).toLocaleString()}</span>
+                      <span>{device.lastSeenAtUnixMs ? `Last seen ${new Date(device.lastSeenAtUnixMs).toLocaleString()}` : "Not seen since pairing"}</span>
+                    </div>
+                    {!revoked ? (
+                      <Button className="danger-button" disabled={revoking === device.invitationId} onClick={() => void revoke(device)} variant="quiet">
+                        {revoking === device.invitationId ? "Revoking…" : "Revoke"}
+                      </Button>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </Panel>
+      ) : null}
+
+      {clientCore ? (
+        <Panel className="pairing-card pairing-join">
+          {!joinClaim ? (
+            <>
+              <div>
+                <p className="pairing-step">Join another node</p>
+                <h3>Pair this desktop</h3>
+                <p>
+                  Create an invitation on the other desktop, copy its payload, and paste it here.
+                  Protected node and actor keys stay in this app’s native Rust runtime.
+                </p>
+              </div>
+              <label className="field-label">
+                Pairing invitation
+                <textarea
+                  onChange={(event) => setJoinPayload(event.target.value)}
+                  placeholder="fractonica-pairing:v1:…"
+                  rows={4}
+                  value={joinPayload}
+                />
+              </label>
+              <div className="pairing-actions">
+                <Button disabled={joining || joinPayload.trim().length === 0} onClick={() => void claimRemote()}>
+                  {joining ? "Verifying…" : "Verify invitation"}
+                </Button>
+              </div>
+            </>
+          ) : !joinComplete ? (
+            <>
+              <div>
+                <p className="pairing-step">Human confirmation</p>
+                <h3>Compare both desktops</h3>
+                <p>
+                  Confirm that these two five-digit glyphs and all ten octal digits exactly match
+                  the inviting desktop before pairing.
+                </p>
+              </div>
+              <ConfirmationGlyphs value={joinClaim.confirmationOctal} />
+              <dl className="pairing-facts">
+                <div><dt>Remote node</dt><dd>{joinClaim.responderNodeId}</dd></div>
+                <div><dt>Local records</dt><dd>{joinClaim.localRecordCount}</dd></div>
+              </dl>
+              {joinClaim.localRecordCount > 0 ? (
+                <p className="security-note">
+                  Merge copies these records into the joined space. Keep separate leaves them in
+                  this desktop’s original local space; Fractonica never silently deletes them.
+                </p>
+              ) : null}
+              <div className="pairing-actions">
+                <Button disabled={joining} onClick={() => void acceptRemote("merge")}>
+                  {joining ? "Pairing…" : joinClaim.localRecordCount > 0 ? "Pair and merge" : "Pair"}
+                </Button>
+                {joinClaim.localRecordCount > 0 ? (
+                  <Button disabled={joining} onClick={() => void acceptRemote("discard")} variant="quiet">
+                    Pair and keep separate
+                  </Button>
+                ) : null}
+                <Button disabled={joining} onClick={() => setJoinClaim(null)} variant="quiet">Cancel</Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <StatusBadge tone="ready">Desktop paired</StatusBadge>
+              <div>
+                <p className="pairing-step">Complete</p>
+                <h3>Remote workspace connected</h3>
+                <p>Operations and record media now synchronize through the paired node.</p>
+              </div>
+              <Button onClick={() => { setJoinClaim(null); setJoinComplete(false); setJoinPayload(""); }} variant="quiet">
+                Join another node
+              </Button>
+            </>
+          )}
+        </Panel>
+      ) : null}
+
       {error ? <p className="pairing-error" role="alert">{error}</p> : null}
     </section>
   );
@@ -539,7 +726,7 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
           <>
             {phase === "loading" ? <LoadingOverview baseUrl={client.baseUrl} /> : null}
             {phase === "offline" ? <OfflineOverview baseUrl={client.baseUrl} error={error} onRetry={() => void refresh()} refreshing={refreshing} /> : null}
-            {phase === "ready" && snapshot ? <PairingPanel client={client} snapshot={snapshot} /> : null}
+            {phase === "ready" && snapshot ? <PairingPanel client={client} clientCore={clientCore} snapshot={snapshot} /> : null}
           </>
         ) : null}
 

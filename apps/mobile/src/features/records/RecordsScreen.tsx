@@ -16,7 +16,12 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { OctalGlyph } from "@fractonica/glyph-react-native";
 
-import type { ClientRecordPreview, ClientStatus, PairingClaim } from "../../core/contracts";
+import type {
+  ClientRecordPreview,
+  ClientStatus,
+  PairingClaim,
+  PrePairRecordPolicy,
+} from "../../core/contracts";
 import { discoverNativeClient } from "../../core/native-client-discovery";
 import {
   isRecoveryRequiredError,
@@ -307,6 +312,7 @@ function PairingModal({
   const [accepted, setAccepted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
+  const [recordPolicy, setRecordPolicy] = useState<PrePairRecordPolicy>("merge");
   const autoSubmitted = useRef(false);
 
   useEffect(() => {
@@ -316,6 +322,7 @@ function PairingModal({
     setAccepted(false);
     setError(null);
     setWorking(false);
+    setRecordPolicy("merge");
     autoSubmitted.current = false;
   }, [open]);
 
@@ -344,7 +351,7 @@ function PairingModal({
     setWorking(true);
     setError(null);
     try {
-      await client.acceptPairingInvitation(claim.invitationId);
+      await client.acceptPairingInvitation(claim.invitationId, recordPolicy);
       setAccepted(true);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -381,6 +388,36 @@ function PairingModal({
                 ? "The verified peer is stored on this device and record and media synchronization can continue in the background."
                 : "Check every octal digit and both glyphs. Press Pair only when the desktop shows the same sequence."}
             </Text>
+            {!accepted && claim.localRecordCount > 0 ? (
+              <View style={styles.recordPolicy}>
+                <Text style={styles.recordPolicyTitle}>
+                  {claim.localRecordCount} local {claim.localRecordCount === 1 ? "record" : "records"}
+                </Text>
+                <Text style={styles.recordPolicyText}>
+                  Choose what happens to records created before this device was paired.
+                </Text>
+                <View style={styles.recordPolicyChoices}>
+                  <Pressable
+                    accessibilityRole="radio"
+                    accessibilityState={{ checked: recordPolicy === "merge" }}
+                    onPress={() => setRecordPolicy("merge")}
+                    style={[styles.recordPolicyChoice, recordPolicy === "merge" && styles.recordPolicyChoiceSelected]}
+                  >
+                    <Text style={styles.recordPolicyChoiceTitle}>Merge</Text>
+                    <Text style={styles.recordPolicyChoiceText}>Copy into the paired node and sync media.</Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="radio"
+                    accessibilityState={{ checked: recordPolicy === "discard" }}
+                    onPress={() => setRecordPolicy("discard")}
+                    style={[styles.recordPolicyChoice, recordPolicy === "discard" && styles.recordPolicyChoiceSelected]}
+                  >
+                    <Text style={styles.recordPolicyChoiceTitle}>Discard</Text>
+                    <Text style={styles.recordPolicyChoiceText}>Do not copy them into this paired space.</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
             <Pressable
               accessibilityLabel={`Pair with confirmation ${claim.confirmationOctal}`}
               accessibilityRole="button"
@@ -854,6 +891,14 @@ const styles = StyleSheet.create({
   pairingButton: { marginTop: 18, flex: 0 },
   pairingFootnote: { color: colors.textMuted, fontSize: 11, lineHeight: 17, textAlign: "center", marginTop: 18 },
   pairingResult: { flex: 1, alignItems: "center", paddingTop: 32 },
+  recordPolicy: { width: "100%", backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: radius.medium, padding: 14, marginTop: 18 },
+  recordPolicyTitle: { color: colors.text, fontSize: 15, fontWeight: "700" },
+  recordPolicyText: { color: colors.textMuted, fontSize: 12, lineHeight: 18, marginTop: 4 },
+  recordPolicyChoices: { flexDirection: "row", gap: 10, marginTop: 12 },
+  recordPolicyChoice: { flex: 1, borderColor: colors.border, borderWidth: 1, borderRadius: radius.medium, padding: 12 },
+  recordPolicyChoiceSelected: { borderColor: colors.accent, backgroundColor: colors.accentWash },
+  recordPolicyChoiceTitle: { color: colors.text, fontSize: 13, fontWeight: "800" },
+  recordPolicyChoiceText: { color: colors.textMuted, fontSize: 10, lineHeight: 15, marginTop: 4 },
   confirmationButton: { width: "100%", alignItems: "center", backgroundColor: colors.accentWash, borderColor: colors.borderStrong, borderWidth: 1, borderRadius: radius.large, paddingHorizontal: 18, paddingVertical: 20, marginTop: 24 },
   confirmationGlyphs: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 18 },
   confirmationGrid: { gap: 7, marginTop: 14 },

@@ -24,7 +24,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 10;
 
 struct Migration {
     version: u32,
@@ -63,6 +63,14 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 8,
         sql: include_str!("../migrations/0008_peer_transport_credentials.sql"),
+    },
+    Migration {
+        version: 9,
+        sql: include_str!("../migrations/0009_paired_device_activity.sql"),
+    },
+    Migration {
+        version: 10,
+        sql: include_str!("../migrations/0010_pairing_handshake_replay.sql"),
     },
 ];
 

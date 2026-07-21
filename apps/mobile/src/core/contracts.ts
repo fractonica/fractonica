@@ -105,4 +105,7 @@ export interface PairingClaim {
   endpoint: string;
   confirmationOctal: string;
   grantOperationId: string;
+  localRecordCount: number;
 }
+
+export type PrePairRecordPolicy = "merge" | "discard";

@@ -57,7 +57,17 @@ private-LAN URL for the same authenticated listener is placed in pairing
 invitations. The node requires a fresh bearer token handed directly from Tauri
 to the control center.
 The token is never placed in a URL or process argument. This bootstrap channel
-is local process supervision, not the future device-pairing protocol.
+is local process supervision and is separate from the Noise pairing protocol.
+
+## Pair another desktop
+
+Each desktop runtime can act as the protected joiner as well as administer its
+embedded node. On the inviting desktop, create an invitation in **Pair
+devices** and copy the payload. Paste it into **Join another node** on the other
+desktop, compare the two five-digit glyphs on both screens, and accept only if
+all ten octal digits match. Pre-pair local records can be merged into the
+joined space or kept in the original local space; neither choice silently
+deletes local data.
 
 The runtime uses separate directories below Tauri's platform application-data
 directory:
@@ -85,7 +95,11 @@ The current Tauri commands expose:
 - `client_list_records` for one-query timeline summaries with editable public
   documents and opaque private entries; and
 - `client_import_attachments` for native selection and content-addressed import
-  without exposing selected paths or file bytes to the webview.
+  without exposing selected paths or file bytes to the webview;
+- `client_claim_pairing_invitation` for the protected Noise joiner handshake;
+  and
+- `client_accept_pairing_invitation` for dual-signed human-confirmed admission
+  with an explicit pre-pair record policy.
 
 The desktop opens directly into the Records workspace. It supports public
 record creation, editing, local deletion, local-time start/end fields,

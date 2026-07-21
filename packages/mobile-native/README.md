@@ -4,13 +4,17 @@ Standalone Expo module boundary for the Fractonica mobile client. It links the
 Rust client through pinned UniFFI 0.32.0 bindings and exposes versioned,
 bounded operations for bridge/client status, record previews, exact record
 lookup, durable public-record creation, and explicit local-installation
-recovery. It also exposes the bounded loopback pairing claim: Rust validates
+recovery. It also exposes the bounded private-LAN pairing claim: Rust validates
 the invitation, signs with protected keys, completes Noise, verifies the
 responder receipt, and returns only public ceremony fields and the two-glyph
 confirmation value. The separate acceptance method keeps the pending
 transcript below JavaScript, creates a fresh dual-signed acceptance with the
 protected node and actor keys, verifies the completed responder session, and
-persists a pull-only paired peer for the background worker.
+persists a bidirectional paired peer for the background worker. The first iOS
+request retries bounded transport failures caused by the local-network
+permission transition. Before activating the paired workspace, the bridge
+requires an explicit merge/discard policy for pre-pair records; merge pages
+and re-signs them below JavaScript while reusing content-addressed media.
 
 The module must never expose private keys, SQLite handles, native storage
 paths, raw signed envelopes, or bulk attachment bytes to JavaScript.

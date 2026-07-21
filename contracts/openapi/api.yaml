@@ -407,6 +407,40 @@ paths:
         "410": { $ref: "#/components/responses/PairingUnavailable" }
         "413": { $ref: "#/components/responses/PairingTooLarge" }
         "503": { $ref: "#/components/responses/ProfileUnavailable" }
+  /api/pairing/devices:
+    get:
+      tags: [Pairing]
+      summary: List durably paired devices and recent authenticated activity
+      operationId: listPairedDevices
+      responses:
+        "200":
+          description: Completed pairing sessions, including revoked devices for auditability.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 1024
+                items: { $ref: "#/components/schemas/PairedDevice" }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "503": { $ref: "#/components/responses/ProfileUnavailable" }
+  /api/pairing/devices/{invitationId}:
+    parameters:
+      - $ref: "#/components/parameters/InvitationId"
+    delete:
+      tags: [Pairing]
+      summary: Revoke a paired device capability
+      operationId: revokePairedDevice
+      description: Creates a controller-signed administrative capability revocation. The audit row remains visible.
+      responses:
+        "200":
+          description: Device access is revoked, or was already revoked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairedDevice" }
+        "401": { $ref: "#/components/responses/TransportUnauthorized" }
+        "404": { $ref: "#/components/responses/PairingNotFound" }
+        "410": { $ref: "#/components/responses/PairingUnavailable" }
+        "503": { $ref: "#/components/responses/ProfileUnavailable" }
 components:
   securitySchemes:
     bootstrapBearer:
@@ -1403,6 +1437,21 @@ components:
       properties:
         qr: { type: string, pattern: '^fractonica-pairing:v1:[A-Za-z0-9_-]+$' }
         session: { $ref: "#/components/schemas/PairingSession" }
+    PairedDevice:
+      type: object
+      additionalProperties: false
+      required: [invitationId, spaceId, nodeId, actorId, grantOperationId, pairedAtUnixMs, online]
+      properties:
+        invitationId: { type: string, pattern: '^[0-9a-f]{32}$' }
+        spaceId: { $ref: "#/components/schemas/SpaceId" }
+        nodeId: { $ref: "#/components/schemas/NodeId" }
+        actorId: { $ref: "#/components/schemas/ActorId" }
+        grantOperationId: { $ref: "#/components/schemas/OperationId" }
+        pairedAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        lastSeenAtUnixMs: { type: integer, format: int64, minimum: 0 }
+        online: { type: boolean }
+        revocationOperationId: { $ref: "#/components/schemas/OperationId" }
+        revokedAtUnixMs: { type: integer, format: int64, minimum: 0 }
     PairingHandshakeResponse:
       type: object
       additionalProperties: false

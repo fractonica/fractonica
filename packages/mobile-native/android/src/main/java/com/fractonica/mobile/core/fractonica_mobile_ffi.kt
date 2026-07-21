@@ -735,7 +735,7 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_fractonica_mobile_ffi_fn_free_mobileclientcore(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(`ptr`: Long,`invitationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(`ptr`: Long,`invitationId`: RustBuffer.ByValue,`recordPolicy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_claim_pairing_invitation(`ptr`: Long,`qr`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -887,7 +887,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_fractonica_mobile_ffi_checksum_method_mobileclientbootstrap_reset_local_installation() != 60421) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_accept_pairing_invitation() != 60083) {
+    if (lib.uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_accept_pairing_invitation() != 33240) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_claim_pairing_invitation() != 16134) {
@@ -1663,7 +1663,7 @@ public interface MobileClientCoreInterface {
      * bidirectional operation/media peer and the background worker discovers
      * it without exposing transport credentials to JavaScript.
      */
-    fun `acceptPairingInvitation`(`invitationId`: kotlin.String): MobilePairingClaim
+    fun `acceptPairingInvitation`(`invitationId`: kotlin.String, `recordPolicy`: MobilePrePairRecordPolicy): MobilePairingClaim
 
     /**
      * Claims a short-lived local-network invitation using the protected device
@@ -1802,14 +1802,15 @@ open class MobileClientCore: Disposable, AutoCloseable, MobileClientCoreInterfac
      * bidirectional operation/media peer and the background worker discovers
      * it without exposing transport credentials to JavaScript.
      */
-    @Throws(MobileClientException::class)override fun `acceptPairingInvitation`(`invitationId`: kotlin.String): MobilePairingClaim {
+    @Throws(MobileClientException::class)override fun `acceptPairingInvitation`(`invitationId`: kotlin.String, `recordPolicy`: MobilePrePairRecordPolicy): MobilePairingClaim {
             return FfiConverterTypeMobilePairingClaim.lift(
     callWithHandle {
     uniffiRustCallWithError(MobileClientException) { _status ->
     UniffiLib.uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(
         it,
 
-        FfiConverterString.lower(`invitationId`),_status)
+        FfiConverterString.lower(`invitationId`),
+        FfiConverterTypeMobilePrePairRecordPolicy.lower(`recordPolicy`),_status)
 }
     }
     )
@@ -2167,6 +2168,8 @@ data class MobilePairingClaim (
     val `confirmationOctal`: kotlin.String
     ,
     val `grantOperationId`: kotlin.String
+    ,
+    val `localRecordCount`: kotlin.ULong
 
 ){
 
@@ -2189,6 +2192,7 @@ public object FfiConverterTypeMobilePairingClaim: FfiConverterRustBuffer<MobileP
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -2198,7 +2202,8 @@ public object FfiConverterTypeMobilePairingClaim: FfiConverterRustBuffer<MobileP
             FfiConverterString.allocationSize(value.`spaceId`) +
             FfiConverterString.allocationSize(value.`endpoint`) +
             FfiConverterString.allocationSize(value.`confirmationOctal`) +
-            FfiConverterString.allocationSize(value.`grantOperationId`)
+            FfiConverterString.allocationSize(value.`grantOperationId`) +
+            FfiConverterULong.allocationSize(value.`localRecordCount`)
     )
 
     override fun write(value: MobilePairingClaim, buf: ByteBuffer) {
@@ -2208,6 +2213,7 @@ public object FfiConverterTypeMobilePairingClaim: FfiConverterRustBuffer<MobileP
             FfiConverterString.write(value.`endpoint`, buf)
             FfiConverterString.write(value.`confirmationOctal`, buf)
             FfiConverterString.write(value.`grantOperationId`, buf)
+            FfiConverterULong.write(value.`localRecordCount`, buf)
     }
 }
 
@@ -2627,6 +2633,42 @@ public object FfiConverterTypeMobileIdentityAction: FfiConverterRustBuffer<Mobil
     override fun allocationSize(value: MobileIdentityAction) = 4UL
 
     override fun write(value: MobileIdentityAction, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class MobilePrePairRecordPolicy {
+
+    MERGE,
+    DISCARD;
+
+
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobilePrePairRecordPolicy: FfiConverterRustBuffer<MobilePrePairRecordPolicy> {
+    override fun read(buf: ByteBuffer) = try {
+
+        MobilePrePairRecordPolicy.entries[buf.getInt() - 1]
+
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobilePrePairRecordPolicy) = 4UL
+
+    override fun write(value: MobilePrePairRecordPolicy, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }

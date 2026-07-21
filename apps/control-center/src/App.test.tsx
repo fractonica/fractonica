@@ -26,6 +26,8 @@ function makeClient(readStatus: NodeClient["readStatus"]): NodeClient {
     readPairing: vi.fn(),
     confirmPairing: vi.fn(),
     cancelPairing: vi.fn(),
+    listPairedDevices: vi.fn().mockResolvedValue([]),
+    revokePairedDevice: vi.fn(),
   };
 }
 
@@ -67,6 +69,8 @@ function makeClientCore(records: ClientRecord[] = []): ClientCore {
       replayed: false,
       queuedPeers: 1,
     }),
+    claimPairing: vi.fn(),
+    acceptPairing: vi.fn(),
   };
 }
 

@@ -79,6 +79,19 @@ export interface PairingInvitation {
   session: PairingSession;
 }
 
+export interface PairedDevice {
+  invitationId: string;
+  spaceId: string;
+  nodeId: string;
+  actorId: string;
+  grantOperationId: string;
+  pairedAtUnixMs: number;
+  lastSeenAtUnixMs?: number;
+  online: boolean;
+  revocationOperationId?: string;
+  revokedAtUnixMs?: number;
+}
+
 export interface NodeClient {
   readonly baseUrl: string;
   readonly pairingEndpointHints: readonly string[];
@@ -91,6 +104,8 @@ export interface NodeClient {
     signal?: AbortSignal,
   ): Promise<PairingSession>;
   cancelPairing(invitationId: string, signal?: AbortSignal): Promise<PairingSession>;
+  listPairedDevices(signal?: AbortSignal): Promise<PairedDevice[]>;
+  revokePairedDevice(invitationId: string, signal?: AbortSignal): Promise<PairedDevice>;
 }
 
 interface NodeConnection {
@@ -333,6 +348,36 @@ function decodePairingInvitation(value: unknown): PairingInvitation {
   return { qr: value.qr, session: decodePairingSession(value.session) };
 }
 
+function decodePairedDevice(value: unknown): PairedDevice {
+  const required = ["invitationId", "spaceId", "nodeId", "actorId", "grantOperationId", "pairedAtUnixMs", "online"] as const;
+  const optional = ["lastSeenAtUnixMs", "revocationOperationId", "revokedAtUnixMs"] as const;
+  if (
+    !isObject(value) ||
+    !hasOnlyKeys(value, required, optional) ||
+    typeof value.invitationId !== "string" || !INVITATION_ID.test(value.invitationId) ||
+    typeof value.spaceId !== "string" || !SPACE_ID.test(value.spaceId) ||
+    typeof value.nodeId !== "string" || !NODE_ID.test(value.nodeId) ||
+    typeof value.actorId !== "string" || !ACTOR_ID.test(value.actorId) ||
+    typeof value.grantOperationId !== "string" || !OPERATION_ID.test(value.grantOperationId) ||
+    !isSafeNonnegativeInteger(value.pairedAtUnixMs) ||
+    typeof value.online !== "boolean" ||
+    (value.lastSeenAtUnixMs !== undefined && !isSafeNonnegativeInteger(value.lastSeenAtUnixMs)) ||
+    (value.revocationOperationId !== undefined &&
+      (typeof value.revocationOperationId !== "string" || !OPERATION_ID.test(value.revocationOperationId))) ||
+    (value.revokedAtUnixMs !== undefined && !isSafeNonnegativeInteger(value.revokedAtUnixMs))
+  ) {
+    throw new Error("The paired-device response did not match the expected schema.");
+  }
+  return value as unknown as PairedDevice;
+}
+
+function decodePairedDevices(value: unknown): PairedDevice[] {
+  if (!Array.isArray(value) || value.length > 1024) {
+    throw new Error("The paired-device response did not match the expected schema.");
+  }
+  return value.map(decodePairedDevice);
+}
+
 function endpoint(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 }
@@ -514,6 +559,28 @@ function createResolvingNodeClient(
               fetcher,
               connection,
               `/api/pairing/invitations/${invitationId}`,
+              requestSignal,
+              "DELETE",
+            ),
+          ),
+        signal,
+      ),
+    listPairedDevices: (signal) =>
+      execute(
+        async (connection, requestSignal) =>
+          decodePairedDevices(
+            await requestJson(fetcher, connection, "/api/pairing/devices", requestSignal),
+          ),
+        signal,
+      ),
+    revokePairedDevice: (invitationId, signal) =>
+      execute(
+        async (connection, requestSignal) =>
+          decodePairedDevice(
+            await requestJson(
+              fetcher,
+              connection,
+              `/api/pairing/devices/${invitationId}`,
               requestSignal,
               "DELETE",
             ),

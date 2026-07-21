@@ -6,6 +6,7 @@ import type {
   EntityReference,
   JsonValue,
   PairingClaim,
+  PrePairRecordPolicy,
   PublicRecordPayload,
   RecordDocument,
   ResourceReference,
@@ -42,7 +43,7 @@ export interface NativeClientPort {
   getRecord(operationId: string, entityId: string): Promise<ClientRecordDetail | undefined>;
   createRecord(payload: PublicRecordPayload): Promise<CommitResult>;
   claimPairingInvitation(qr: string): Promise<PairingClaim>;
-  acceptPairingInvitation(invitationId: string): Promise<PairingClaim>;
+  acceptPairingInvitation(invitationId: string, recordPolicy: PrePairRecordPolicy): Promise<PairingClaim>;
   resetLocalInstallation(confirmation: LocalInstallationResetConfirmation): Promise<void>;
 }
 
@@ -53,7 +54,7 @@ export interface NativeClientBridge {
   clientGetRecord(options: { operationId: string; entityId: string }): Promise<unknown>;
   clientCreateRecord(options: { payload: PublicRecordPayload }): Promise<unknown>;
   clientClaimPairingInvitation(options: { qr: string }): Promise<unknown>;
-  clientAcceptPairingInvitation(options: { invitationId: string }): Promise<unknown>;
+  clientAcceptPairingInvitation(options: { invitationId: string; recordPolicy: PrePairRecordPolicy }): Promise<unknown>;
   clientResetLocalInstallation(options: { confirmation: string }): Promise<unknown>;
 }
 
@@ -320,6 +321,7 @@ function decodePairingClaim(value: unknown): PairingClaim {
         "endpoint",
         "confirmationOctal",
         "grantOperationId",
+        "localRecordCount",
       ],
       [],
     ) ||
@@ -334,7 +336,8 @@ function decodePairingClaim(value: unknown): PairingClaim {
     typeof value.confirmationOctal !== "string" ||
     !CONFIRMATION_OCTAL.test(value.confirmationOctal) ||
     typeof value.grantOperationId !== "string" ||
-    !OPERATION_ID.test(value.grantOperationId)
+    !OPERATION_ID.test(value.grantOperationId) ||
+    !isCount(value.localRecordCount)
   ) {
     contractError("The native pairing claim did not match the expected schema.");
   }
@@ -537,12 +540,12 @@ export function createNativeClientPort(bridge: NativeClientBridge): NativeClient
       }
       return decodePairingClaim(await bridge.clientClaimPairingInvitation({ qr }));
     },
-    acceptPairingInvitation: async (invitationId) => {
+    acceptPairingInvitation: async (invitationId, recordPolicy) => {
       if (!INVITATION_ID.test(invitationId)) {
         contractError("Pairing acceptance requires a canonical invitation identifier.");
       }
       return decodePairingClaim(
-        await bridge.clientAcceptPairingInvitation({ invitationId }),
+        await bridge.clientAcceptPairingInvitation({ invitationId, recordPolicy }),
       );
     },
     resetLocalInstallation: async (confirmation) => {

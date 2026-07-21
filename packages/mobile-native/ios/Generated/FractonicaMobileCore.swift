@@ -783,7 +783,7 @@ public protocol MobileClientCoreProtocol: AnyObject, Sendable {
      * bidirectional operation/media peer and the background worker discovers
      * it without exposing transport credentials to JavaScript.
      */
-    func acceptPairingInvitation(invitationId: String) throws  -> MobilePairingClaim
+    func acceptPairingInvitation(invitationId: String, recordPolicy: MobilePrePairRecordPolicy) throws  -> MobilePairingClaim
 
     /**
      * Claims a short-lived local-network invitation using the protected device
@@ -871,12 +871,13 @@ open class MobileClientCore: MobileClientCoreProtocol, @unchecked Sendable {
      * bidirectional operation/media peer and the background worker discovers
      * it without exposing transport credentials to JavaScript.
      */
-open func acceptPairingInvitation(invitationId: String)throws  -> MobilePairingClaim  {
+open func acceptPairingInvitation(invitationId: String, recordPolicy: MobilePrePairRecordPolicy)throws  -> MobilePairingClaim  {
     return try  FfiConverterTypeMobilePairingClaim_lift(try rustCallWithError(FfiConverterTypeMobileClientError_lift) {
         uniffiCallStatus in
     uniffi_fractonica_mobile_ffi_fn_method_mobileclientcore_accept_pairing_invitation(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(invitationId),uniffiCallStatus
+        FfiConverterString.lower(invitationId),
+        FfiConverterTypeMobilePrePairRecordPolicy_lower(recordPolicy),uniffiCallStatus
     )
 })
 }
@@ -1238,16 +1239,18 @@ public struct MobilePairingClaim: Equatable, Hashable {
     public let endpoint: String
     public let confirmationOctal: String
     public let grantOperationId: String
+    public let localRecordCount: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(invitationId: String, responderNodeId: String, spaceId: String, endpoint: String, confirmationOctal: String, grantOperationId: String) {
+    public init(invitationId: String, responderNodeId: String, spaceId: String, endpoint: String, confirmationOctal: String, grantOperationId: String, localRecordCount: UInt64) {
         self.invitationId = invitationId
         self.responderNodeId = responderNodeId
         self.spaceId = spaceId
         self.endpoint = endpoint
         self.confirmationOctal = confirmationOctal
         self.grantOperationId = grantOperationId
+        self.localRecordCount = localRecordCount
     }
 
 
@@ -1271,7 +1274,8 @@ public struct FfiConverterTypeMobilePairingClaim: FfiConverterRustBuffer {
                 spaceId: FfiConverterString.read(from: &buf),
                 endpoint: FfiConverterString.read(from: &buf),
                 confirmationOctal: FfiConverterString.read(from: &buf),
-                grantOperationId: FfiConverterString.read(from: &buf)
+                grantOperationId: FfiConverterString.read(from: &buf),
+                localRecordCount: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -1282,6 +1286,7 @@ public struct FfiConverterTypeMobilePairingClaim: FfiConverterRustBuffer {
         FfiConverterString.write(value.endpoint, into: &buf)
         FfiConverterString.write(value.confirmationOctal, into: &buf)
         FfiConverterString.write(value.grantOperationId, into: &buf)
+        FfiConverterUInt64.write(value.localRecordCount, into: &buf)
     }
 }
 
@@ -1705,6 +1710,72 @@ public func FfiConverterTypeMobileIdentityAction_lower(_ value: MobileIdentityAc
 }
 
 
+
+
+public enum MobilePrePairRecordPolicy: Equatable, Hashable {
+
+    case merge
+    case discard
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MobilePrePairRecordPolicy: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMobilePrePairRecordPolicy: FfiConverterRustBuffer {
+    typealias SwiftType = MobilePrePairRecordPolicy
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MobilePrePairRecordPolicy {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .merge
+
+        case 2: return .discard
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MobilePrePairRecordPolicy, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .merge:
+            writeInt(&buf, Int32(1))
+
+
+        case .discard:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMobilePrePairRecordPolicy_lift(_ buf: RustBuffer) throws -> MobilePrePairRecordPolicy {
+    return try FfiConverterTypeMobilePrePairRecordPolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMobilePrePairRecordPolicy_lower(_ value: MobilePrePairRecordPolicy) -> RustBuffer {
+    return FfiConverterTypeMobilePrePairRecordPolicy.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -1853,7 +1924,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientbootstrap_reset_local_installation() != 60421) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_accept_pairing_invitation() != 60083) {
+    if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_accept_pairing_invitation() != 33240) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_fractonica_mobile_ffi_checksum_method_mobileclientcore_claim_pairing_invitation() != 16134) {

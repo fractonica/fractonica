@@ -27,9 +27,9 @@ The initial vertical slice provides:
 - authenticated liveness, readiness, node metadata, and Swagger endpoints;
 - a stateless `saros` node profile for exact temporal readings and reviewed
   eclipse geometry without local storage;
-- a React control center that can inspect the local node and administer the
-  loopback Noise pairing ceremony through a scannable QR and two-glyph human
-  confirmation;
+- a React control center that can inspect the local node, issue private-LAN
+  Noise invitations, pair mobile or desktop clients, and compare the complete
+  two-glyph human confirmation;
 - an Expo/React Native mobile foundation with a strict native-client boundary,
   canonical SVG glyph rendering, and an offline-first records surface;
 - dual-signed, pairing-bound `readSpace` change pages plus a Noise-delivered,
@@ -141,6 +141,13 @@ Keep this terminal open. `Fractonica node available` in the desktop status and
 a scannable pairing QR mean the supervised node is ready. If startup fails, the
 desktop status now includes the node's actual stderr (for example, a retained
 profile lock) rather than only saying that the node is unavailable.
+
+To pair two desktops, open **Pair devices** on the inviting desktop, create an
+invitation, and copy its payload. On the joining desktop, open **Pair devices**,
+paste the payload under **Join another node**, compare both five-digit glyphs
+and all ten octal digits, then choose whether to merge pre-pair records into the
+joined space or keep them separate. Both desktops must be on the same trusted
+private network.
 
 Create a release bundle with:
 

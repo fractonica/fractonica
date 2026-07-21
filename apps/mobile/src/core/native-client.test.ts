@@ -84,6 +84,7 @@ function bridge(overrides: Partial<NativeClientBridge> = {}): NativeClientBridge
       endpoint: "http://127.0.0.1:8787",
       confirmationOctal: "0123456701",
       grantOperationId: `sha-256:${OTHER_HASH}`,
+      localRecordCount: 2,
     })),
     clientAcceptPairingInvitation: vi.fn(async () => ({
       invitationId: "1".repeat(32),
@@ -92,6 +93,7 @@ function bridge(overrides: Partial<NativeClientBridge> = {}): NativeClientBridge
       endpoint: "http://127.0.0.1:8787",
       confirmationOctal: "0123456701",
       grantOperationId: `sha-256:${OTHER_HASH}`,
+      localRecordCount: 2,
     })),
     clientResetLocalInstallation: vi.fn(async () => undefined),
     ...overrides,
@@ -237,11 +239,12 @@ describe("native client port", () => {
       endpoint: "http://127.0.0.1:8787",
     });
     expect(native.clientClaimPairingInvitation).toHaveBeenCalledExactlyOnceWith({ qr });
-    await expect(client.acceptPairingInvitation("1".repeat(32))).resolves.toMatchObject({
+    await expect(client.acceptPairingInvitation("1".repeat(32), "merge")).resolves.toMatchObject({
       confirmationOctal: "0123456701",
     });
     expect(native.clientAcceptPairingInvitation).toHaveBeenCalledExactlyOnceWith({
       invitationId: "1".repeat(32),
+      recordPolicy: "merge",
     });
 
     const lanClient = createNativeClientPort(bridge({
@@ -252,6 +255,7 @@ describe("native client port", () => {
         endpoint: "http://192.168.0.24:60743",
         confirmationOctal: "0123456701",
         grantOperationId: `sha-256:${OTHER_HASH}`,
+        localRecordCount: 0,
       })),
     }));
     await expect(lanClient.claimPairingInvitation(qr)).resolves.toMatchObject({
@@ -266,6 +270,7 @@ describe("native client port", () => {
         endpoint: "http://8.8.8.8:60743",
         confirmationOctal: "0123456701",
         grantOperationId: `sha-256:${OTHER_HASH}`,
+        localRecordCount: 0,
       })),
     }));
     await expect(publicClient.claimPairingInvitation(qr)).rejects.toBeInstanceOf(
@@ -276,7 +281,7 @@ describe("native client port", () => {
       NativeContractError,
     );
     expect(native.clientClaimPairingInvitation).toHaveBeenCalledOnce();
-    await expect(client.acceptPairingInvitation("not-an-id")).rejects.toBeInstanceOf(
+    await expect(client.acceptPairingInvitation("not-an-id", "merge")).rejects.toBeInstanceOf(
       NativeContractError,
     );
   });

@@ -75,6 +75,18 @@ export interface CommitResult {
   queuedPeers: number;
 }
 
+export interface PairingClaim {
+  invitationId: string;
+  responderNodeId: string;
+  spaceId: string;
+  endpoint: string;
+  confirmationOctal: string;
+  grantOperationId: string;
+  localRecordCount: number;
+}
+
+export type PrePairRecordPolicy = "merge" | "discard";
+
 export interface ClientCore {
   status(): Promise<ClientStatus>;
   listRecords(limit?: number): Promise<ClientRecord[]>;
@@ -82,6 +94,8 @@ export interface ClientCore {
   createRecord(payload: PublicRecordPayload): Promise<CommitResult>;
   updateRecord(entityId: string, payload: PublicRecordPayload): Promise<CommitResult>;
   deleteRecord(entityId: string): Promise<CommitResult>;
+  claimPairing(invitation: string): Promise<PairingClaim>;
+  acceptPairing(invitationId: string, recordPolicy: PrePairRecordPolicy): Promise<PairingClaim>;
 }
 
 type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -92,6 +106,7 @@ const NODE_ID = /^node:ed25519:[0-9a-f]{64}$/;
 const ACTOR_ID = /^actor:ed25519:[0-9a-f]{64}$/;
 const SPACE_ID = /^space:[0-9a-f]{64}$/;
 const CONTENT_ID = /^sha-256:[0-9a-f]{64}$/;
+const INVITATION_ID = /^[0-9a-f]{32}$/;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -258,6 +273,41 @@ function decodeCommit(value: unknown): CommitResult {
   return value as unknown as CommitResult;
 }
 
+function decodePairingClaim(value: unknown): PairingClaim {
+  if (
+    !isObject(value) ||
+    !hasOnlyKeys(
+      value,
+      [
+        "invitationId",
+        "responderNodeId",
+        "spaceId",
+        "endpoint",
+        "confirmationOctal",
+        "grantOperationId",
+        "localRecordCount",
+      ],
+      [],
+    ) ||
+    typeof value.invitationId !== "string" ||
+    !INVITATION_ID.test(value.invitationId) ||
+    typeof value.responderNodeId !== "string" ||
+    !NODE_ID.test(value.responderNodeId) ||
+    typeof value.spaceId !== "string" ||
+    !SPACE_ID.test(value.spaceId) ||
+    typeof value.endpoint !== "string" ||
+    !value.endpoint.startsWith("http://") ||
+    typeof value.confirmationOctal !== "string" ||
+    !/^[0-7]{10}$/.test(value.confirmationOctal) ||
+    typeof value.grantOperationId !== "string" ||
+    !OPERATION_ID.test(value.grantOperationId) ||
+    !isCount(value.localRecordCount)
+  ) {
+    throw new Error("The native pairing claim did not match the expected schema.");
+  }
+  return value as unknown as PairingClaim;
+}
+
 function decodeRecord(value: unknown): ClientRecord {
   if (
     !isObject(value) ||
@@ -338,6 +388,22 @@ export function createClientCore(invoke: Invoke): ClientCore {
       if (!ENTITY_ID.test(entityId)) throw new Error("The record entity ID is invalid.");
       return decodeCommit(
         await invoke("client_delete", { entityId, schema: "record" }),
+      );
+    },
+    claimPairing: async (invitation) => {
+      if (!/^fractonica-pairing:v1:[A-Za-z0-9_-]+$/.test(invitation)) {
+        throw new Error("The pairing invitation is invalid.");
+      }
+      return decodePairingClaim(
+        await invoke("client_claim_pairing_invitation", { qr: invitation }),
+      );
+    },
+    acceptPairing: async (invitationId, recordPolicy) => {
+      if (!INVITATION_ID.test(invitationId) || !["merge", "discard"].includes(recordPolicy)) {
+        throw new Error("The pending pairing decision is invalid.");
+      }
+      return decodePairingClaim(
+        await invoke("client_accept_pairing_invitation", { invitationId, recordPolicy }),
       );
     },
   };

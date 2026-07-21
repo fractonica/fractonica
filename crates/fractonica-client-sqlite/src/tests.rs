@@ -199,6 +199,24 @@ fn record_feed_projection_is_bounded_and_detail_requires_the_exact_live_head() {
     );
     store.commit_local(&operation, 3).unwrap();
 
+    assert_eq!(store.record_import_count(space()).unwrap(), 1);
+    let import = store.record_import_batch(space(), 0, 100).unwrap();
+    assert_eq!(import.len(), 1);
+    assert_eq!(import[0].entity_id, operation.entity_id);
+    assert_eq!(
+        import[0].payload,
+        match operation.body.clone() {
+            OperationBody::PutRecord { payload } => payload,
+            _ => unreachable!(),
+        }
+    );
+    assert!(
+        store
+            .record_import_batch(space(), import[0].local_sequence, 100)
+            .unwrap()
+            .is_empty()
+    );
+
     let previews = store.list_record_previews(space(), 20).unwrap();
     assert_eq!(previews.len(), 1);
     let preview = &previews[0];

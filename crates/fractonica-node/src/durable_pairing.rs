@@ -3,14 +3,14 @@
 use std::collections::BTreeSet;
 
 use fractonica_api::{
-    PairingControl, PairingControlError, PairingCreateCommand, PairingHandshakeResult,
-    PairingInvitationCreated, PairingSessionView, PairingState, PeerTransportAction,
-    PeerTransportPrincipal,
+    PairedDeviceView, PairingControl, PairingControlError, PairingCreateCommand,
+    PairingHandshakeResult, PairingInvitationCreated, PairingSessionView, PairingState,
+    PeerTransportAction, PeerTransportPrincipal,
 };
 use fractonica_application::{OperationRepository, SubmitOperationRequest};
 use fractonica_data_model::{
-    CapabilityAction, EntityId, EntitySchema, OperationBody, OperationEnvelope, OperationId,
-    OperationNonce,
+    CapabilityAction, CapabilityRevocation, CapabilityRevocationReason, EntityId, EntitySchema,
+    NodeId, OperationBody, OperationEnvelope, OperationId, OperationNonce,
 };
 use fractonica_keystore::IdentityBundle;
 use fractonica_keystore::{FilePairingSecretVault, PairingSecretVaultError};
@@ -266,6 +266,134 @@ impl NodePairingControl {
         }
         Err(PairingControlError::Storage)
     }
+
+    fn replay_handshake(
+        &self,
+        session: PairingSession,
+        first_frame_digest: [u8; 32],
+        now: i64,
+    ) -> Result<PairingHandshakeResult, PairingControlError> {
+        let claimed_at = session
+            .claimed_at_unix_ms
+            .ok_or(PairingControlError::Unavailable)?;
+        let replay_deadline = session
+            .descriptor
+            .expires_at_unix_ms
+            .min(claimed_at.saturating_add(120_000));
+        let expected = session
+            .first_frame_digest
+            .ok_or(PairingControlError::Unavailable)?;
+        if session.state != PairingLifecycle::Claimed
+            || now < claimed_at
+            || now >= replay_deadline
+            || !bool::from(expected.ct_eq(&first_frame_digest))
+        {
+            return Err(PairingControlError::Unavailable);
+        }
+        let response_frame = session
+            .response_frame
+            .clone()
+            .ok_or(PairingControlError::Unavailable)?;
+        let receipt_frame = session
+            .receipt_frame
+            .clone()
+            .ok_or(PairingControlError::Unavailable)?;
+        self.planned_or_new_grant(&session, now)?;
+        let session = self
+            .durable
+            .database()
+            .pairing_session(session.invitation_id)
+            .map_err(store_error)?
+            .ok_or(PairingControlError::Storage)?;
+        Ok(PairingHandshakeResult {
+            response_frame,
+            receipt_frame,
+            session: Self::view(session),
+        })
+    }
+
+    fn device_view(
+        &self,
+        session: PairingSession,
+        now: i64,
+    ) -> Result<PairedDeviceView, PairingControlError> {
+        let node_id = session.joiner_node_id.ok_or(PairingControlError::Storage)?;
+        let actor_id = session
+            .subject_actor_id
+            .ok_or(PairingControlError::Storage)?;
+        let grant_operation_id = session
+            .grant_operation_id
+            .ok_or(PairingControlError::Storage)?;
+        let paired_at_unix_ms = session
+            .completed_at_unix_ms
+            .ok_or(PairingControlError::Storage)?;
+        let revocation = self
+            .durable
+            .database()
+            .grant_revocation(session.descriptor.space_id, grant_operation_id)
+            .map_err(store_error)?;
+        let (revocation_operation_id, revoked_at_unix_ms) = match revocation {
+            Some((operation_id, occurred_at)) => (Some(operation_id), Some(occurred_at)),
+            None => (None, None),
+        };
+        let online = revocation_operation_id.is_none()
+            && session
+                .last_seen_at_unix_ms
+                .is_some_and(|last_seen| now.saturating_sub(last_seen) <= 15_000);
+        Ok(PairedDeviceView {
+            invitation_id: session.invitation_id,
+            space_id: session.descriptor.space_id,
+            node_id,
+            actor_id,
+            grant_operation_id,
+            paired_at_unix_ms,
+            last_seen_at_unix_ms: session.last_seen_at_unix_ms,
+            online,
+            revocation_operation_id,
+            revoked_at_unix_ms,
+        })
+    }
+
+    fn new_revocation(
+        &self,
+        session: &PairingSession,
+        grant_operation_id: OperationId,
+        now: i64,
+    ) -> Result<OperationEnvelope, PairingControlError> {
+        let timestamp: u64 = now
+            .try_into()
+            .map_err(|_| PairingControlError::Invalid("invalid revocation time".into()))?;
+        if timestamp > (1_u64 << 48) - 1 {
+            return Err(PairingControlError::Invalid(
+                "revocation time exceeds UUIDv7 range".into(),
+            ));
+        }
+        let mut random = [0_u8; 10];
+        getrandom::fill(&mut random).map_err(|_| PairingControlError::Storage)?;
+        let entity_id = EntityId::new(
+            uuid::Builder::from_unix_timestamp_millis(timestamp, &random).into_uuid(),
+        );
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| PairingControlError::Storage)?;
+        OperationEnvelope::sign(
+            session.descriptor.space_id,
+            entity_id,
+            EntitySchema::CapabilityRevoke,
+            vec![],
+            vec![self.genesis_operation_id],
+            now,
+            OperationNonce::from_bytes(nonce),
+            OperationBody::CapabilityRevoke {
+                revocation: CapabilityRevocation {
+                    grant_id: grant_operation_id,
+                    reason: CapabilityRevocationReason::Administrative,
+                    detail: Some("Paired device revoked by the local operator".into()),
+                },
+            },
+            self.identity.space_controller_key(),
+        )
+        .map_err(|error| PairingControlError::Invalid(error.to_string()))
+    }
 }
 
 impl PairingControl for NodePairingControl {
@@ -332,6 +460,10 @@ impl PairingControl for NodePairingControl {
             .pairing_session(id)
             .map_err(store_error)?
             .ok_or(PairingControlError::NotFound)?;
+        let first_frame_digest: [u8; 32] = Sha256::digest(first_frame).into();
+        if session.state == PairingLifecycle::Claimed {
+            return self.replay_handshake(session, first_frame_digest, now);
+        }
         if session.state != PairingLifecycle::Created {
             return Err(PairingControlError::Unavailable);
         }
@@ -355,18 +487,6 @@ impl PairingControl for NodePairingControl {
         let mut peer_access_token = [0_u8; 32];
         getrandom::fill(&mut peer_access_token).map_err(|_| PairingControlError::Storage)?;
         let peer_token_digest: [u8; 32] = Sha256::digest(peer_access_token).into();
-        let claimed = self
-            .durable
-            .database()
-            .claim_pairing_session(&session.descriptor, &claim, hash, peer_token_digest, now)
-            .map_err(store_error)?;
-        let _planned_grant = self.planned_or_new_grant(&claimed, now)?;
-        let claimed = self
-            .durable
-            .database()
-            .pairing_session(id)
-            .map_err(store_error)?
-            .ok_or(PairingControlError::Storage)?;
         let receipt = PairingReceipt::sign(
             &session.descriptor,
             &claim,
@@ -377,6 +497,35 @@ impl PairingControl for NodePairingControl {
         let receipt_frame = transport
             .write_message(&receipt.canonical_bytes().map_err(protocol_error)?)
             .map_err(protocol_error)?;
+        let claimed = match self.durable.database().claim_pairing_session(
+            &session.descriptor,
+            &claim,
+            hash,
+            peer_token_digest,
+            first_frame_digest,
+            &response_frame,
+            &receipt_frame,
+            now,
+        ) {
+            Ok(claimed) => claimed,
+            Err(PairingStoreError::Unavailable) => {
+                let current = self
+                    .durable
+                    .database()
+                    .pairing_session(id)
+                    .map_err(store_error)?
+                    .ok_or(PairingControlError::Storage)?;
+                return self.replay_handshake(current, first_frame_digest, now);
+            }
+            Err(error) => return Err(store_error(error)),
+        };
+        let _planned_grant = self.planned_or_new_grant(&claimed, now)?;
+        let claimed = self
+            .durable
+            .database()
+            .pairing_session(id)
+            .map_err(store_error)?
+            .ok_or(PairingControlError::Storage)?;
         Ok(PairingHandshakeResult {
             response_frame,
             receipt_frame,
@@ -545,12 +694,97 @@ impl PairingControl for NodePairingControl {
                 now,
             )
             .map_err(|_| PairingControlError::Unavailable)?;
+        self.durable
+            .database()
+            .touch_pairing_session(id, now)
+            .map_err(store_error)?;
         Ok(PeerTransportPrincipal {
             invitation_id: id,
             space_id: session.descriptor.space_id,
             actor_id,
             grant_operation_id,
         })
+    }
+
+    fn paired_devices(&self, now: i64) -> Result<Vec<PairedDeviceView>, PairingControlError> {
+        if now < 0 {
+            return Err(PairingControlError::Invalid("invalid activity time".into()));
+        }
+        self.durable
+            .database()
+            .completed_pairing_sessions()
+            .map_err(store_error)?
+            .into_iter()
+            .map(|session| self.device_view(session, now))
+            .collect()
+    }
+
+    fn revoke_paired_device(
+        &self,
+        id: InvitationId,
+        now: i64,
+    ) -> Result<PairedDeviceView, PairingControlError> {
+        let session = self
+            .durable
+            .database()
+            .pairing_session(id)
+            .map_err(store_error)?
+            .ok_or(PairingControlError::NotFound)?;
+        if session.state != PairingLifecycle::Completed {
+            return Err(PairingControlError::Unavailable);
+        }
+        let grant_operation_id = session
+            .grant_operation_id
+            .ok_or(PairingControlError::Storage)?;
+        if self
+            .durable
+            .database()
+            .grant_revocation(session.descriptor.space_id, grant_operation_id)
+            .map_err(store_error)?
+            .is_none()
+        {
+            let operation = self.new_revocation(&session, grant_operation_id, now)?;
+            self.durable
+                .database()
+                .submit_operation(
+                    session.descriptor.space_id,
+                    &SubmitOperationRequest {
+                        operation,
+                        received_at_unix_ms: now,
+                    },
+                )
+                .map_err(|_| PairingControlError::Storage)?;
+        }
+        self.device_view(session, now)
+    }
+
+    fn record_paired_activity(
+        &self,
+        id: InvitationId,
+        space_id: fractonica_data_model::SpaceId,
+        node_id: NodeId,
+        actor_id: fractonica_data_model::ActorId,
+        grant_operation_id: OperationId,
+        now: i64,
+    ) -> Result<(), PairingControlError> {
+        let session = self
+            .durable
+            .database()
+            .pairing_session(id)
+            .map_err(store_error)?
+            .ok_or(PairingControlError::Unavailable)?;
+        if session.state != PairingLifecycle::Completed
+            || session.descriptor.space_id != space_id
+            || session.joiner_node_id != Some(node_id)
+            || session.subject_actor_id != Some(actor_id)
+            || session.grant_operation_id != Some(grant_operation_id)
+        {
+            return Err(PairingControlError::Unavailable);
+        }
+        self.durable
+            .database()
+            .touch_pairing_session(id, now)
+            .map_err(store_error)
     }
 }
 
@@ -707,8 +941,19 @@ mod tests {
         receipt
             .verify_for(invitation.descriptor(), &claim, transport.handshake_hash())
             .unwrap();
+        let replayed = control
+            .handshake(created.session.invitation_id, &first, NOW + 2)
+            .unwrap();
+        assert_eq!(replayed.response_frame, result.response_frame);
+        assert_eq!(replayed.receipt_frame, result.receipt_frame);
+        assert_eq!(
+            replayed.session.grant_operation_id,
+            result.session.grant_operation_id
+        );
+        let mut altered_first = first.clone();
+        altered_first[0] ^= 1;
         assert!(matches!(
-            control.handshake(created.session.invitation_id, &first, NOW + 2),
+            control.handshake(created.session.invitation_id, &altered_first, NOW + 2),
             Err(PairingControlError::Unavailable)
         ));
         assert!(matches!(
@@ -759,6 +1004,10 @@ mod tests {
             .expect("Noise-delivered credential authorizes the admitted read grant");
         assert_eq!(principal.space_id, identity.space_id());
         assert_eq!(principal.actor_id, actor_key.actor_id());
+        let devices = control.paired_devices(NOW + 4).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].online);
+        assert_eq!(devices[0].last_seen_at_unix_ms, Some(NOW + 3));
         assert!(matches!(
             control.authenticate_peer_transport(
                 created.session.invitation_id,
@@ -785,5 +1034,28 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let revoked = control
+            .revoke_paired_device(created.session.invitation_id, NOW + 5)
+            .unwrap();
+        assert!(!revoked.online);
+        assert_eq!(revoked.revoked_at_unix_ms, Some(NOW + 5));
+        let revocation_id = revoked.revocation_operation_id.expect("signed revocation");
+        assert_eq!(
+            control
+                .revoke_paired_device(created.session.invitation_id, NOW + 6)
+                .unwrap()
+                .revocation_operation_id,
+            Some(revocation_id),
+            "revocation is idempotent"
+        );
+        assert!(matches!(
+            control.authenticate_peer_transport(
+                created.session.invitation_id,
+                *receipt.peer_access_token(),
+                PeerTransportAction::ReadContent,
+                NOW + 7,
+            ),
+            Err(PairingControlError::Unavailable)
+        ));
     }
 }

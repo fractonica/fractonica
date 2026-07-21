@@ -153,8 +153,11 @@ content store, and returns only validated `record.media` references to React.
 Cancelling is a no-op, equal bytes deduplicate, and removing a draft reference
 does not delete historical content.
 
-Private-record key management/decryption, richer pagination, and paired-device
-lifecycle management are the next client-facing layers.
+Private-record key management/decryption and richer feed pagination remain
+future client-facing layers. Paired-device lifecycle management is exposed by
+the node: completed sessions retain authenticated last-seen activity and a
+controller-signed administrative revocation disables their grant without
+deleting the audit trail.
 
 Pairing accepts explicit private/link-local endpoint hints. The QR secret opens
 a Noise session; its encrypted receipt carries a random transport credential
@@ -162,3 +165,10 @@ whose digest alone is stored by the node. Each use is rechecked against the
 completed pairing and current grant. The current data plane is plain HTTP and
 therefore restricted to a trusted private network; a confidential persistent
 peer channel remains a subsequent hardening phase.
+
+The Noise joiner ceremony is implemented once in `fractonica-client-runtime`.
+Mobile UniFFI and desktop Tauri expose only verified claim summaries and the
+explicit merge/keep-separate decision. The first HTTP request is retried with
+the identical Noise frame because the responder can durably replay its exact
+opaque response after an iOS local-network permission transition. Desktop
+bootstrap preserves an already admitted paired workspace across restarts.
