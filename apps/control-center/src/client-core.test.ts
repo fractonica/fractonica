@@ -138,4 +138,15 @@ describe("native client core adapter", () => {
       recordPolicy: "merge",
     });
   });
+
+  it("requires the native reset confirmation phrase below the JavaScript boundary", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createClientCore(invoke);
+
+    await client.resetInstallation?.();
+
+    expect(invoke).toHaveBeenCalledWith("client_reset_local_installation", {
+      confirmation: "RESET LOCAL INSTALLATION",
+    });
+  });
 });

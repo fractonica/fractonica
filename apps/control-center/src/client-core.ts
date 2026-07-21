@@ -96,6 +96,7 @@ export interface ClientCore {
   deleteRecord(entityId: string): Promise<CommitResult>;
   claimPairing(invitation: string): Promise<PairingClaim>;
   acceptPairing(invitationId: string, recordPolicy: PrePairRecordPolicy): Promise<PairingClaim>;
+  resetInstallation?(): Promise<void>;
 }
 
 type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -405,6 +406,11 @@ export function createClientCore(invoke: Invoke): ClientCore {
       return decodePairingClaim(
         await invoke("client_accept_pairing_invitation", { invitationId, recordPolicy }),
       );
+    },
+    resetInstallation: async () => {
+      await invoke("client_reset_local_installation", {
+        confirmation: "RESET LOCAL INSTALLATION",
+      });
     },
   };
 }

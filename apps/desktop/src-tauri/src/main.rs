@@ -21,7 +21,7 @@ use fractonica_data_model::{
     TagDocument,
 };
 use serde::Serialize;
-use tauri::{Manager, RunEvent, State};
+use tauri::{AppHandle, Manager, RunEvent, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_shell::{ShellExt, process::CommandChild};
 use uuid::Uuid;
@@ -457,6 +457,56 @@ async fn client_accept_pairing_invitation(
         .into())
 }
 
+#[tauri::command]
+async fn client_reset_local_installation(
+    app: AppHandle,
+    confirmation: String,
+) -> Result<(), String> {
+    if confirmation != "RESET LOCAL INSTALLATION" {
+        return Err("Resetting local storage requires explicit confirmation.".to_owned());
+    }
+    let application_data = app.path().app_data_dir().map_err(command_error)?;
+    let targets = [application_data.join("node"), application_data.join("client")];
+    if targets
+        .iter()
+        .any(|target| target.parent() != Some(application_data.as_path()))
+    {
+        return Err("Refusing to reset storage outside Fractonica app data.".to_owned());
+    }
+
+    stop_sidecar(&app);
+    for target in &targets {
+        remove_storage_tree_with_retry(target).await?;
+    }
+    eprintln!(
+        "Fractonica local installation reset completed; restarting with fresh node and client storage"
+    );
+    app.request_restart();
+    Ok(())
+}
+
+async fn remove_storage_tree_with_retry(path: &Path) -> Result<(), String> {
+    for attempt in 0..30 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 29 => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Failed to remove Fractonica storage at {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "Fractonica storage at {} remained busy after shutdown",
+        path.display()
+    ))
+}
+
 fn client(sidecar: &NodeSidecar) -> Result<Arc<ClientRuntime>, String> {
     sidecar
         .client
@@ -502,6 +552,7 @@ fn main() {
             client_import_attachments,
             client_claim_pairing_invitation,
             client_accept_pairing_invitation,
+            client_reset_local_installation,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

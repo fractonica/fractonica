@@ -664,7 +664,28 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
     [suppliedClientCore],
   );
   const [view, setView] = useState<WorkspaceView>(() => clientCore ? "records" : "node");
+  const [resetArmed, setResetArmed] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const { error, lastCheckedAt, phase, refresh, refreshing, snapshot } = useNodeStatus(client);
+
+  const resetInstallation = async () => {
+    if (!clientCore?.resetInstallation) return;
+    if (!resetArmed) {
+      setResetArmed(true);
+      setResetError(null);
+      return;
+    }
+    setResetting(true);
+    setResetError(null);
+    try {
+      await clientCore.resetInstallation();
+    } catch (reason) {
+      setResetError(reason instanceof Error ? reason.message : "Local storage could not be reset.");
+      setResetting(false);
+      setResetArmed(false);
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -718,6 +739,23 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
               {phase === "loading" ? <LoadingOverview baseUrl={client.baseUrl} /> : null}
               {phase === "offline" ? <OfflineOverview baseUrl={client.baseUrl} error={error} onRetry={() => void refresh()} refreshing={refreshing} /> : null}
               {phase === "ready" && snapshot ? <ReadyOverview snapshot={snapshot} /> : null}
+              {clientCore?.resetInstallation ? (
+                <Panel className="reset-installation-panel">
+                  <div>
+                    <h2>Reset local installation</h2>
+                    <p>Erase this desktop's records, attachments, pairing state, and node identity, then restart as a new device.</p>
+                    {resetError ? <p className="pairing-error" role="alert">{resetError}</p> : null}
+                  </div>
+                  <div className="reset-installation-panel__actions">
+                    <Button disabled={resetting} onClick={() => void resetInstallation()} variant="quiet">
+                      {resetting ? "Resetting…" : resetArmed ? "Confirm erase and restart" : "Reset local storage"}
+                    </Button>
+                    {resetArmed && !resetting ? (
+                      <Button onClick={() => setResetArmed(false)} variant="quiet">Cancel</Button>
+                    ) : null}
+                  </div>
+                </Panel>
+              ) : null}
             </div>
           </>
         ) : null}

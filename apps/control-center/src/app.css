@@ -829,6 +829,31 @@ main {
   font-size: 0.76rem;
 }
 
+.reset-installation-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.25rem;
+  border-color: rgba(255, 138, 120, 0.22);
+}
+
+.reset-installation-panel h2,
+.reset-installation-panel p {
+  margin: 0;
+}
+
+.reset-installation-panel p {
+  margin-top: 0.35rem;
+  color: #8b9995;
+  font-size: 0.78rem;
+}
+
+.reset-installation-panel__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.5rem;
+}
+
 .desktop-required-panel {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;

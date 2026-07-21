@@ -454,6 +454,11 @@ impl PairingControl for NodePairingControl {
         first_frame: &[u8],
         now: i64,
     ) -> Result<PairingHandshakeResult, PairingControlError> {
+        tracing::info!(
+            invitation_id = %id,
+            frame_bytes = first_frame.len(),
+            "pairing handshake reached the node"
+        );
         let session = self
             .durable
             .database()
@@ -526,6 +531,11 @@ impl PairingControl for NodePairingControl {
             .pairing_session(id)
             .map_err(store_error)?
             .ok_or(PairingControlError::Storage)?;
+        tracing::info!(
+            invitation_id = %id,
+            joiner_node_id = ?claimed.joiner_node_id,
+            "pairing handshake authenticated"
+        );
         Ok(PairingHandshakeResult {
             response_frame,
             receipt_frame,

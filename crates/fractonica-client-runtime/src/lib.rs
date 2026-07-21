@@ -1376,21 +1376,26 @@ async fn claim_pairing(
             let client = client.clone();
             let request = request.clone();
             requests.spawn(async move {
-                client
-                    .post(url)
-                    .json(&request)
-                    .send()
-                    .await
-                    .map(|response| (endpoint, response))
+                let result = client.post(url).json(&request).send().await;
+                (endpoint, result)
             });
         }
         while let Some(result) = requests.join_next().await {
-            if let Ok(Ok((endpoint, value))) = result
-                && value.status().is_success()
-            {
-                requests.abort_all();
-                response = Some((endpoint, value));
-                break;
+            if let Ok((endpoint, result)) = result {
+                match result {
+                    Ok(value) if value.status().is_success() => {
+                        requests.abort_all();
+                        response = Some((endpoint, value));
+                        break;
+                    }
+                    Ok(value) => eprintln!(
+                        "Fractonica pairing endpoint {endpoint} rejected the handshake with HTTP {}",
+                        value.status()
+                    ),
+                    Err(error) => eprintln!(
+                        "Fractonica pairing endpoint {endpoint} was unreachable: {error}"
+                    ),
+                }
             }
         }
         if response.is_some() {
