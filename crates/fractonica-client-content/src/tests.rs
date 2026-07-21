@@ -85,6 +85,22 @@ fn rejects_symlinked_native_sources() {
 }
 
 #[test]
+fn rejects_lengths_above_the_protocol_bound() {
+    assert!(matches!(
+        ensure_protocol_length(MAX_CONTENT_BYTE_LENGTH + 1),
+        Err(ClientContentError::ContentTooLarge {
+            actual,
+            maximum: MAX_CONTENT_BYTE_LENGTH
+        }) if actual == MAX_CONTENT_BYTE_LENGTH + 1
+    ));
+}
+
+// Creating a sparse file beyond the protocol maximum is a useful integration
+// check on filesystems that support it. Windows may reserve the full logical
+// length and fail with StorageFull before the importer can inspect metadata;
+// the platform-independent boundary check above still covers the guard.
+#[cfg(not(windows))]
+#[test]
 fn rejects_native_sources_above_the_protocol_bound_without_copying() {
     let directory = tempfile::tempdir().unwrap();
     let store = ClientContentStore::open(directory.path().join("store")).unwrap();

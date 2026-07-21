@@ -639,9 +639,11 @@ mod tests {
 
     #[test]
     fn claim_and_expiry_survive_restart() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempdir().unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.path().join("node.sqlite3");
         let store = SqliteStore::open(&path).unwrap();

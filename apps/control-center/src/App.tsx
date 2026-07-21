@@ -268,7 +268,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
         const next = await client.listPairedDevices();
         if (!stopped) setDevices(next);
       } catch (reason) {
-        if (!stopped) setError(reason instanceof Error ? reason.message : "Could not read paired devices.");
+        if (!stopped) setError(reason instanceof Error ? reason.message : "Could not read linked devices.");
       } finally {
         if (!stopped) timer = window.setTimeout(() => void poll(), 5_000);
       }
@@ -296,7 +296,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
         }
       } catch (reason) {
         if (!stopped) {
-          setError(reason instanceof Error ? reason.message : "Could not refresh pairing state.");
+          setError(reason instanceof Error ? reason.message : "Could not refresh link state.");
           timer = window.setTimeout(() => void poll(), 2_000);
         }
       }
@@ -330,7 +330,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
         }),
       );
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not create a pairing invitation.");
+      setError(reason instanceof Error ? reason.message : "Could not create a link invitation.");
     } finally {
       setBusy(false);
     }
@@ -344,7 +344,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
       const next = await client.readPairing(session.invitationId);
       setInvitation((current) => (current ? { qr: current.qr, session: next } : null));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not refresh pairing state.");
+      setError(reason instanceof Error ? reason.message : "Could not refresh link state.");
     } finally {
       setBusy(false);
     }
@@ -380,14 +380,14 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
   };
 
   const revoke = async (device: PairedDevice) => {
-    if (!window.confirm("Revoke this device's access? Its signed audit entry will remain visible.")) return;
+    if (!window.confirm("Remove this device's access? Its signed audit entry will remain visible.")) return;
     setRevoking(device.invitationId);
     setError(null);
     try {
       const revoked = await client.revokePairedDevice(device.invitationId);
       setDevices((current) => current.map((item) => item.invitationId === revoked.invitationId ? revoked : item));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not revoke the paired device.");
+      setError(reason instanceof Error ? reason.message : "Could not remove the linked device.");
     } finally {
       setRevoking(null);
     }
@@ -419,7 +419,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
       await clientCore.acceptPairing(joinClaim.invitationId, recordPolicy);
       setJoinComplete(true);
     } catch (reason) {
-      setError(nativeErrorMessage(reason, "Could not complete desktop pairing."));
+      setError(nativeErrorMessage(reason, "Could not complete the desktop link."));
     } finally {
       setJoining(false);
     }
@@ -430,7 +430,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
       <header className="section-header">
         <div>
           <p className="section-kicker">Local authority</p>
-          <h2 id="pairing-title">Pair a device</h2>
+          <h2 id="pairing-title">Link a device</h2>
           <p>
             Grant a new actor access without copying this node’s private keys. The invitation expires
             after five minutes and can be claimed once.
@@ -441,7 +441,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
 
       {!pairingAvailable || snapshot.node.profile !== "node" ? (
         <Panel className="pairing-card pairing-card--notice">
-          <h3>Pairing is unavailable in this profile</h3>
+          <h3>Device linking is unavailable in this profile</h3>
           <p>Start the full local node profile to create durable device capabilities.</p>
         </Panel>
       ) : null}
@@ -522,7 +522,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
           <div>
             <p className="pairing-step">Step 3 · Human confirmation</p>
             <h3>Compare both glyphs</h3>
-            <p>Verify every octal digit and both five-digit glyphs. The joining device admits the grant only when its Pair button is pressed.</p>
+            <p>Verify every octal digit and both five-digit glyphs. The joining device admits the grant only when its Link button is pressed.</p>
           </div>
           <ConfirmationGlyphs value={session.confirmationOctal} />
           <div className="pairing-actions">
@@ -540,7 +540,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
             <h3>Capability admitted</h3>
             <p>The joining actor now has exactly the bounded authority shown above.</p>
           </div>
-          <Button onClick={reset} variant="quiet">Pair another device</Button>
+          <Button onClick={reset} variant="quiet">Link another device</Button>
         </Panel>
       ) : null}
 
@@ -557,10 +557,10 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
         <Panel className="pairing-card paired-devices">
           <div>
             <p className="pairing-step">Authorized peers</p>
-            <h3>Paired devices</h3>
+            <h3>Linked devices</h3>
             <p>Online means the node verified this device's token and active capability within the last 15 seconds.</p>
           </div>
-          {devices.length === 0 ? <p className="empty-note">No devices have completed pairing yet.</p> : (
+          {devices.length === 0 ? <p className="empty-note">No devices have completed linking yet.</p> : (
             <ul className="paired-device-list">
               {devices.map((device) => {
                 const revoked = Boolean(device.revocationOperationId);
@@ -573,8 +573,8 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
                           {revoked ? "Revoked" : device.online ? "Online" : "Offline"}
                         </StatusBadge>
                       </div>
-                      <span>Paired {new Date(device.pairedAtUnixMs).toLocaleString()}</span>
-                      <span>{device.lastSeenAtUnixMs ? `Last seen ${new Date(device.lastSeenAtUnixMs).toLocaleString()}` : "Not seen since pairing"}</span>
+                      <span>Linked {new Date(device.pairedAtUnixMs).toLocaleString()}</span>
+                      <span>{device.lastSeenAtUnixMs ? `Last seen ${new Date(device.lastSeenAtUnixMs).toLocaleString()}` : "Not seen since linking"}</span>
                     </div>
                     {!revoked ? (
                       <Button className="danger-button" disabled={revoking === device.invitationId} onClick={() => void revoke(device)} variant="quiet">
@@ -594,15 +594,15 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
           {!joinClaim ? (
             <>
               <div>
-                <p className="pairing-step">Join another node</p>
-                <h3>Pair this desktop</h3>
+                <p className="pairing-step">Link another node</p>
+                <h3>Link this desktop</h3>
                 <p>
                   Create an invitation on the other desktop, copy its payload, and paste it here.
                   Protected node and actor keys stay in this app’s native Rust runtime.
                 </p>
               </div>
               <label className="field-label">
-                Pairing invitation
+                Link invitation
                 <textarea
                   onChange={(event) => setJoinPayload(event.target.value)}
                   placeholder="fractonica-pairing:v1:…"
@@ -623,7 +623,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
                 <h3>Compare both desktops</h3>
                 <p>
                   Confirm that these two five-digit glyphs and all ten octal digits exactly match
-                  the inviting desktop before pairing.
+                  the inviting desktop before linking.
                 </p>
               </div>
               <ConfirmationGlyphs value={joinClaim.confirmationOctal} />
@@ -639,11 +639,11 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
               ) : null}
               <div className="pairing-actions">
                 <Button disabled={joining} onClick={() => void acceptRemote("merge")}>
-                  {joining ? "Pairing…" : joinClaim.localRecordCount > 0 ? "Pair and merge" : "Pair"}
+                  {joining ? "Linking…" : joinClaim.localRecordCount > 0 ? "Link and merge" : "Link"}
                 </Button>
                 {joinClaim.localRecordCount > 0 ? (
                   <Button disabled={joining} onClick={() => void acceptRemote("discard")} variant="quiet">
-                    Pair and keep separate
+                    Link and keep separate
                   </Button>
                 ) : null}
                 <Button disabled={joining} onClick={() => setJoinClaim(null)} variant="quiet">Cancel</Button>
@@ -651,14 +651,14 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
             </>
           ) : (
             <>
-              <StatusBadge tone="ready">Desktop paired</StatusBadge>
+              <StatusBadge tone="ready">Desktop linked</StatusBadge>
               <div>
                 <p className="pairing-step">Complete</p>
                 <h3>Remote workspace connected</h3>
-                <p>Operations and record media now synchronize through the paired node.</p>
+                <p>Operations and record media now synchronize through the linked node.</p>
               </div>
               <Button onClick={() => { setJoinClaim(null); setJoinComplete(false); setJoinPayload(""); }} variant="quiet">
-                Join another node
+                Link another node
               </Button>
             </>
           )}
@@ -713,7 +713,7 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
           <span className="nav-label">Local workspace</span>
           <button className={`nav-item${view === "records" ? "" : " nav-item--secondary"}`} onClick={() => setView("records")} type="button"><span aria-hidden="true" className="nav-item__glyph">✦</span>Records</button>
           <button className={`nav-item${view === "node" ? "" : " nav-item--secondary"}`} onClick={() => setView("node")} type="button"><span aria-hidden="true" className="nav-item__glyph">◈</span>Node overview</button>
-          <button className={`nav-item${view === "pairing" ? "" : " nav-item--secondary"}`} onClick={() => setView("pairing")} type="button"><span aria-hidden="true" className="nav-item__glyph">⌁</span>Pair devices</button>
+          <button className={`nav-item${view === "pairing" ? "" : " nav-item--secondary"}`} onClick={() => setView("pairing")} type="button"><span aria-hidden="true" className="nav-item__glyph">⌁</span>Link devices</button>
         </nav>
         <div className="sidebar__status">
           <StatusBadge tone={toneForPhase(phase)}>{labelForPhase(phase)}</StatusBadge>
@@ -758,7 +758,7 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
                 <Panel className="reset-installation-panel">
                   <div>
                     <h2>Reset local installation</h2>
-                    <p>Erase this desktop's records, attachments, pairing state, and node identity, then restart as a new device.</p>
+                    <p>Erase this desktop's records, attachments, link state, and node identity, then restart as a new device.</p>
                     {resetError ? <p className="pairing-error" role="alert">{resetError}</p> : null}
                   </div>
                   <div className="reset-installation-panel__actions">

@@ -454,6 +454,118 @@ fn completed_peer_download_unlocks_fanout_without_duplicate_source_upload() {
 }
 
 #[test]
+fn three_node_chain_forwards_complete_trust_history_and_converges() {
+    let relay = ClientSqliteStore::open_in_memory().unwrap();
+    let identity = standalone_identity(90);
+    let bootstrap = build_trusted_space_bootstrap(&identity, "Shared space", 100).unwrap();
+    let upstream = PeerConfig {
+        peer_id: key(94).node_id(),
+        endpoint: "https://upstream.example".into(),
+        enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
+        added_at_unix_ms: 101,
+    };
+    let downstream = PeerConfig {
+        peer_id: key(95).node_id(),
+        endpoint: "https://downstream.example".into(),
+        enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
+        added_at_unix_ms: 101,
+    };
+    relay.upsert_peer(&upstream).unwrap();
+    relay.upsert_peer(&downstream).unwrap();
+    relay
+        .commit_from_peer(&bootstrap.genesis, 102, upstream.peer_id)
+        .unwrap();
+    relay
+        .commit_from_peer(&bootstrap.initial_grant, 103, upstream.peer_id)
+        .unwrap();
+    let record = OperationEnvelope::sign(
+        identity.space_id(),
+        entity(96),
+        EntitySchema::Record,
+        Vec::new(),
+        vec![bootstrap.initial_grant.operation_id],
+        104,
+        OperationNonce::from_bytes([96; 16]),
+        OperationBody::PutRecord {
+            payload: ProtectedDocument::Public {
+                document: RecordDocument {
+                    start_at_unix_ms: 104,
+                    end_at_unix_ms: None,
+                    emoji: None,
+                    text: Some("transitive".into()),
+                    metadata: BTreeMap::new(),
+                    resources: Vec::new(),
+                    references: Vec::new(),
+                },
+            },
+        },
+        identity.local_writer_key(),
+    )
+    .unwrap();
+    relay
+        .commit_from_peer(&record, 104, upstream.peer_id)
+        .unwrap();
+
+    assert_eq!(
+        relay.outbox_counts(upstream.peer_id).unwrap().acknowledged,
+        3
+    );
+    let forwarded = relay
+        .lease_due(
+            downstream.peer_id,
+            104,
+            Duration::from_secs(1),
+            10,
+            DeliveryLeaseId::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        forwarded
+            .iter()
+            .map(|item| item.operation.operation_id)
+            .collect::<Vec<_>>(),
+        vec![
+            bootstrap.genesis.operation_id,
+            bootstrap.initial_grant.operation_id,
+            record.operation_id,
+        ]
+    );
+
+    let leaf = ClientSqliteStore::open_in_memory().unwrap();
+    let relay_peer = PeerConfig {
+        peer_id: key(97).node_id(),
+        endpoint: "https://relay.example".into(),
+        enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
+        added_at_unix_ms: 105,
+    };
+    leaf.upsert_peer(&relay_peer).unwrap();
+    for item in forwarded {
+        leaf.commit_from_peer(&item.operation, 105, relay_peer.peer_id)
+            .unwrap();
+    }
+    assert_eq!(
+        leaf.entity(identity.space_id(), record.entity_id)
+            .unwrap()
+            .unwrap()
+            .heads,
+        vec![record]
+    );
+    assert_eq!(
+        leaf.outbox_counts(relay_peer.peer_id).unwrap().acknowledged,
+        3
+    );
+}
+
+#[test]
 fn concurrent_heads_are_preserved_then_explicitly_merged() {
     let (store, signing_key, genesis) = seeded_store();
     let root = record(

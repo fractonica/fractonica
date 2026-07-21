@@ -371,22 +371,22 @@ function PairingModal({
           <Pressable accessibilityRole="button" disabled={working} hitSlop={12} onPress={onClose}>
             <Text style={styles.composerCancel}>Close</Text>
           </Pressable>
-          <Text style={styles.composerTitle}>Pair a node</Text>
+          <Text style={styles.composerTitle}>Link a node</Text>
           <View style={styles.composerSpacer} />
         </View>
 
         {claim ? (
           <View style={styles.pairingResult}>
             <Text style={styles.pairingKicker}>
-              {accepted ? "PAIRING COMPLETE" : "COMPARE WITH THE DESKTOP"}
+              {accepted ? "LINK COMPLETE" : "COMPARE WITH THE DESKTOP"}
             </Text>
             <Text style={styles.pairingTitle}>
-              {accepted ? "Node paired" : "Do both sequences match?"}
+              {accepted ? "Node linked" : "Do both sequences match?"}
             </Text>
             <Text style={styles.pairingText}>
               {accepted
                 ? "The verified peer is stored on this device and record and media synchronization can continue in the background."
-                : "Check every octal digit and both glyphs. Press Pair only when the desktop shows the same sequence."}
+                : "Check every octal digit and both glyphs. Press Link only when the desktop shows the same sequence."}
             </Text>
             {!accepted && claim.localRecordCount > 0 ? (
               <View style={styles.recordPolicy}>
@@ -394,7 +394,7 @@ function PairingModal({
                   {claim.localRecordCount} local {claim.localRecordCount === 1 ? "record" : "records"}
                 </Text>
                 <Text style={styles.recordPolicyText}>
-                  Choose what happens to records created before this device was paired.
+                  Choose what happens to records created before this device was linked.
                 </Text>
                 <View style={styles.recordPolicyChoices}>
                   <Pressable
@@ -404,7 +404,7 @@ function PairingModal({
                     style={[styles.recordPolicyChoice, recordPolicy === "merge" && styles.recordPolicyChoiceSelected]}
                   >
                     <Text style={styles.recordPolicyChoiceTitle}>Merge</Text>
-                    <Text style={styles.recordPolicyChoiceText}>Copy into the paired node and sync media.</Text>
+                    <Text style={styles.recordPolicyChoiceText}>Copy into the linked node and sync media.</Text>
                   </Pressable>
                   <Pressable
                     accessibilityRole="radio"
@@ -413,13 +413,13 @@ function PairingModal({
                     style={[styles.recordPolicyChoice, recordPolicy === "discard" && styles.recordPolicyChoiceSelected]}
                   >
                     <Text style={styles.recordPolicyChoiceTitle}>Discard</Text>
-                    <Text style={styles.recordPolicyChoiceText}>Do not copy them into this paired space.</Text>
+                    <Text style={styles.recordPolicyChoiceText}>Do not copy them into this linked space.</Text>
                   </Pressable>
                 </View>
               </View>
             ) : null}
             <Pressable
-              accessibilityLabel={`Pair with confirmation ${claim.confirmationOctal}`}
+              accessibilityLabel={`Link with confirmation ${claim.confirmationOctal}`}
               accessibilityRole="button"
               disabled={working || accepted}
               onPress={() => void accept()}
@@ -451,7 +451,7 @@ function PairingModal({
                 ))}
               </View>
               <Text style={styles.confirmationButtonText}>
-                {working ? "Pairing…" : accepted ? "Paired" : "Pair"}
+                {working ? "Linking…" : accepted ? "Linked" : "Link"}
               </Text>
             </Pressable>
             {error ? <Text accessibilityRole="alert" style={styles.errorText}>{error}</Text> : null}
@@ -459,13 +459,13 @@ function PairingModal({
           </View>
         ) : (
           <View style={styles.pairingBody}>
-            <Text style={styles.pairingKicker}>LOCAL NETWORK PAIRING</Text>
-            <Text style={styles.pairingTitle}>Paste a pairing invitation</Text>
+            <Text style={styles.pairingKicker}>LOCAL NETWORK LINK</Text>
+            <Text style={styles.pairingTitle}>Paste a link invitation</Text>
             <Text style={styles.pairingText}>
               Create a short-lived invitation in the desktop node, then paste its Fractonica v1 payload here. The protected device keys never enter JavaScript.
             </Text>
             <TextInput
-              accessibilityLabel="Pairing invitation"
+              accessibilityLabel="Link invitation"
               autoCapitalize="none"
               autoCorrect={false}
               editable={!working}
@@ -712,7 +712,7 @@ export function RecordsScreen({ pairingInvitation, onClosePairing }: RecordsScre
               onPress={() => setPairingOpen(true)}
               style={({ pressed }) => [styles.pairButton, pressed && styles.pressed, !coreReady && styles.disabled]}
             >
-              <Text style={styles.pairButtonText}>Pair</Text>
+              <Text style={styles.pairButtonText}>Link</Text>
             </Pressable>
             <View style={[styles.statusPill, coreReady && styles.statusPillReady]}>
               <View style={[styles.statusDot, coreReady && styles.statusDotReady]} />

@@ -281,6 +281,42 @@ async fn worker_retries_then_acknowledges_without_blocking_the_async_executor() 
 }
 
 #[tokio::test]
+async fn worker_defers_a_peer_batch_suffix_when_its_prefix_is_retryable() {
+    let store = ClientSqliteStore::open_in_memory().unwrap();
+    let signing_key = key(17);
+    let genesis = genesis(&signing_key);
+    store.commit_remote(&genesis, 1).unwrap();
+    let peer = peer("https://peer.example".into(), 18);
+    store.upsert_peer(&peer).unwrap();
+    let first = record(&signing_key, entity(17), genesis.operation_id, 17);
+    let second = record(&signing_key, entity(18), genesis.operation_id, 18);
+    store.commit_local(&first, 2).unwrap();
+    store.commit_local(&second, 3).unwrap();
+    let transport = FakeTransport::default();
+    transport
+        .pushes
+        .lock()
+        .unwrap()
+        .push_back(Err(TransportError::retryable("trust prefix unavailable")));
+    transport.pushes.lock().unwrap().push_back(Ok(()));
+    let clock = FixedClock::new(10);
+    let content_directory = tempfile::tempdir().unwrap();
+    let content = ClientContentStore::open(content_directory.path()).unwrap();
+    let (worker, _) =
+        SyncWorker::with_clock(store.clone(), content, transport, clock.clone(), config()).unwrap();
+
+    let first_cycle = worker.run_cycle().await.unwrap();
+    assert_eq!(first_cycle.retried, 1);
+    assert_eq!(first_cycle.pushed, 0);
+    assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 2);
+
+    clock.set(1_010);
+    let second_cycle = worker.run_cycle().await.unwrap();
+    assert_eq!(second_cycle.pushed, 2);
+    assert_eq!(store.outbox_counts(peer.peer_id).unwrap().acknowledged, 2);
+}
+
+#[tokio::test]
 async fn worker_commits_a_complete_pull_before_advancing_the_durable_cursor() {
     let store = ClientSqliteStore::open_in_memory().unwrap();
     let signing_key = key(7);

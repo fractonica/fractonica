@@ -727,7 +727,44 @@ fn validate_private_regular_with_links(
             });
         }
     }
+    #[cfg(windows)]
+    {
+        let found = windows_link_count(path)?;
+        if !allowed_link_counts.contains(&found) {
+            return Err(InstallationError::UnsafeLinkCount {
+                path: path.to_owned(),
+                found,
+            });
+        }
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_link_count(path: &Path) -> Result<u64, InstallationError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = File::open(path).map_err(|source| InstallationError::Io {
+        action: "open private file for link inspection",
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a valid handle for the duration of the call and the
+    // output pointer refers to an initialized, writable structure.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) };
+    if succeeded == 0 {
+        return Err(InstallationError::Io {
+            action: "inspect private file link count",
+            path: path.to_owned(),
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(u64::from(information.nNumberOfLinks))
 }
 
 fn sync_directory(path: &Path) -> Result<(), InstallationError> {

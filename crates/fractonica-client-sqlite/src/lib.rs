@@ -733,8 +733,7 @@ impl ClientSqliteStore {
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', stored_at_unix_ms
                    FROM client_operations
-                  WHERE schema_id IN ('record', 'event', 'tag', 'profile')
-                    AND ((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
+                  WHERE ((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
                       OR EXISTS (
                         SELECT 1 FROM client_peer_spaces space
                          WHERE space.peer_id=?1
@@ -841,12 +840,19 @@ impl ClientSqliteStore {
             |row| row.get::<_, bool>(0),
         )?;
         if push_enabled {
+            let schema_scope = match &config.read_mode {
+                PeerReadMode::SupervisorBearer => {
+                    "AND schema_id IN ('record','event','tag','profile')"
+                }
+                PeerReadMode::Paired { .. } => "",
+            };
             transaction.execute(
-                "INSERT OR IGNORE INTO client_deliveries (
+                &format!(
+                    "INSERT OR IGNORE INTO client_deliveries (
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', ?3 FROM client_operations
-                   WHERE space_id=?2
-                     AND schema_id IN ('record','event','tag','profile')",
+                   WHERE space_id=?2 {schema_scope}"
+                ),
                 params![
                     config.peer_id.to_string(),
                     config.space_id.to_string(),
@@ -1542,6 +1548,24 @@ impl ClientSqliteStore {
             acknowledged_at_unix_ms,
             None,
         )
+    }
+
+    /// Returns every still-unattempted item from one batch lease to the
+    /// pending queue. Items already acknowledged, retried, or rejected no
+    /// longer carry the lease and are left unchanged.
+    pub fn release_lease(
+        &self,
+        peer_id: NodeId,
+        lease_id: DeliveryLeaseId,
+    ) -> Result<u64, ClientStoreError> {
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "UPDATE client_deliveries SET
+                state = 'pending', lease_id = NULL, lease_expires_at_unix_ms = NULL
+             WHERE peer_id = ?1 AND state = 'leased' AND lease_id = ?2",
+            params![peer_id.to_string(), lease_id.to_string()],
+        )?;
+        u64::try_from(changed).map_err(|_| corrupt("released delivery count overflow"))
     }
 
     pub fn retry(
@@ -2666,14 +2690,6 @@ fn apply_delivery_source(
     at_unix_ms: i64,
     source: CommitSource,
 ) -> Result<(), ClientStoreError> {
-    let schema: String = transaction.query_row(
-        "SELECT schema_id FROM client_operations WHERE operation_id = ?1",
-        params![operation_id.to_string()],
-        |row| row.get(0),
-    )?;
-    if !matches!(schema.as_str(), "record" | "event" | "tag" | "profile") {
-        return Ok(());
-    }
     if let CommitSource::Peer(peer_id) = source {
         let configured = transaction
             .query_row(

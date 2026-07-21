@@ -156,8 +156,8 @@ describe("control center", () => {
     const user = userEvent.setup();
 
     render(<App client={client} />);
-    await user.click(screen.getByRole("button", { name: "Pair devices" }));
-    await screen.findByRole("heading", { name: "Pair a device" });
+    await user.click(screen.getByRole("button", { name: "Link devices" }));
+    await screen.findByRole("heading", { name: "Link a device" });
     await user.click(screen.getByRole("button", { name: "Create invitation" }));
 
     expect(await screen.findByText("Scan from the joining client")).toBeInTheDocument();

@@ -342,6 +342,16 @@ where
                         })
                         .await?;
                         report.rejected += 1;
+                        blocking({
+                            let store = self.store.clone();
+                            let peer_id = peer.peer_id;
+                            move || store.release_lease(peer_id, lease_id).map(|_| ())
+                        })
+                        .await?;
+                        // A rejected prefix may authorize or causally precede
+                        // the remaining batch, so do not cascade misleading
+                        // permanent rejections through its suffix.
+                        break;
                     }
                     Err(error) => {
                         let completed_at = self.clock.now_unix_ms()?;
@@ -356,6 +366,18 @@ where
                         })
                         .await?;
                         report.retried += 1;
+                        blocking({
+                            let store = self.store.clone();
+                            let peer_id = peer.peer_id;
+                            move || store.release_lease(peer_id, lease_id).map(|_| ())
+                        })
+                        .await?;
+                        // Delivery order is causal order. If an earlier
+                        // operation (notably a capability grant) could not be
+                        // accepted yet, pushing later dependent operations in
+                        // this cycle would turn a temporary gap into permanent
+                        // missing-authorization rejections at the peer.
+                        break;
                     }
                 }
             }
