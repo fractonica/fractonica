@@ -413,19 +413,29 @@ fn permits_append(grant: &CapabilityGrant, schema: EntitySchema, visibility: Vis
 }
 
 fn permits_delegation(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool {
-    parent.actions.contains(&CapabilityAction::IssueCapability)
+    let scope_is_narrower = || {
+        is_subset(&child.actions, &parent.actions)
+            && is_subset_by(&child.schemas, &parent.schemas, |value| value.as_str())
+            && is_subset(&child.visibilities, &parent.visibilities)
+            && is_subset(&child.content_roles, &parent.content_roles)
+            && maximum_is_narrower(
+                child.max_resource_byte_length,
+                parent.max_resource_byte_length,
+            )
+            && lower_bound_is_narrower(child.not_before_unix_ms, parent.not_before_unix_ms)
+            && upper_bound_is_narrower(child.expires_at_unix_ms, parent.expires_at_unix_ms)
+    };
+    let attenuated = parent.actions.contains(&CapabilityAction::IssueCapability)
         && parent.delegation_depth > 0
         && child.delegation_depth < parent.delegation_depth
-        && is_subset(&child.actions, &parent.actions)
-        && is_subset_by(&child.schemas, &parent.schemas, |value| value.as_str())
-        && is_subset(&child.visibilities, &parent.visibilities)
-        && is_subset(&child.content_roles, &parent.content_roles)
-        && maximum_is_narrower(
-            child.max_resource_byte_length,
-            parent.max_resource_byte_length,
-        )
-        && lower_bound_is_narrower(child.not_before_unix_ms, parent.not_before_unix_ms)
-        && upper_bound_is_narrower(child.expires_at_unix_ms, parent.expires_at_unix_ms)
+        && scope_is_narrower();
+    let workspace_link = parent.actions.contains(&CapabilityAction::LinkWorkspace)
+        && child.actions.contains(&CapabilityAction::LinkWorkspace)
+        && !child.actions.contains(&CapabilityAction::IssueCapability)
+        && !child.actions.contains(&CapabilityAction::RevokeCapability)
+        && child.delegation_depth == 0
+        && scope_is_narrower();
+    attenuated || workspace_link
 }
 
 fn is_subset<T: Ord>(child: &[T], parent: &[T]) -> bool {
@@ -845,6 +855,94 @@ mod tests {
         assert_eq!(
             authorize_operation(&record, NOW, &view),
             Err(AuthorizationError::Revoked(parent.operation_id))
+        );
+    }
+
+    #[test]
+    fn workspace_link_authority_is_renewable_but_cannot_create_admin_authority() {
+        let space_id = space(23);
+        let controller = key(23);
+        let first_member = key(24);
+        let second_member = key(25);
+        let third_member = key(26);
+        let genesis = genesis(space_id, &controller);
+        let member_grant = |subject| CapabilityGrant {
+            actions: vec![
+                CapabilityAction::AppendOperation,
+                CapabilityAction::LinkWorkspace,
+            ],
+            delegation_depth: 0,
+            ..writer_grant(subject)
+        };
+        let first = grant(
+            space_id,
+            &controller,
+            vec![genesis.operation_id],
+            2,
+            2,
+            member_grant(first_member.actor_id()),
+        );
+        let second = grant(
+            space_id,
+            &first_member,
+            vec![first.operation_id],
+            3,
+            3,
+            member_grant(second_member.actor_id()),
+        );
+        let third = grant(
+            space_id,
+            &second_member,
+            vec![second.operation_id],
+            4,
+            4,
+            member_grant(third_member.actor_id()),
+        );
+        let record = record(
+            space_id,
+            &third_member,
+            vec![third.operation_id],
+            Visibility::Public,
+            NOW,
+        );
+        let mut view = MemoryView::default();
+        view.insert(genesis);
+        view.insert(first);
+        view.insert(second.clone());
+        view.insert(third);
+        assert_eq!(authorize_operation(&record, NOW, &view), Ok(()));
+
+        let administrative = CapabilityGrant {
+            subject: key(27).actor_id(),
+            actions: vec![CapabilityAction::RevokeCapability],
+            schemas: Vec::new(),
+            visibilities: Vec::new(),
+            content_roles: Vec::new(),
+            max_resource_byte_length: None,
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            delegation_depth: 0,
+            label: "must fail".into(),
+        };
+        let administrative = grant(
+            space_id,
+            &second_member,
+            vec![second.operation_id],
+            5,
+            5,
+            administrative,
+        );
+        view.insert(administrative.clone());
+        assert_eq!(
+            authorize_capability_action(
+                space_id,
+                key(27).actor_id(),
+                &[administrative.operation_id],
+                CapabilityAction::RevokeCapability,
+                NOW,
+                &view,
+            ),
+            Err(AuthorizationError::Denied)
         );
     }
 

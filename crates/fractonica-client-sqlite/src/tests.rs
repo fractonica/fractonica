@@ -185,6 +185,54 @@ fn local_commit_is_atomic_replayable_and_materialized_before_delivery() {
 }
 
 #[test]
+fn a_peer_with_an_explicit_workspace_never_receives_another_spaces_operations() {
+    let (store, signing_key, genesis) = seeded_store();
+    let peer = PeerConfig {
+        peer_id: key(41).node_id(),
+        endpoint: "https://local-node.example".into(),
+        enabled: true,
+        push_enabled: true,
+        content_read_enabled: true,
+        peer_transport_credential: None,
+        added_at_unix_ms: 2,
+    };
+    store.upsert_peer(&peer).unwrap();
+    store
+        .configure_peer_space(&PeerSpaceConfig {
+            peer_id: peer.peer_id,
+            space_id: SpaceId::from_bytes([2; 32]),
+            read_mode: PeerReadMode::SupervisorBearer,
+            start_after: 0,
+            next_pull_at_unix_ms: 2,
+        })
+        .unwrap();
+    let operation = record(
+        &signing_key,
+        entity(41),
+        Vec::new(),
+        genesis.operation_id,
+        41,
+        100,
+        "belongs to another workspace",
+    );
+
+    let committed = store.commit_local(&operation, 3).unwrap();
+    assert_eq!(committed.queued_peers, 0);
+    assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 0);
+
+    store
+        .configure_peer_space(&PeerSpaceConfig {
+            peer_id: peer.peer_id,
+            space_id: space(),
+            read_mode: PeerReadMode::SupervisorBearer,
+            start_after: 0,
+            next_pull_at_unix_ms: 4,
+        })
+        .unwrap();
+    assert_eq!(store.outbox_counts(peer.peer_id).unwrap().pending, 1);
+}
+
+#[test]
 fn disabled_provisional_peer_can_supply_bootstrap_operations_without_syncing() {
     let (store, signing_key, genesis) = seeded_store();
     let peer_id = key(19).node_id();
@@ -1105,30 +1153,21 @@ fn paired_read_only_peer_never_queues_local_operations_or_media_uploads() {
 }
 
 #[test]
-fn standalone_establishment_is_atomic_replayable_and_pins_exact_anchors() {
+fn installation_identity_and_workspace_roots_are_independent_and_replayable() {
     let store = ClientSqliteStore::open_in_memory().unwrap();
     assert_eq!(store.installation().unwrap(), ClientInstallation::Unbound);
-    assert_eq!(
-        store.begin_local_installation().unwrap(),
-        ClientInstallation::Initializing
-    );
     let identity = standalone_identity(40);
+    let binding = ClientInstallationBinding {
+        node_id: identity.node_id(),
+        controller_actor_id: identity.space_controller_actor_id(),
+        local_writer_actor_id: identity.local_writer_actor_id(),
+    };
+    assert_eq!(store.bind_local_identity(binding.clone()).unwrap(), binding);
     let bootstrap = build_trusted_space_bootstrap(&identity, "Personal space", 100).unwrap();
 
-    let established = store
-        .establish_local_space(identity.node_id(), &bootstrap)
-        .unwrap();
-    assert!(!established.replayed);
-    assert_eq!(established.binding.node_id, identity.node_id());
-    assert_eq!(established.binding.space_id, identity.space_id());
-    assert_eq!(
-        established.binding.controller_actor_id,
-        identity.space_controller_actor_id()
-    );
-    assert_eq!(
-        established.binding.local_writer_actor_id,
-        identity.local_writer_actor_id()
-    );
+    let workspace = store.store_workspace(&bootstrap).unwrap();
+    assert_eq!(workspace.space_id, identity.space_id());
+    assert_eq!(store.workspaces().unwrap(), vec![workspace.clone()]);
     assert_eq!(
         store
             .operation(bootstrap.genesis.operation_id)
@@ -1143,36 +1182,33 @@ fn standalone_establishment_is_atomic_replayable_and_pins_exact_anchors() {
             .unwrap(),
         bootstrap.initial_grant
     );
-    assert_eq!(operation_count(&store.lock().unwrap()).unwrap(), 2);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM client_operations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
 
-    let replay = store
-        .establish_local_space(identity.node_id(), &bootstrap)
-        .unwrap();
-    assert!(replay.replayed);
-    assert_eq!(replay.binding, established.binding);
+    assert_eq!(store.store_workspace(&bootstrap).unwrap(), workspace);
 }
 
 #[test]
-fn standalone_establishment_rejects_an_exact_preexisting_anchor() {
+fn workspace_admission_completes_an_exact_preexisting_anchor() {
     let store = ClientSqliteStore::open_in_memory().unwrap();
-    store.begin_local_installation().unwrap();
     let identity = standalone_identity(50);
     let bootstrap = build_trusted_space_bootstrap(&identity, "Personal space", 200).unwrap();
     store.commit_remote(&bootstrap.genesis, 200).unwrap();
 
-    assert!(matches!(
-        store.establish_local_space(identity.node_id(), &bootstrap),
-        Err(ClientStoreError::UntrackedInstallationOperations)
-    ));
-    assert_eq!(
-        store.installation().unwrap(),
-        ClientInstallation::Initializing
-    );
+    let workspace = store.store_workspace(&bootstrap).unwrap();
+    assert_eq!(workspace.space_id, identity.space_id());
     assert!(
         store
             .operation(bootstrap.initial_grant.operation_id)
             .unwrap()
-            .is_none()
+            .is_some()
     );
 }
 
@@ -1194,54 +1230,26 @@ fn persistent_store_rejects_a_symbolic_link_database_path() {
 }
 
 #[test]
-fn standalone_establishment_rejects_untracked_operations() {
+fn independent_workspace_roots_coexist() {
     let store = ClientSqliteStore::open_in_memory().unwrap();
-    store.begin_local_installation().unwrap();
     let expected_identity = standalone_identity(70);
     let expected =
         build_trusted_space_bootstrap(&expected_identity, "Personal space", 300).unwrap();
     let unrelated_identity = standalone_identity(80);
     let unrelated = build_trusted_space_bootstrap(&unrelated_identity, "Other space", 301).unwrap();
-    store.commit_remote(&unrelated.genesis, 301).unwrap();
+    store.store_workspace(&unrelated).unwrap();
+    store.store_workspace(&expected).unwrap();
 
-    assert!(matches!(
-        store.establish_local_space(expected_identity.node_id(), &expected),
-        Err(ClientStoreError::UntrackedInstallationOperations)
-    ));
-    assert_eq!(
-        store.installation().unwrap(),
-        ClientInstallation::Initializing
+    let workspaces = store.workspaces().unwrap();
+    assert_eq!(workspaces.len(), 2);
+    assert!(
+        workspaces
+            .iter()
+            .any(|space| space.space_id == expected.genesis.space_id)
     );
     assert!(
-        store
-            .operation(expected.genesis.operation_id)
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[test]
-fn ordered_migrations_upgrade_a_version_one_client_database() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("client.sqlite3");
-    {
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(MIGRATIONS[0]).unwrap();
-        assert_eq!(
-            connection
-                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
-                .unwrap(),
-            1
-        );
-    }
-
-    let store = ClientSqliteStore::open(&path).unwrap();
-    assert_eq!(store.installation().unwrap(), ClientInstallation::Unbound);
-    let connection = store.lock().unwrap();
-    assert_eq!(
-        connection
-            .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
-            .unwrap(),
-        CLIENT_SCHEMA_VERSION
+        workspaces
+            .iter()
+            .any(|space| space.space_id == unrelated.genesis.space_id)
     );
 }

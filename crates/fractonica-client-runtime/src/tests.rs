@@ -115,7 +115,7 @@ fn anchors(identity: &IdentityBundle) -> (SpaceDescriptor, StoredOperation, Stor
         EntitySchema::CapabilityGrant,
         Vec::new(),
         vec![genesis.operation_id],
-        2,
+        1,
         OperationNonce::from_bytes([2; 16]),
         OperationBody::CapabilityGrant {
             grant: CapabilityGrant {
@@ -123,6 +123,8 @@ fn anchors(identity: &IdentityBundle) -> (SpaceDescriptor, StoredOperation, Stor
                 actions: vec![
                     CapabilityAction::AppendOperation,
                     CapabilityAction::ReadSpace,
+                    CapabilityAction::WriteContent,
+                    CapabilityAction::LinkWorkspace,
                 ],
                 schemas: vec![
                     EntitySchema::Event,
@@ -131,8 +133,8 @@ fn anchors(identity: &IdentityBundle) -> (SpaceDescriptor, StoredOperation, Stor
                     EntitySchema::Tag,
                 ],
                 visibilities: vec![Visibility::Public, Visibility::Private],
-                content_roles: Vec::new(),
-                max_resource_byte_length: None,
+                content_roles: vec!["record.media".into()],
+                max_resource_byte_length: Some(1_073_741_824),
                 not_before_unix_ms: None,
                 expires_at_unix_ms: None,
                 delegation_depth: 0,
@@ -216,7 +218,7 @@ async fn adopts_exact_node_identity_commits_locally_and_survives_restart() {
     assert!(matches!(&runtime.sync, RuntimeSync::Worker { .. }));
     assert_eq!(runtime.status().node_id, identity.node_id());
     assert_eq!(runtime.status().actor_id, identity.local_writer_actor_id());
-    assert_eq!(runtime.status().space_id, identity.space_id());
+    assert_eq!(runtime.status().space_id, Some(identity.space_id()));
 
     let attachment_source = directory.path().join("eclipse.jpg");
     let attachment_bytes = b"native attachment";
@@ -295,6 +297,49 @@ async fn adopts_exact_node_identity_commits_locally_and_survives_restart() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].operation_id, created.operation_id);
     restarted.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn supervised_runtime_accepts_an_installation_with_no_workspaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let node_data = directory.path().join("node");
+    prepare_private_directory(&node_data).unwrap();
+    let identity = FileKeyStore::new(node_data.join("identity"))
+        .load_or_create()
+        .unwrap();
+    let app = Router::new().route(
+        "/api/node",
+        get({
+            let node_id = identity.node_id();
+            move || async move {
+                Json(json!({
+                    "nodeId": node_id,
+                    "spaces": [],
+                    "profile": "node"
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let runtime = ClientRuntime::bootstrap_supervised(SupervisedNodeConfig {
+        client_data_dir: directory.path().join("client"),
+        node_data_dir: node_data,
+        endpoint: format!("http://{address}"),
+        bearer_token: TOKEN.into(),
+        sync: SyncConfig::default(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(runtime.status().space_id, None);
+    assert!(matches!(
+        runtime.list(EntitySchema::Record, 20).await,
+        Err(ClientRuntimeError::NoActiveWorkspace)
+    ));
+    runtime.shutdown().await.unwrap();
     server.abort();
 }
 
@@ -441,7 +486,6 @@ async fn pairing_joiner_retries_a_lost_first_transport_and_verifies_the_noise_re
 fn standalone_config(root: &std::path::Path) -> StandaloneClientConfig {
     StandaloneClientConfig {
         client_data_dir: root.join("client"),
-        display_name: "Personal space".into(),
     }
 }
 
@@ -476,11 +520,18 @@ async fn standalone_client_creates_offline_and_survives_force_drop() {
     assert!(matches!(&runtime.sync, RuntimeSync::Worker { .. }));
     let initial = runtime.status();
     assert_eq!(initial.sync.counts.unwrap_or_default().enabled_peers, 0);
+    assert_eq!(initial.space_id, None);
+    let workspace = runtime
+        .create_workspace("Personal space".into())
+        .await
+        .unwrap();
+    assert_eq!(runtime.status().space_id, Some(workspace.space_id));
 
     let committed = runtime
         .create_record(standalone_record("offline and durable"))
         .await
         .unwrap();
+    assert_eq!(runtime.pre_pair_record_count().await.unwrap(), 1);
     assert_eq!(committed.queued_peers, 0);
     let expected_node = runtime.status().node_id;
     let expected_actor = runtime.status().actor_id;
@@ -532,13 +583,40 @@ async fn standalone_client_creates_offline_and_survives_force_drop() {
 }
 
 #[tokio::test]
+async fn standalone_workspaces_are_explicit_isolated_and_deletable() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = standalone_config(directory.path());
+    let identities = Arc::new(FileKeyStore::new(directory.path().join("identity")));
+    let runtime = ClientRuntime::bootstrap_standalone(config, identities)
+        .await
+        .unwrap();
+    assert_eq!(runtime.status().space_id, None);
+    assert!(runtime.workspaces().unwrap().is_empty());
+
+    let first = runtime.create_workspace("First".into()).await.unwrap();
+    runtime
+        .create_record(standalone_record("first-only"))
+        .await
+        .unwrap();
+    let second = runtime.create_workspace("Second".into()).await.unwrap();
+    assert_ne!(first.space_id, second.space_id);
+    assert!(runtime.list_records(20).await.unwrap().is_empty());
+
+    runtime.activate_workspace(first.space_id).await.unwrap();
+    assert_eq!(runtime.list_records(20).await.unwrap().len(), 1);
+    runtime.delete_workspace(first.space_id).await.unwrap();
+    assert_eq!(runtime.status().space_id, None);
+    assert_eq!(runtime.workspaces().unwrap(), vec![second]);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn standalone_rejects_a_non_directory_data_path() {
     let directory = tempfile::tempdir().unwrap();
     let data_path = directory.path().join("client");
     std::fs::write(&data_path, b"not a directory").unwrap();
     let config = StandaloneClientConfig {
         client_data_dir: data_path,
-        display_name: "Personal space".into(),
     };
 
     assert!(matches!(
@@ -561,7 +639,6 @@ async fn standalone_rejects_a_symbolic_link_data_directory() {
     symlink(&target, &data_path).unwrap();
     let config = StandaloneClientConfig {
         client_data_dir: data_path,
-        display_name: "Personal space".into(),
     };
 
     assert!(matches!(
@@ -601,24 +678,26 @@ async fn standalone_preparation_resumes_both_sides_of_key_creation() {
     let runtime = ClientRuntime::bootstrap_standalone(config, identities)
         .await
         .unwrap();
+    assert_eq!(runtime.status().space_id, None);
+    let workspace = runtime.create_workspace("Empty".into()).await.unwrap();
+    assert_eq!(runtime.status().space_id, Some(workspace.space_id));
     assert_eq!(runtime.list_records(20).await.unwrap(), Vec::new());
     runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn standalone_identity_database_mismatches_fail_closed() {
+async fn standalone_identity_can_bind_a_fresh_database_but_missing_keys_fail() {
     let orphaned_identity_root = tempfile::tempdir().unwrap();
     let orphaned_config = standalone_config(orphaned_identity_root.path());
     let orphaned_identity = Arc::new(FileKeyStore::new(
         orphaned_identity_root.path().join("identity"),
     ));
     orphaned_identity.load_or_create().unwrap();
-    assert!(matches!(
-        ClientRuntime::bootstrap_standalone(orphaned_config, orphaned_identity).await,
-        Err(ClientRuntimeError::StandaloneRecovery(
-            "protected identity exists without its client database"
-        ))
-    ));
+    let runtime = ClientRuntime::bootstrap_standalone(orphaned_config, orphaned_identity)
+        .await
+        .unwrap();
+    assert_eq!(runtime.status().space_id, None);
+    runtime.shutdown().await.unwrap();
 
     let missing_identity_root = tempfile::tempdir().unwrap();
     let config = standalone_config(missing_identity_root.path());
@@ -634,7 +713,7 @@ async fn standalone_identity_database_mismatches_fail_closed() {
     assert!(matches!(
         ClientRuntime::bootstrap_standalone(config, identities).await,
         Err(ClientRuntimeError::StandaloneRecovery(
-            "established client database has no established protected identity"
+            "client installation identity exists without protected keys"
         ))
     ));
 }

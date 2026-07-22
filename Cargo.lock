@@ -1684,6 +1684,7 @@ dependencies = [
 name = "fractonica-mobile-ffi"
 version = "0.1.0"
 dependencies = [
+ "fractonica-application",
  "fractonica-client-runtime",
  "fractonica-client-sqlite",
  "fractonica-content",

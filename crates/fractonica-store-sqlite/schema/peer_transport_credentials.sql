@@ -3,5 +3,3 @@
 ALTER TABLE pairing_sessions
     ADD COLUMN peer_token_digest BLOB
     CHECK (peer_token_digest IS NULL OR length(peer_token_digest) = 32);
-
-PRAGMA user_version = 8;

@@ -14,5 +14,3 @@ CREATE TABLE client_active_workspace (
     FOREIGN KEY (peer_id)
         REFERENCES client_peers(peer_id) ON DELETE RESTRICT
 ) STRICT;
-
-PRAGMA user_version = 5;

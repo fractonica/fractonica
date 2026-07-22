@@ -1337,10 +1337,22 @@ where
             .send()
             .await
             .map_err(|error| TransportError::retryable(error.to_string()))?;
-        if response.status().is_success() {
+        let status = response.status();
+        // Space genesis is installed through the trusted bootstrap path. A
+        // later graph relay reaches the ordinary operation endpoint, which
+        // returns conflict even for the exact bootstrap already installed.
+        // Treat that content-addressed replay as acknowledged so it cannot
+        // strand the causal suffix of the peer outbox.
+        if status.is_success()
+            || (status == StatusCode::CONFLICT
+                && matches!(
+                    &operation.body,
+                    fractonica_data_model::OperationBody::SpaceGenesis { .. }
+                ))
+        {
             return Ok(());
         }
-        Err(http_failure(response.status()).await)
+        Err(http_failure(status).await)
     }
 
     async fn pull(

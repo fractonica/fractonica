@@ -17,7 +17,7 @@ function jsonResponse(value: unknown, status = 200): Response {
 const NODE_READY_RESPONSE = {
   status: "ready",
   profile: "node",
-  storage: { kind: "sqlite", status: "ready", schemaVersion: 7 },
+  storage: { kind: "sqlite", status: "ready" },
 };
 
 const NODE_RESPONSE = {
@@ -57,7 +57,7 @@ const SAROS_NODE_RESPONSE = {
 };
 
 describe("node client", () => {
-  it("decodes current, legacy, and temporarily LAN-less desktop handoffs", () => {
+  it("decodes the exact desktop handoff", () => {
     const token = "0123456789abcdef0123456789abcdef";
     expect(decodeDesktopNodeConnection({
       baseUrl: "http://127.0.0.1:49152",
@@ -68,14 +68,10 @@ describe("node client", () => {
       bearerToken: token,
       pairingEndpointHints: ["http://192.168.1.12:49152"],
     });
-    expect(decodeDesktopNodeConnection({
+    expect(() => decodeDesktopNodeConnection({
       base_url: "http://127.0.0.1:49152",
       bearer_token: token,
-    })).toEqual({
-      baseUrl: "http://127.0.0.1:49152",
-      bearerToken: token,
-      pairingEndpointHints: [],
-    });
+    })).toThrow("expected schema");
   });
 
   it("keeps the desktop control handoff loopback-only", () => {
@@ -108,7 +104,7 @@ describe("node client", () => {
     ]);
   });
 
-  it("accepts the stateless Saros profile without a schema version", async () => {
+  it("accepts the stateless Saros profile", async () => {
     const fetcher = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(jsonResponse(SAROS_READY_RESPONSE))

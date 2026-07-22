@@ -874,6 +874,7 @@ const fn action_code(action: CapabilityAction) -> u64 {
         CapabilityAction::RevokeCapability => 2,
         CapabilityAction::ReadSpace => 3,
         CapabilityAction::WriteContent => 4,
+        CapabilityAction::LinkWorkspace => 5,
     }
 }
 
@@ -888,6 +889,7 @@ fn decode_action(
         2 => Ok(CapabilityAction::RevokeCapability),
         3 => Ok(CapabilityAction::ReadSpace),
         4 => Ok(CapabilityAction::WriteContent),
+        5 => Ok(CapabilityAction::LinkWorkspace),
         _ => invalid(schema, "unknown capability action code"),
     }
 }

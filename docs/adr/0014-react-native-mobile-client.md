@@ -73,23 +73,22 @@ encrypted seed bundle outside backup storage, protected by a non-exportable
 Android Keystore wrapping key. Secrets may enter native/Rust process memory but
 never JavaScript.
 
-Database and key recovery states must agree. An existing identity with a
-missing installation database, or an established database with missing or
-mismatched identity, fails closed into an explicit recovery state. It must not
-silently generate replacement trust anchors.
+An established database must match its protected identity. A protected
+identity may bind a fresh empty database after local storage is reset; no
+workspace exists until the user explicitly creates or links one.
 
 ## Offline space ownership
 
-A fresh phone creates and owns a real personal space before any desktop hub or
-network peer exists. Records authored there remain in that space permanently.
-Pairing may add delivery peers, admit further trusted spaces, or grant another
-device authority, but it must never re-sign, rewrite, or migrate the phone's
-existing operation history into a hub-owned space.
+A fresh phone opens at the workspace root with no vault. Creating a workspace
+makes a real local trust root without requiring a desktop hub or network peer.
+Records authored there remain in that space permanently. Linking may admit
+further trusted spaces or grant another device authority, but it must never
+re-sign or rewrite existing operation history into another root.
 
-If two independently initialized devices are paired later, both established
-spaces remain valid. A future product flow may let the user choose a default
-space and may present records from several spaces as one timeline, but that is
-a projection concern rather than an identity migration. This follows directly
+If two independently initialized devices are linked later, both established
+spaces remain valid unless the user explicitly chooses one destination and
+imports records. Presenting several spaces as one timeline is a projection
+concern rather than an identity replacement. This follows directly
 from the local-first promise: offline work is canonical data, not a temporary
 JavaScript queue waiting for a server to assign its final identity.
 

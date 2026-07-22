@@ -8,6 +8,7 @@
   "scripts": {
     "build": "pnpm --recursive build",
     "check": "pnpm glyph:check && pnpm --recursive check",
+    "desktop:allow-local-network": "pnpm --filter @fractonica/desktop allow-local-network",
     "desktop:build": "pnpm --filter @fractonica/desktop bundle",
     "desktop:dev": "pnpm --filter @fractonica/desktop dev",
     "dev": "pnpm --filter @fractonica/control-center dev",

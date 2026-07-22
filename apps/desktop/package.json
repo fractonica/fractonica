@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "allow-local-network": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/allow-local-network.ps1",
     "bundle": "node scripts/build.mjs",
     "dev": "pnpm prepare:sidecar && tauri dev",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs"

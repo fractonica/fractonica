@@ -19,7 +19,7 @@ use fractonica_client_sqlite::{CommitResult, LocalEntitySummary, LocalRecordSumm
 use fractonica_content::ResourceRef;
 use fractonica_data_model::{
     EntityId, EntitySchema, EventDocument, ProfileDocument, ProtectedDocument, RecordDocument,
-    TagDocument,
+    SpaceId, TagDocument,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, RunEvent, State};
@@ -34,6 +34,8 @@ const CONNECTION_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 const DESKTOP_NODE_BIND: &str = "0.0.0.0:8789";
 const RESET_MARKER_FILE: &str = ".reset-local-installation";
 const RESET_MARKER_BYTES: &[u8] = b"fractonica-reset-local-installation-v1\n";
+#[cfg(target_os = "windows")]
+const WINDOWS_FIREWALL_SCRIPT: &[u8] = include_bytes!("../../scripts/allow-local-network.ps1");
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -210,7 +212,7 @@ fn client_status(sidecar: State<'_, NodeSidecar>) -> ClientStatusResponse {
             phase: "ready",
             node_id: Some(status.node_id.to_string()),
             actor_id: Some(status.actor_id.to_string()),
-            space_id: Some(status.space_id.to_string()),
+            space_id: status.space_id.map(|space_id| space_id.to_string()),
             sync_running: status.sync.running,
             cycle: status.sync.cycle,
             pending_operations: counts.pending_deliveries + counts.leased_deliveries,
@@ -560,6 +562,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             node_connection,
             client_status,
+            client_create_workspace,
+            client_delete_workspace,
+            client_activate_workspace,
             client_create_record,
             client_update_record,
             client_create_event,
@@ -587,6 +592,8 @@ fn main() {
             prepare_private_directory(&client_data)?;
             let bootstrap_directory = app.path().app_cache_dir()?.join("bootstrap");
             prepare_private_directory(&bootstrap_directory)?;
+            #[cfg(target_os = "windows")]
+            request_windows_private_lan_access(&bootstrap_directory);
             let ready_file = bootstrap_directory.join("node.ready");
             let _ = fs::remove_file(&ready_file);
             let bearer_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -1072,4 +1079,82 @@ mod tests {
                 < interface_preference("Tailscale", Ipv4Addr::new(192, 168, 65, 1))
         );
     }
+}
+
+#[tauri::command]
+async fn client_create_workspace(
+    sidecar: State<'_, NodeSidecar>,
+    display_name: String,
+) -> Result<(), String> {
+    client(&sidecar)?
+        .create_workspace(display_name)
+        .await
+        .map_err(command_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn client_delete_workspace(
+    sidecar: State<'_, NodeSidecar>,
+    space_id: String,
+) -> Result<(), String> {
+    let space_id = SpaceId::parse(&space_id).map_err(command_error)?;
+    client(&sidecar)?
+        .delete_workspace(space_id)
+        .await
+        .map_err(command_error)
+}
+
+#[tauri::command]
+async fn client_activate_workspace(
+    sidecar: State<'_, NodeSidecar>,
+    space_id: String,
+) -> Result<(), String> {
+    let space_id = SpaceId::parse(&space_id).map_err(command_error)?;
+    client(&sidecar)?
+        .activate_workspace(space_id)
+        .await
+        .map_err(command_error)
+}
+
+#[cfg(target_os = "windows")]
+fn request_windows_private_lan_access(bootstrap_directory: &Path) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Some(node_path) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| {
+            executable
+                .parent()
+                .map(|parent| parent.join("fractonica-node.exe"))
+        })
+        .filter(|path| path.is_file())
+    else {
+        eprintln!("Fractonica could not locate its node sidecar for Windows Firewall setup");
+        return;
+    };
+    let script_path = bootstrap_directory.join("allow-local-network.ps1");
+    if fs::read(&script_path).ok().as_deref() != Some(WINDOWS_FIREWALL_SCRIPT)
+        && let Err(error) = fs::write(&script_path, WINDOWS_FIREWALL_SCRIPT)
+    {
+        eprintln!("Fractonica could not prepare Windows Firewall setup: {error}");
+        return;
+    }
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script_path)
+            .arg("-NodePath")
+            .arg(&node_path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        match result {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("Fractonica Windows Firewall setup exited with status {status}")
+            }
+            Err(error) => eprintln!("Fractonica could not start Windows Firewall setup: {error}"),
+        }
+    });
 }

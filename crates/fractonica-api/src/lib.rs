@@ -290,6 +290,18 @@ impl ApiState {
 }
 
 pub trait PairingControl: Send + Sync {
+    fn create_workspace(
+        &self,
+        _display_name: String,
+        _now_unix_ms: i64,
+    ) -> Result<WorkspaceCreated, PairingControlError> {
+        Err(PairingControlError::ProfileUnavailable)
+    }
+
+    fn delete_workspace(&self, _space_id: SpaceId) -> Result<(), PairingControlError> {
+        Err(PairingControlError::ProfileUnavailable)
+    }
+
     fn create_invitation(
         &self,
         request: PairingCreateCommand,
@@ -477,6 +489,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/api/node", get(node))
+        .route("/api/workspaces", post(create_workspace))
+        .route("/api/workspaces/{space_id}", delete(delete_workspace))
         .route(
             "/api/spaces/{space_id}/operations",
             post(submit_operation).layer(DefaultBodyLimit::max(MAX_SIGNED_OPERATION_JSON_BYTES)),
@@ -704,8 +718,13 @@ pub struct ReadyResponse {
 pub struct StorageReady {
     pub kind: &'static str,
     pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceCreated {
+    pub space: SpaceDescriptor,
+    pub genesis: OperationEnvelope,
+    pub initial_grant: OperationEnvelope,
 }
 
 #[derive(Debug, Serialize)]
@@ -722,6 +741,20 @@ pub struct NodeResponse {
     pub started_at: String,
     pub uptime_seconds: u64,
     pub capabilities: Vec<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateWorkspaceRequest {
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCreatedResponse {
+    space: SpaceDescriptor,
+    genesis: OperationEnvelope,
+    initial_grant: OperationEnvelope,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1624,21 +1657,13 @@ async fn live() -> Json<LiveResponse> {
 }
 
 async fn ready(State(state): State<ApiState>) -> Result<Json<ReadyResponse>, ApiError> {
-    let schema_version = match &state.application {
-        Some(application) => {
-            let application = Arc::clone(application);
-            Some(
-                tokio::task::spawn_blocking(move || application.readiness())
-                    .await
-                    .map_err(|error| {
-                        ApiError::unavailable(format!("database task failed: {error}"))
-                    })?
-                    .map_err(|error| ApiError::unavailable(error.to_string()))?
-                    .schema_version,
-            )
-        }
-        None => None,
-    };
+    if let Some(application) = &state.application {
+        let application = Arc::clone(application);
+        tokio::task::spawn_blocking(move || application.readiness())
+            .await
+            .map_err(|error| ApiError::unavailable(format!("database task failed: {error}")))?
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    }
 
     Ok(Json(ReadyResponse {
         status: "ready",
@@ -1646,7 +1671,6 @@ async fn ready(State(state): State<ApiState>) -> Result<Json<ReadyResponse>, Api
         storage: StorageReady {
             kind: state.profile.storage_kind(),
             status: state.profile.storage_status(),
-            schema_version,
         },
     }))
 }
@@ -1686,6 +1710,41 @@ async fn node(State(state): State<ApiState>) -> Result<Json<NodeResponse>, ApiEr
         uptime_seconds: state.started_instant.elapsed().as_secs(),
         capabilities,
     }))
+}
+
+async fn create_workspace(
+    State(state): State<ApiState>,
+    payload: Result<Json<CreateWorkspaceRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<WorkspaceCreatedResponse>), ApiError> {
+    let Json(request) = payload.map_err(pairing_json_error)?;
+    let control = pairing_control(&state)?;
+    let now = unix_time_millis()?;
+    let created =
+        tokio::task::spawn_blocking(move || control.create_workspace(request.display_name, now))
+            .await
+            .map_err(|_| ApiError::storage_unavailable())?
+            .map_err(pairing_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(WorkspaceCreatedResponse {
+            space: created.space,
+            genesis: created.genesis,
+            initial_grant: created.initial_grant,
+        }),
+    ))
+}
+
+async fn delete_workspace(
+    State(state): State<ApiState>,
+    Path(space_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let space_id = parse_space_id(&space_id)?;
+    let control = pairing_control(&state)?;
+    tokio::task::spawn_blocking(move || control.delete_workspace(space_id))
+        .await
+        .map_err(|_| ApiError::storage_unavailable())?
+        .map_err(pairing_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn submit_operation(
@@ -3946,7 +4005,7 @@ mod tests {
     impl OperationRepository for SignedOperationStub {
         fn readiness(&self) -> Result<RepositoryReadiness, RepositoryError> {
             self.count_call();
-            Ok(RepositoryReadiness { schema_version: 4 })
+            Ok(RepositoryReadiness)
         }
 
         fn installation(&self) -> Result<InstallationMetadata, RepositoryError> {
@@ -4649,10 +4708,6 @@ mod tests {
         assert_eq!(body["profile"], "node");
         assert_eq!(body["storage"]["kind"], "sqlite");
         assert_eq!(body["storage"]["status"], "ready");
-        assert_eq!(
-            body["storage"]["schemaVersion"],
-            fractonica_store_sqlite::SCHEMA_VERSION
-        );
     }
 
     #[tokio::test]
@@ -5239,7 +5294,6 @@ mod tests {
         assert_eq!(ready["profile"], "saros");
         assert_eq!(ready["storage"]["kind"], "none");
         assert_eq!(ready["storage"]["status"], "notConfigured");
-        assert!(ready["storage"].get("schemaVersion").is_none());
 
         let node = saros_only_app()
             .oneshot(

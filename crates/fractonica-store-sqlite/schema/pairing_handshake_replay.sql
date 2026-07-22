@@ -13,5 +13,3 @@ ALTER TABLE pairing_sessions
 ALTER TABLE pairing_sessions
     ADD COLUMN receipt_frame BLOB
     CHECK (receipt_frame IS NULL OR length(receipt_frame) BETWEEN 1 AND 16384);
-
-PRAGMA user_version = 10;

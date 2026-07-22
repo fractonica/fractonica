@@ -7,7 +7,7 @@
 use fractonica_application::{MAX_SPACE_DISPLAY_NAME_CHARS, TrustedSpaceBootstrapRequest};
 use fractonica_data_model::{
     CapabilityAction, CapabilityGrant, DataModelError, EntityId, EntitySchema, OperationBody,
-    OperationEnvelope, OperationNonce, Visibility,
+    OperationEnvelope, OperationNonce, SpaceId, Visibility,
 };
 use fractonica_keystore::IdentityBundle;
 use thiserror::Error;
@@ -56,9 +56,26 @@ pub fn build_trusted_space_bootstrap(
     display_name: impl Into<String>,
     trusted_current_unix_ms: i64,
 ) -> Result<TrustedSpaceBootstrapRequest, BootstrapBuildError> {
-    let mut source = OsBootstrapMaterialSource;
-    build_trusted_space_bootstrap_with_source(
+    build_trusted_space_bootstrap_for_space(
         identity,
+        identity.space_id(),
+        display_name,
+        trusted_current_unix_ms,
+    )
+}
+
+/// Builds the first two signed operations for a newly created workspace.
+/// Installation keys may control several independent workspace roots.
+pub fn build_trusted_space_bootstrap_for_space(
+    identity: &IdentityBundle,
+    space_id: SpaceId,
+    display_name: impl Into<String>,
+    trusted_current_unix_ms: i64,
+) -> Result<TrustedSpaceBootstrapRequest, BootstrapBuildError> {
+    let mut source = OsBootstrapMaterialSource;
+    build_trusted_space_bootstrap_for_space_with_source(
+        identity,
+        space_id,
         display_name,
         trusted_current_unix_ms,
         &mut source,
@@ -68,6 +85,22 @@ pub fn build_trusted_space_bootstrap(
 /// Deterministic core of [`build_trusted_space_bootstrap`].
 pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
     identity: &IdentityBundle,
+    display_name: impl Into<String>,
+    trusted_current_unix_ms: i64,
+    source: &mut S,
+) -> Result<TrustedSpaceBootstrapRequest, BootstrapBuildError> {
+    build_trusted_space_bootstrap_for_space_with_source(
+        identity,
+        identity.space_id(),
+        display_name,
+        trusted_current_unix_ms,
+        source,
+    )
+}
+
+pub fn build_trusted_space_bootstrap_for_space_with_source<S: BootstrapMaterialSource>(
+    identity: &IdentityBundle,
+    space_id: SpaceId,
     display_name: impl Into<String>,
     trusted_current_unix_ms: i64,
     source: &mut S,
@@ -87,7 +120,7 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
     let local_writer_actor_id = identity.local_writer_actor_id();
 
     let genesis = OperationEnvelope::sign(
-        identity.space_id(),
+        space_id,
         genesis_entity_id,
         EntitySchema::SpaceGenesis,
         Vec::new(),
@@ -101,7 +134,7 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
     )?;
 
     let initial_grant = OperationEnvelope::sign(
-        identity.space_id(),
+        space_id,
         grant_entity_id,
         EntitySchema::CapabilityGrant,
         Vec::new(),
@@ -114,6 +147,8 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
                 actions: vec![
                     CapabilityAction::AppendOperation,
                     CapabilityAction::ReadSpace,
+                    CapabilityAction::WriteContent,
+                    CapabilityAction::LinkWorkspace,
                 ],
                 schemas: vec![
                     EntitySchema::Event,
@@ -122,8 +157,8 @@ pub fn build_trusted_space_bootstrap_with_source<S: BootstrapMaterialSource>(
                     EntitySchema::Tag,
                 ],
                 visibilities: vec![Visibility::Public, Visibility::Private],
-                content_roles: Vec::new(),
-                max_resource_byte_length: None,
+                content_roles: vec!["record.media".to_owned()],
+                max_resource_byte_length: Some(1_073_741_824),
                 not_before_unix_ms: None,
                 expires_at_unix_ms: None,
                 delegation_depth: 0,
@@ -322,7 +357,9 @@ mod tests {
             grant.actions,
             vec![
                 CapabilityAction::AppendOperation,
-                CapabilityAction::ReadSpace
+                CapabilityAction::ReadSpace,
+                CapabilityAction::WriteContent,
+                CapabilityAction::LinkWorkspace,
             ]
         );
         assert_eq!(
@@ -338,13 +375,13 @@ mod tests {
             grant.visibilities,
             vec![Visibility::Public, Visibility::Private]
         );
-        assert!(grant.content_roles.is_empty());
-        assert_eq!(grant.max_resource_byte_length, None);
+        assert_eq!(grant.content_roles, vec!["record.media"]);
+        assert_eq!(grant.max_resource_byte_length, Some(1_073_741_824));
         assert_eq!(grant.not_before_unix_ms, None);
         assert_eq!(grant.expires_at_unix_ms, None);
         assert_eq!(grant.delegation_depth, 0);
         assert_eq!(grant.label, INITIAL_WRITER_GRANT_LABEL);
-        assert!(!grant.actions.contains(&CapabilityAction::WriteContent));
+        assert!(grant.actions.contains(&CapabilityAction::LinkWorkspace));
     }
 
     #[test]

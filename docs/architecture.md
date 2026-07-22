@@ -12,7 +12,7 @@ leaving explicit boundaries for mobile and constrained devices.
 1. **Contracts** define versioned HTTP and device-facing interfaces. They are
    reviewed independently of any implementation language.
 2. **Rust core** owns canonical domain semantics, validation, protocol rules,
-   migrations, and persistence orchestration.
+   storage schema and persistence orchestration.
 3. **Node process** owns durable state, identity material, policy enforcement,
    network listeners, and helper lifecycle.
 4. **Helpers and adapters** connect the node to operating-system or device
@@ -52,19 +52,13 @@ a space capability chain. See the [threat model](threat-model.md),
 [signed-operation ADR](adr/0009-signed-operation-trust-kernel.md), and
 [capability/pairing ADR](adr/0010-space-capabilities-and-pairing.md).
 
-The full profile binds three trust-critical units into one installation: the
-SQLite database, protected `identity/` directory, and public
-`installation.json`. First run publishes
-`installation.identity.pending.json` before the keystore writes anything, so
-an interrupted identity bootstrap resumes the same protected directory.
-Before SQLite is created, `installation.pending.json` stores the exact signed
-genesis and initial writer grant; an interrupted first run can replay those
-same bytes but can never generate a lookalike anchor. Staged state publication
-is recoverable both immediately before and after its atomic no-replace link. The
-completed manifest contains no private keys, but retains that signed bootstrap
-and pins the exact node, default space, controller, and writer identities. The
-node refuses replacement when an established database or identity half is
-missing or disagrees with the manifest.
+The full profile keeps installation identity separate from workspace trust.
+The protected `identity/` directory contains the node, controller, and local
+writer keys; public `installation.json` binds those public identities to the
+installation and contains no workspace. SQLite may contain zero or many
+independent workspace roots. A workspace appears only after the user creates
+one or completes a link, and every workspace has its own signed genesis and
+member graph.
 
 The `content/` tree is independently addressable availability data rather than
 part of operation validity: deleting it loses this node's local media bytes but
@@ -75,9 +69,9 @@ manifest.
 
 ## Persistence and replication
 
-SQLite is the initial durable store for desktop and headless nodes. The node
-applies checked-in, ordered migrations and serializes writes through its
-persistence layer. Backup and restore must use SQLite-safe mechanisms rather
+SQLite is the initial durable store for desktop and headless nodes. A fresh
+store is created from the checked-in schema, and the node serializes writes
+through its persistence layer. Backup and restore must use SQLite-safe mechanisms rather
 than copying an active database opportunistically. The raw `FileKeyStore`
 backend uses Unix owner, mode, hard-link, and no-follow guarantees on Unix. It
 does not prove that a macOS or
@@ -100,9 +94,8 @@ require a dedicated protocol decision.
 
 Public HTTP descriptions are checked in under `contracts/openapi`. Signed and
 device messages retain explicit wire discriminators and hard bounds so corrupt
-or unsupported bytes fail closed. Fractonica has one current API and one
-current application schema vocabulary; pre-release experiments are not kept as
-compatibility surfaces.
+or unsupported bytes fail closed. Fractonica has one API and one application
+schema.
 
 Ed25519 actor and node identities, SHA-256 operation IDs, deterministic CBOR,
 COSE Sign1, capability semantics, and the QR bootstrap boundary are selected by

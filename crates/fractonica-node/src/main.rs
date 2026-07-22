@@ -8,15 +8,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use fractonica_api::ApiState;
-use fractonica_application::{ApplicationService, SpaceDescriptor};
+use fractonica_application::ApplicationService;
 use fractonica_blob_store::BlobStore;
 use fractonica_keystore::{FileKeyStore, FilePairingSecretVault, IdentityBundle, KeyStore};
 use fractonica_node::{
-    NodeProcessLock, NodeReadyFile,
-    bootstrap::build_trusted_space_bootstrap,
-    default_data_dir,
+    NodeProcessLock, NodeReadyFile, default_data_dir,
     durable_pairing::{DurablePairingStore, NodePairingControl},
-    installation::{InstallationManifest, InstallationPhase, NodeInstallation},
+    installation::{InstallationPhase, NodeInstallation},
     validate_bind_policy,
 };
 use fractonica_store_sqlite::SqliteStore;
@@ -134,10 +132,7 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("failed to open {}", database_path.display()))?,
             );
             let application = Arc::new(ApplicationService::new(Arc::clone(&store)));
-            let space = finish_installation(&application, &identity, &mut installation)?;
             let node_id = identity.node_id();
-            let space_id = identity.space_id();
-            debug_assert_eq!(space.space_id, space_id);
             let pairing = DurablePairingStore::new(
                 store.as_ref().clone(),
                 FilePairingSecretVault::new(data_dir.join("pairing-secrets")),
@@ -151,11 +146,7 @@ async fn main() -> Result<()> {
                 removed_secrets = pairing_recovery.removed_secrets,
                 "pairing state reconciled"
             );
-            let pairing = Arc::new(NodePairingControl::new(
-                pairing,
-                Arc::clone(&identity),
-                space.genesis_operation_id,
-            ));
+            let pairing = Arc::new(NodePairingControl::new(pairing, Arc::clone(&identity)));
             let blob_store = Arc::new(
                 BlobStore::open(data_dir.join("content"), Arc::clone(&store))
                     .context("failed to open the local content store")?,
@@ -173,7 +164,6 @@ async fn main() -> Result<()> {
                     data_dir,
                     process_lock,
                     node_id,
-                    space_id,
                 },
             )
         }
@@ -201,14 +191,12 @@ async fn main() -> Result<()> {
             data_dir,
             process_lock,
             node_id,
-            space_id,
         } => info!(
             profile = arguments.profile.name(),
             address = %local_address,
             data_dir = %data_dir.display(),
             lock = %process_lock.path().display(),
             node_id = %node_id,
-            space_id = %space_id,
             "Fractonica node is ready"
         ),
         RuntimeStorage::Saros => info!(
@@ -232,7 +220,6 @@ enum RuntimeStorage {
         data_dir: PathBuf,
         process_lock: NodeProcessLock,
         node_id: fractonica_data_model::NodeId,
-        space_id: fractonica_data_model::SpaceId,
     },
     Saros,
 }
@@ -258,32 +245,18 @@ fn prepare_installation_identity(
             let identity = keystore
                 .load_or_create()
                 .context("failed to create the local node identities")?;
-            let bootstrap =
-                build_trusted_space_bootstrap(&identity, "Personal space", unix_time_millis()?)
-                    .context("failed to construct the initial signed authorization space")?;
             installation
-                .prepare(&identity, bootstrap)
-                .context("failed to persist the pending signed trust anchor")?;
+                .complete_identity(&identity)
+                .context("failed to persist the node installation identity")?;
             Ok(identity)
         }
         InstallationPhase::IdentityInitializing => {
             let identity = keystore
                 .load_or_create()
                 .context("failed to resume the local node identity bootstrap")?;
-            let bootstrap =
-                build_trusted_space_bootstrap(&identity, "Personal space", unix_time_millis()?)
-                    .context("failed to construct the initial signed authorization space")?;
             installation
-                .prepare(&identity, bootstrap)
-                .context("failed to persist the pending signed trust anchor")?;
-            Ok(identity)
-        }
-        InstallationPhase::Initializing(plan) => {
-            let identity = keystore
-                .load_existing()
-                .context("failed to load identities for the pending signed trust anchor")?;
-            plan.validate_identity(&identity)
-                .context("the pending signed trust anchor does not match the protected identity")?;
+                .complete_identity(&identity)
+                .context("failed to persist the node installation identity")?;
             Ok(identity)
         }
         InstallationPhase::Established(manifest) => {
@@ -291,88 +264,11 @@ fn prepare_installation_identity(
                 .load_existing()
                 .context("failed to load the established local node identities")?;
             manifest
-                .plan()
                 .validate_identity(&identity)
                 .context("the installation manifest does not match the protected identity")?;
             Ok(identity)
         }
     }
-}
-
-fn finish_installation(
-    application: &ApplicationService,
-    identity: &IdentityBundle,
-    installation: &mut NodeInstallation,
-) -> Result<SpaceDescriptor> {
-    match installation.phase().clone() {
-        InstallationPhase::Fresh | InstallationPhase::IdentityInitializing => {
-            bail!("the installation trust anchor was not prepared before opening storage")
-        }
-        InstallationPhase::Established(manifest) => {
-            let space = application
-                .space(manifest.default_space_id())
-                .context("failed to inspect the established authorization space")?
-                .context(
-                    "the database is missing the default trust anchor recorded by the installation manifest",
-                )?;
-            validate_space_identity(&space, identity)?;
-            manifest
-                .validate(identity, &space)
-                .context("the node installation binding is inconsistent")?;
-            let replay = application
-                .bootstrap_trusted_space(manifest.plan().bootstrap().clone())
-                .context("failed to cryptographically verify the stored bootstrap anchors")?;
-            if !replay.replayed || replay.space != space {
-                bail!("established bootstrap anchor did not replay exactly");
-            }
-            // Cleans a matching pending file if the previous process crashed
-            // after manifest publication but before its removal.
-            installation.complete(manifest)?;
-            Ok(space)
-        }
-        InstallationPhase::Initializing(plan) => {
-            plan.validate_identity(identity)
-                .context("pending bootstrap does not match the protected identity")?;
-            let spaces = application
-                .spaces()
-                .context("failed to inspect authorization spaces during first-run recovery")?;
-            if spaces.len() > 1
-                || spaces
-                    .first()
-                    .is_some_and(|space| space.space_id != plan.default_space_id())
-            {
-                bail!(
-                    "the incomplete installation database contains an unrelated authorization space"
-                );
-            }
-            let result = application
-                .bootstrap_trusted_space(plan.bootstrap().clone())
-                .context("failed to commit or replay the pending signed trust anchor")?;
-            let space = result.space;
-            validate_space_identity(&space, identity)?;
-            plan.validate_space(&space)
-                .context("the database did not preserve the pending signed trust anchor")?;
-            let manifest =
-                InstallationManifest::from_plan_and_space(plan, identity, space.clone())?;
-            installation
-                .complete(manifest)
-                .context("failed to finalize the node installation binding")?;
-            Ok(space)
-        }
-    }
-}
-
-fn validate_space_identity(space: &SpaceDescriptor, identity: &IdentityBundle) -> Result<()> {
-    if space.space_id != identity.space_id()
-        || space.controller_actor_id != identity.space_controller_actor_id()
-        || space.local_writer_actor_id != identity.local_writer_actor_id()
-    {
-        bail!(
-            "the database trust anchor for space {} does not match the protected local identity",
-            identity.space_id()
-        );
-    }
-    Ok(())
 }
 
 fn unix_time_millis() -> Result<i64> {
@@ -455,8 +351,6 @@ fn process_is_alive(_process_id: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use tempfile::tempdir;
 
     use super::*;
@@ -502,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn first_run_bootstrap_is_bound_and_exactly_replayable() {
+    fn a_fresh_installation_starts_without_a_workspace_and_reopens() {
         let root = tempdir().expect("temporary directory");
         make_private(root.path());
         let database_path = root.path().join("fractonica.db");
@@ -513,15 +407,8 @@ mod tests {
         let first_identity = prepare_installation_identity(&keystore, &mut installation).unwrap();
         let store = Arc::new(SqliteStore::open(&database_path).unwrap());
         let application = ApplicationService::new(Arc::clone(&store));
-        let first_space =
-            finish_installation(&application, &first_identity, &mut installation).unwrap();
         let expected_node = first_identity.node_id();
-        let expected_space = first_space.clone();
-        let changes = application
-            .changes_after(first_space.space_id, 0, 10)
-            .unwrap();
-        assert_eq!(changes.operations.len(), 2);
-        assert!(!changes.has_more);
+        assert!(application.spaces().unwrap().is_empty());
         drop(first_identity);
 
         let mut restarted =
@@ -531,95 +418,17 @@ mod tests {
             InstallationPhase::Established(_)
         ));
         let reloaded_identity = prepare_installation_identity(&keystore, &mut restarted).unwrap();
-        let reloaded_space =
-            finish_installation(&application, &reloaded_identity, &mut restarted).unwrap();
         assert_eq!(reloaded_identity.node_id(), expected_node);
-        assert_eq!(reloaded_space, expected_space);
-        assert_eq!(application.spaces().unwrap().len(), 1);
-        assert_eq!(
-            application
-                .changes_after(reloaded_space.space_id, 0, 10)
-                .unwrap()
-                .operations
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn incomplete_bootstrap_never_replaces_missing_identity_after_db_commit() {
-        let root = tempdir().expect("temporary directory");
-        make_private(root.path());
-        let database_path = root.path().join("fractonica.db");
-        let identity_path = root.path().join("identity");
-        let mut installation =
-            NodeInstallation::begin(root.path(), &database_path, &identity_path).unwrap();
-        let keystore = FileKeyStore::new(&identity_path);
-        let identity = prepare_installation_identity(&keystore, &mut installation).unwrap();
-        let InstallationPhase::Initializing(plan) = installation.phase().clone() else {
-            panic!("expected pending installation");
-        };
-        let store = Arc::new(SqliteStore::open(&database_path).unwrap());
-        let application = ApplicationService::new(store);
-        application
-            .bootstrap_trusted_space(plan.bootstrap().clone())
-            .unwrap();
-        drop(identity);
-        fs::remove_dir_all(&identity_path).unwrap();
-
-        let error =
-            NodeInstallation::begin(root.path(), &database_path, &identity_path).unwrap_err();
-        assert!(error.to_string().contains("protected identity is missing"));
-        assert!(!identity_path.exists());
-    }
-
-    #[test]
-    fn incomplete_bootstrap_replays_identical_anchor_after_database_loss() {
-        let root = tempdir().expect("temporary directory");
-        make_private(root.path());
-        let database_path = root.path().join("fractonica.db");
-        let identity_path = root.path().join("identity");
-        let mut installation =
-            NodeInstallation::begin(root.path(), &database_path, &identity_path).unwrap();
-        let keystore = FileKeyStore::new(&identity_path);
-        let identity = prepare_installation_identity(&keystore, &mut installation).unwrap();
-        let InstallationPhase::Initializing(plan) = installation.phase().clone() else {
-            panic!("expected pending installation");
-        };
-        let expected_genesis = plan.bootstrap().genesis.operation_id;
-        {
-            let store = Arc::new(SqliteStore::open(&database_path).unwrap());
-            let application = ApplicationService::new(store);
-            application
-                .bootstrap_trusted_space(plan.bootstrap().clone())
-                .unwrap();
-        }
-        fs::remove_file(&database_path).unwrap();
-        drop(identity);
-
-        let mut recovered =
-            NodeInstallation::begin(root.path(), &database_path, &identity_path).unwrap();
-        let recovered_identity = prepare_installation_identity(&keystore, &mut recovered).unwrap();
-        let store = Arc::new(SqliteStore::open(&database_path).unwrap());
-        let application = ApplicationService::new(store);
-        let space = finish_installation(&application, &recovered_identity, &mut recovered).unwrap();
-
-        assert_eq!(space.genesis_operation_id, expected_genesis);
-        assert_eq!(
-            application
-                .changes_after(space.space_id, 0, 10)
-                .unwrap()
-                .operations
-                .len(),
-            2
-        );
+        assert!(application.spaces().unwrap().is_empty());
     }
 
     fn make_private(path: &std::path::Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 }

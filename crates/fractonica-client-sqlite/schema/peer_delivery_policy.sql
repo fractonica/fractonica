@@ -8,5 +8,3 @@ ALTER TABLE client_peers
 ALTER TABLE client_peers
     ADD COLUMN content_read_enabled INTEGER NOT NULL DEFAULT 1
     CHECK (content_read_enabled IN (0, 1));
-
-PRAGMA user_version = 4;

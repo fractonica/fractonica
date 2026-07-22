@@ -1,18 +1,10 @@
--- Establish the signed, space-scoped operation store. Earlier migrations are
--- development scaffolding only and contain no supported Fractonica data.
-CREATE TEMP TABLE _fractonica_v4_empty_legacy_guard (
-    operation_count INTEGER NOT NULL CHECK (operation_count = 0)
-) STRICT;
-
-INSERT INTO _fractonica_v4_empty_legacy_guard (operation_count)
-SELECT count(*) FROM operations;
+-- Establish the signed, space-scoped operation store and its trust boundary.
 
 DROP TABLE operation_resources;
 DROP TABLE idempotency_receipts;
 DROP TABLE entity_heads;
 DROP TABLE operation_parents;
 DROP TABLE operations;
-DROP TABLE _fractonica_v4_empty_legacy_guard;
 
 -- Capability windows use this durable nondecreasing node clock, never a raw
 -- wall-clock sample alone. Admission advances it in an independent committed
@@ -394,7 +386,7 @@ CREATE INDEX capability_grants_issuer_idx
     ON capability_grants (space_id, issuer_actor_id, grant_operation_id);
 
 -- This closed action registry mirrors CapabilityAction. Adding an action is a
--- data-model and schema migration, never a wildcard or prefix interpretation.
+-- data-model and schema change, never a wildcard or prefix interpretation.
 CREATE TABLE capability_grant_actions (
     space_id TEXT NOT NULL,
     grant_operation_id TEXT NOT NULL,
@@ -404,7 +396,8 @@ CREATE TABLE capability_grant_actions (
         'issueCapability',
         'revokeCapability',
         'readSpace',
-        'writeContent'
+        'writeContent',
+        'linkWorkspace'
     )),
     PRIMARY KEY (space_id, grant_operation_id, action),
     UNIQUE (space_id, grant_operation_id, position),
@@ -521,5 +514,3 @@ CREATE INDEX capability_grant_revocations_actor_idx
         revoker_actor_id,
         revocation_operation_id
     );
-
-PRAGMA user_version = 4;

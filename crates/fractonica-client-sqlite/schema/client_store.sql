@@ -180,5 +180,3 @@ CREATE TABLE client_resource_transfers (
 
 CREATE INDEX client_resource_transfers_due_idx
     ON client_resource_transfers (state, next_attempt_at_unix_ms, lease_expires_at_unix_ms, direction, peer_id);
-
-PRAGMA user_version = 1;

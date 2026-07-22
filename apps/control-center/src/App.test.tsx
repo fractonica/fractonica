@@ -71,10 +71,26 @@ function makeClientCore(records: ClientRecord[] = []): ClientCore {
     }),
     claimPairing: vi.fn(),
     acceptPairing: vi.fn(),
+    createWorkspace: vi.fn().mockResolvedValue(undefined),
+    activateWorkspace: vi.fn().mockResolvedValue(undefined),
+    deleteWorkspace: vi.fn().mockResolvedValue(undefined),
   };
 }
 
 describe("control center", () => {
+  it("starts at the workspace root and creates an isolated workspace", async () => {
+    const nodeClient = makeClient(vi.fn().mockResolvedValue(READY_SNAPSHOT));
+    const clientCore = makeClientCore();
+    const user = userEvent.setup();
+
+    render(<App client={nodeClient} clientCore={clientCore} />);
+
+    expect(await screen.findByRole("heading", { name: "Workspaces" })).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Name"), "Travel vault");
+    await user.click(screen.getByRole("button", { name: "Create workspace" }));
+    expect(clientCore.createWorkspace).toHaveBeenCalledWith("Travel vault");
+  });
+
   it("shows a loading state before rendering a ready node", async () => {
     const request = deferred<NodeSnapshot>();
     const client = makeClient(vi.fn(() => request.promise));
@@ -88,7 +104,7 @@ describe("control center", () => {
 
     expect((await screen.findAllByText("Studio node")).length).toBeGreaterThan(0);
     expect(screen.getByText("SQLite")).toBeInTheDocument();
-    expect(screen.getByText("Ready · schema version 14")).toBeInTheDocument();
+    expect(screen.getByText("Ready")).toBeInTheDocument();
     expect(screen.getByText("1d 1h 2m")).toBeInTheDocument();
     expect(screen.getByText("replication")).toBeInTheDocument();
   });
@@ -167,6 +183,10 @@ describe("control center", () => {
         spaceId,
         expiresInMs: 300_000,
         endpointHints: [client.baseUrl],
+        capability: expect.objectContaining({
+          actions: ["appendOperation", "readSpace", "writeContent", "linkWorkspace"],
+          delegationDepth: 0,
+        }),
       }),
     );
 
@@ -184,6 +204,21 @@ describe("control center", () => {
     expect(screen.queryByText(completed.grantOperationId)).not.toBeInTheDocument();
   });
 
+  it("does not invite into the node's stale local space while a linked workspace is active", async () => {
+    const client = makeClient(vi.fn().mockResolvedValue(READY_SNAPSHOT));
+    const clientCore = makeClientCore();
+    const user = userEvent.setup();
+
+    render(<App client={client} clientCore={clientCore} />);
+    await user.click(screen.getByRole("button", { name: "Link devices" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Link from a device that hosts this workspace" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create invitation" })).not.toBeInTheDocument();
+    expect(client.createPairing).not.toHaveBeenCalled();
+  });
+
   it("creates a record through the native local-first client", async () => {
     const nodeClient = makeClient(vi.fn().mockResolvedValue(READY_SNAPSHOT));
     const clientCore = makeClientCore();
@@ -199,6 +234,7 @@ describe("control center", () => {
 
     render(<App client={nodeClient} clientCore={clientCore} />);
 
+    await user.click(await screen.findByRole("button", { name: "Records" }));
     expect(await screen.findByRole("heading", { name: "Records" })).toBeInTheDocument();
     await user.type(screen.getByLabelText("Record emoji"), "🌒");
     await user.type(screen.getByLabelText("Record text"), "A local moment");
@@ -259,6 +295,7 @@ describe("control center", () => {
     const user = userEvent.setup();
 
     render(<App client={nodeClient} clientCore={clientCore} />);
+    await user.click(await screen.findByRole("button", { name: "Records" }));
     await user.click(await screen.findByRole("button", { name: /Original/ }));
     await user.clear(screen.getByLabelText("Record text"));
     await user.type(screen.getByLabelText("Record text"), "Revised");

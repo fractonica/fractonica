@@ -24,60 +24,21 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 10;
-
-struct Migration {
-    version: u32,
-    sql: &'static str,
-}
-
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        sql: include_str!("../migrations/0001_node_installation.sql"),
-    },
-    Migration {
-        version: 2,
-        sql: include_str!("../migrations/0002_operation_log.sql"),
-    },
-    Migration {
-        version: 3,
-        sql: include_str!("../migrations/0003_content_store.sql"),
-    },
-    Migration {
-        version: 4,
-        sql: include_str!("../migrations/0004_signed_spaces.sql"),
-    },
-    Migration {
-        version: 5,
-        sql: include_str!("../migrations/0005_pairing_lifecycle.sql"),
-    },
-    Migration {
-        version: 6,
-        sql: include_str!("../migrations/0006_peer_request_replay.sql"),
-    },
-    Migration {
-        version: 7,
-        sql: include_str!("../migrations/0007_client_contract.sql"),
-    },
-    Migration {
-        version: 8,
-        sql: include_str!("../migrations/0008_peer_transport_credentials.sql"),
-    },
-    Migration {
-        version: 9,
-        sql: include_str!("../migrations/0009_paired_device_activity.sql"),
-    },
-    Migration {
-        version: 10,
-        sql: include_str!("../migrations/0010_pairing_handshake_replay.sql"),
-    },
+const FRESH_SCHEMA: &[&str] = &[
+    include_str!("../schema/node_installation.sql"),
+    include_str!("../schema/operation_log.sql"),
+    include_str!("../schema/content_store.sql"),
+    include_str!("../schema/signed_spaces.sql"),
+    include_str!("../schema/pairing_lifecycle.sql"),
+    include_str!("../schema/peer_request_replay.sql"),
+    include_str!("../schema/client_contract.sql"),
+    include_str!("../schema/peer_transport_credentials.sql"),
+    include_str!("../schema/paired_device_activity.sql"),
+    include_str!("../schema/pairing_handshake_replay.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StoreReadiness {
-    pub schema_version: u32,
-}
+pub struct StoreReadiness;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -86,15 +47,6 @@ pub enum StoreError {
 
     #[error("SQLite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
-
-    #[error("node database uses schema {found}, but this binary supports up to {supported}")]
-    UnsupportedSchema { found: u32, supported: u32 },
-
-    #[error("SQLite migration history has a gap after schema {current}; next migration is {next}")]
-    MigrationGap { current: u32, next: u32 },
-
-    #[error("SQLite migration declared schema {expected}, but database reports {found}")]
-    MigrationVersionMismatch { expected: u32, found: u32 },
 
     #[error("stored installation ID is invalid: {0}")]
     InvalidInstallationId(#[from] uuid::Error),
@@ -125,7 +77,7 @@ impl SqliteStore {
 
         let mut connection = Connection::open(&path)?;
         configure_connection(&connection, true)?;
-        migrate(&mut connection)?;
+        install_fresh_schema(&mut connection)?;
         ensure_installation(&connection)?;
 
         Ok(Self {
@@ -137,7 +89,7 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let mut connection = Connection::open_in_memory()?;
         configure_connection(&connection, false)?;
-        migrate(&mut connection)?;
+        install_fresh_schema(&mut connection)?;
         ensure_installation(&connection)?;
 
         Ok(Self {
@@ -154,8 +106,7 @@ impl SqliteStore {
     pub fn readiness(&self) -> Result<StoreReadiness, StoreError> {
         self.with_connection(|connection| {
             connection.query_row("SELECT 1", [], |_| Ok(()))?;
-            let schema_version = schema_version(connection)?;
-            Ok(StoreReadiness { schema_version })
+            Ok(StoreReadiness)
         })
     }
 
@@ -763,42 +714,20 @@ fn private_state_error(path: &Path, detail: String) -> io::Error {
     )
 }
 
-fn schema_version(connection: &Connection) -> Result<u32, StoreError> {
-    connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(StoreError::from)
-}
-
-fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
-    let mut current = schema_version(connection)?;
-    if current > SCHEMA_VERSION {
-        return Err(StoreError::UnsupportedSchema {
-            found: current,
-            supported: SCHEMA_VERSION,
-        });
-    }
-    for migration in MIGRATIONS {
-        if migration.version <= current {
-            continue;
-        }
-        if migration.version != current + 1 {
-            return Err(StoreError::MigrationGap {
-                current,
-                next: migration.version,
-            });
-        }
+fn install_fresh_schema(connection: &mut Connection) -> Result<(), StoreError> {
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_schema
+          WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(migration.sql)?;
-        transaction.commit()?;
-        current = schema_version(connection)?;
-        if current != migration.version {
-            return Err(StoreError::MigrationVersionMismatch {
-                expected: migration.version,
-                found: current,
-            });
+        for part in FRESH_SCHEMA {
+            transaction.execute_batch(part)?;
         }
+        transaction.commit()?;
     }
-
     Ok(())
 }
 

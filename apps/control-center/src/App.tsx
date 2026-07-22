@@ -158,7 +158,7 @@ function ReadyOverview({ snapshot }: { snapshot: NodeSnapshot }) {
           <Metric
             detail={
               storage.kind === "sqlite"
-                ? `Ready · schema version ${storage.schemaVersion}`
+                ? "Ready"
                 : "No local storage configured"
             }
             label="Storage"
@@ -253,11 +253,35 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
   const [joinClaim, setJoinClaim] = useState<PairingClaim | null>(null);
   const [joinComplete, setJoinComplete] = useState(false);
   const [joining, setJoining] = useState(false);
+  const [activeSpaceId, setActiveSpaceId] = useState<string | null | undefined>(
+    clientCore ? undefined : null,
+  );
   const pairingAvailable = snapshot.node.capabilities.includes("noise-pairing");
   const pairingEndpointAvailable = client.pairingEndpointHints.length > 0;
+  const activeWorkspaceHostedLocally =
+    activeSpaceId == null || spaces.some((space) => space.spaceId === activeSpaceId);
   const session = invitation?.session;
   const qr = invitation?.qr ?? "";
   const terminal = session && ["completed", "cancelled", "expired"].includes(session.state);
+
+  useEffect(() => {
+    if (!clientCore) return;
+    let stopped = false;
+    void clientCore.status().then(
+      (status) => {
+        if (!stopped) setActiveSpaceId(status.spaceId ?? null);
+      },
+      (reason) => {
+        if (!stopped) {
+          setError(nativeErrorMessage(reason, "Could not identify the active workspace."));
+          setActiveSpaceId(null);
+        }
+      },
+    );
+    return () => {
+      stopped = true;
+    };
+  }, [clientCore]);
 
   useEffect(() => {
     if (!pairingAvailable || snapshot.node.profile !== "node") return;
@@ -319,7 +343,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
           expiresInMs: 5 * 60 * 1_000,
           endpointHints: [...client.pairingEndpointHints],
           capability: {
-            actions: ["appendOperation", "readSpace", "writeContent"],
+            actions: ["appendOperation", "readSpace", "writeContent", "linkWorkspace"],
             schemas: ["record", "event", "tag", "profile"],
             visibilities: ["public", "private"],
             contentRoles: ["record.media"],
@@ -446,7 +470,22 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
         </Panel>
       ) : null}
 
-      {pairingAvailable && snapshot.node.profile === "node" && !session ? (
+      {pairingAvailable && snapshot.node.profile === "node" && !session && !activeWorkspaceHostedLocally ? (
+        <Panel className="pairing-card pairing-card--notice">
+          <h3>Link from a device that hosts this workspace</h3>
+          <p>
+            This desktop is displaying a workspace joined through another device, but its local
+            Windows node owns a different workspace. Creating an invitation here would link the
+            joining device to that other workspace instead of the records currently shown.
+          </p>
+          <p className="security-note">
+            Create the invitation on the Mac that introduced this workspace. Windows can still
+            join invitations and will continue synchronizing through its existing link.
+          </p>
+        </Panel>
+      ) : null}
+
+      {pairingAvailable && snapshot.node.profile === "node" && !session && activeWorkspaceHostedLocally ? (
         <Panel className="pairing-card pairing-setup">
           <div>
             <p className="pairing-step">Step 1 · Scope</p>
@@ -474,7 +513,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
             <li>No delegation</li>
           </ul>
           <div className="pairing-actions">
-            <Button disabled={busy || !spaceId || !pairingEndpointAvailable} onClick={() => void create()}>
+            <Button disabled={busy || !spaceId || !pairingEndpointAvailable || activeSpaceId === undefined} onClick={() => void create()}>
               {busy ? "Creating…" : "Create invitation"}
             </Button>
           </div>
@@ -674,7 +713,136 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
   );
 }
 
-type WorkspaceView = "records" | "node" | "pairing";
+interface WorkspaceManagerProps {
+  clientCore: ClientCore;
+  snapshot: NodeSnapshot;
+  onRefresh: () => Promise<void>;
+  activeSpaceId?: string;
+  onActiveChange: (spaceId?: string) => void;
+}
+
+function WorkspaceManager({
+  clientCore,
+  snapshot,
+  onRefresh,
+  activeSpaceId,
+  onActiveChange,
+}: WorkspaceManagerProps) {
+  const [displayName, setDisplayName] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const spaces = snapshot.node.spaces ?? [];
+
+  const create = async () => {
+    if (!clientCore.createWorkspace) return;
+    setBusy("create");
+    setError(null);
+    try {
+      await clientCore.createWorkspace(displayName);
+      setDisplayName("");
+      const status = await clientCore.status();
+      onActiveChange(status.spaceId);
+      await onRefresh();
+    } catch (reason) {
+      setError(nativeErrorMessage(reason, "Workspace could not be created."));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const activate = async (spaceId: string) => {
+    if (!clientCore.activateWorkspace) return;
+    setBusy(spaceId);
+    setError(null);
+    try {
+      await clientCore.activateWorkspace(spaceId);
+      onActiveChange(spaceId);
+    } catch (reason) {
+      setError(nativeErrorMessage(reason, "Workspace could not be opened."));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async (spaceId: string) => {
+    if (!clientCore.deleteWorkspace) return;
+    setBusy(spaceId);
+    setError(null);
+    try {
+      await clientCore.deleteWorkspace(spaceId);
+      const status = await clientCore.status();
+      onActiveChange(status.spaceId);
+      await onRefresh();
+    } catch (reason) {
+      setError(nativeErrorMessage(reason, "Workspace could not be deleted."));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <p className="section-kicker">Vault root</p>
+          <h1>Workspaces</h1>
+          <p>Each workspace has an independent record graph and device network.</p>
+        </div>
+      </header>
+      <div className="content-stack">
+        <Panel>
+          <h2>Create workspace</h2>
+          <div className="pairing-form">
+            <label>
+              <span>Name</span>
+              <input
+                maxLength={128}
+                onChange={(event) => setDisplayName(event.target.value)}
+                placeholder="Personal"
+                value={displayName}
+              />
+            </label>
+            <Button disabled={busy !== null || !displayName.trim()} onClick={() => void create()}>
+              {busy === "create" ? "Creating…" : "Create workspace"}
+            </Button>
+          </div>
+        </Panel>
+        {spaces.length === 0 ? (
+          <Panel>
+            <h2>No workspace selected</h2>
+            <p>This installation is an empty node. Create a workspace or link one from another device.</p>
+          </Panel>
+        ) : (
+          spaces.map((space) => (
+            <Panel key={space.spaceId}>
+              <div className="pairing-device__header">
+                <div>
+                  <h2>{space.displayName}</h2>
+                  <code>{space.spaceId}</code>
+                </div>
+                {activeSpaceId === space.spaceId ? <StatusBadge tone="ready">Open</StatusBadge> : null}
+              </div>
+              <div className="pairing-actions">
+                <Button
+                  disabled={busy !== null || activeSpaceId === space.spaceId}
+                  onClick={() => void activate(space.spaceId)}
+                >
+                  Open workspace
+                </Button>
+                <Button disabled={busy !== null} onClick={() => void remove(space.spaceId)} variant="quiet">
+                  Delete workspace
+                </Button>
+              </div>
+            </Panel>
+          ))
+        )}
+        {error ? <p className="pairing-error" role="alert">{error}</p> : null}
+      </div>
+    </>
+  );
+}
+
+type WorkspaceView = "workspaces" | "records" | "node" | "pairing";
 
 export default function App({ client: suppliedClient, clientCore: suppliedClientCore }: AppProps) {
   const client = useMemo(() => suppliedClient ?? createRuntimeNodeClient(), [suppliedClient]);
@@ -682,11 +850,17 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
     () => suppliedClientCore === undefined ? createRuntimeClientCore() : suppliedClientCore,
     [suppliedClientCore],
   );
-  const [view, setView] = useState<WorkspaceView>(() => clientCore ? "records" : "node");
+  const [view, setView] = useState<WorkspaceView>(() => clientCore ? "workspaces" : "node");
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | undefined>();
   const [resetArmed, setResetArmed] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
   const { error, lastCheckedAt, phase, refresh, refreshing, snapshot } = useNodeStatus(client);
+
+  useEffect(() => {
+    if (!clientCore) return;
+    void clientCore.status().then((status) => setActiveWorkspaceId(status.spaceId));
+  }, [clientCore]);
 
   const resetInstallation = async () => {
     if (!clientCore?.resetInstallation) return;
@@ -714,7 +888,8 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
           <div><strong>Fractonica</strong><span>Control center</span></div>
         </div>
         <nav aria-label="Control center">
-          <span className="nav-label">Local workspace</span>
+          <span className="nav-label">Vaults</span>
+          <button className={`nav-item${view === "workspaces" ? "" : " nav-item--secondary"}`} onClick={() => setView("workspaces")} type="button"><span aria-hidden="true" className="nav-item__glyph">◇</span>Workspaces</button>
           <button className={`nav-item${view === "records" ? "" : " nav-item--secondary"}`} onClick={() => setView("records")} type="button"><span aria-hidden="true" className="nav-item__glyph">✦</span>Records</button>
           <button className={`nav-item${view === "node" ? "" : " nav-item--secondary"}`} onClick={() => setView("node")} type="button"><span aria-hidden="true" className="nav-item__glyph">◈</span>Node overview</button>
           <button className={`nav-item${view === "pairing" ? "" : " nav-item--secondary"}`} onClick={() => setView("pairing")} type="button"><span aria-hidden="true" className="nav-item__glyph">⌁</span>Link devices</button>
@@ -727,7 +902,19 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
       </aside>
 
       <main id={view}>
-        {view === "records" && clientCore ? <RecordsWorkspace client={clientCore} /> : null}
+        {view === "workspaces" && phase === "ready" && snapshot && clientCore ? (
+          <WorkspaceManager
+            activeSpaceId={activeWorkspaceId}
+            clientCore={clientCore}
+            onActiveChange={setActiveWorkspaceId}
+            onRefresh={refresh}
+            snapshot={snapshot}
+          />
+        ) : null}
+        {view === "records" && clientCore && activeWorkspaceId ? <RecordsWorkspace client={clientCore} /> : null}
+        {view === "records" && clientCore && !activeWorkspaceId ? (
+          <Panel><h2>No open workspace</h2><p>Create or open a workspace from the Workspaces root first.</p></Panel>
+        ) : null}
         {view === "records" && !clientCore ? (
           <>
             <header className="page-header">

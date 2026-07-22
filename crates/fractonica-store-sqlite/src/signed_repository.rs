@@ -31,9 +31,7 @@ const PEER_NONCE_CLEANUP_BATCH: i64 = 1_024;
 impl OperationRepository for SqliteStore {
     fn readiness(&self) -> Result<RepositoryReadiness, RepositoryError> {
         SqliteStore::readiness(self)
-            .map(|ready| RepositoryReadiness {
-                schema_version: ready.schema_version,
-            })
+            .map(|_| RepositoryReadiness)
             .map_err(repository_unavailable)
     }
 
@@ -67,6 +65,61 @@ impl OperationRepository for SqliteStore {
             )));
         }
         Ok(result)
+    }
+
+    fn delete_space(&self, space_id: SpaceId) -> Result<(), RepositoryError> {
+        let mut connection = lock_mut(self)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(repository_sqlite)?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM spaces WHERE space_id=?1)",
+                params![space_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(repository_sqlite)?;
+        if !exists {
+            return Err(RepositoryError::SpaceNotFound(space_id));
+        }
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON")
+            .map_err(repository_sqlite)?;
+        for table in [
+            "pairing_sessions",
+            "client_operation_projections",
+            "capability_grant_actions",
+            "capability_grant_schema_scopes",
+            "capability_grant_visibilities",
+            "capability_grant_content_roles",
+            "capability_grant_revocations",
+            "operation_resources",
+            "client_entity_visibility",
+            "entity_heads",
+            "operation_authorization_refs",
+            "operation_parents",
+            "capability_grants",
+        ] {
+            transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE space_id=?1"),
+                    params![space_id.to_string()],
+                )
+                .map_err(repository_sqlite)?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM spaces WHERE space_id=?1",
+                params![space_id.to_string()],
+            )
+            .map_err(repository_sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM operations WHERE space_id=?1",
+                params![space_id.to_string()],
+            )
+            .map_err(repository_sqlite)?;
+        transaction.commit().map_err(repository_sqlite)
     }
 
     fn bootstrap_trusted_space(
@@ -843,6 +896,8 @@ fn validate_bootstrap(request: &TrustedSpaceBootstrapRequest) -> Result<(), Repo
             == [
                 CapabilityAction::AppendOperation,
                 CapabilityAction::ReadSpace,
+                CapabilityAction::WriteContent,
+                CapabilityAction::LinkWorkspace,
             ]
         && grant.schemas
             == [
@@ -852,8 +907,8 @@ fn validate_bootstrap(request: &TrustedSpaceBootstrapRequest) -> Result<(), Repo
                 EntitySchema::Tag,
             ]
         && grant.visibilities == [Visibility::Public, Visibility::Private]
-        && grant.content_roles.is_empty()
-        && grant.max_resource_byte_length.is_none()
+        && grant.content_roles == ["record.media"]
+        && grant.max_resource_byte_length == Some(1_073_741_824)
         && grant.not_before_unix_ms.is_none()
         && grant.expires_at_unix_ms.is_none()
         && grant.delegation_depth == 0;
@@ -1695,6 +1750,7 @@ const fn action_key(value: CapabilityAction) -> &'static str {
         CapabilityAction::RevokeCapability => "revokeCapability",
         CapabilityAction::ReadSpace => "readSpace",
         CapabilityAction::WriteContent => "writeContent",
+        CapabilityAction::LinkWorkspace => "linkWorkspace",
     }
 }
 
@@ -1723,7 +1779,6 @@ fn corrupt(detail: impl Into<String>) -> RepositoryError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use fractonica_application::ContentRepository;
     use fractonica_data_model::{
         CapabilityGrant, CapabilityRevocation, EncryptedPayload, EncryptionAlgorithm,
         OperationNonce, ProtectedDocument, RecordDocument, SigningKey,
@@ -1731,8 +1786,6 @@ mod tests {
     use fractonica_peer::{
         PeerReadChangesFields, PeerReadChangesProof, PeerRequestNonce, PeerSessionId,
     };
-    use rusqlite::Connection;
-    use tempfile::tempdir;
     use uuid::Uuid;
 
     use super::*;
@@ -1804,6 +1857,8 @@ mod tests {
                         actions: vec![
                             CapabilityAction::AppendOperation,
                             CapabilityAction::ReadSpace,
+                            CapabilityAction::WriteContent,
+                            CapabilityAction::LinkWorkspace,
                         ],
                         schemas: vec![
                             EntitySchema::Event,
@@ -1812,8 +1867,8 @@ mod tests {
                             EntitySchema::Tag,
                         ],
                         visibilities: vec![Visibility::Public, Visibility::Private],
-                        content_roles: vec![],
-                        max_resource_byte_length: None,
+                        content_roles: vec!["record.media".into()],
+                        max_resource_byte_length: Some(1_073_741_824),
                         not_before_unix_ms: None,
                         expires_at_unix_ms: None,
                         delegation_depth: 0,
@@ -2068,6 +2123,8 @@ mod tests {
                     actions: vec![
                         CapabilityAction::AppendOperation,
                         CapabilityAction::ReadSpace,
+                        CapabilityAction::WriteContent,
+                        CapabilityAction::LinkWorkspace,
                     ],
                     schemas: vec![
                         EntitySchema::Event,
@@ -2076,8 +2133,8 @@ mod tests {
                         EntitySchema::Tag,
                     ],
                     visibilities: vec![Visibility::Public, Visibility::Private],
-                    content_roles: vec![],
-                    max_resource_byte_length: None,
+                    content_roles: vec!["record.media".into()],
+                    max_resource_byte_length: Some(1_073_741_824),
                     not_before_unix_ms: None,
                     expires_at_unix_ms: None,
                     delegation_depth: 0,
@@ -2453,55 +2510,6 @@ mod tests {
                 .operation_count,
             1
         );
-    }
-
-    #[test]
-    fn schema_upgrade_preserves_content_and_upload_metadata() {
-        let temporary = tempdir().unwrap();
-        let path = temporary.path().join("content.sqlite3");
-        let content_id = fractonica_content::hash_bytes(b"preserved");
-        let upload_id = fractonica_application::UploadId::new(Uuid::from_bytes([31; 16]));
-        let connection = Connection::open(&path).unwrap();
-        for migration in &super::super::MIGRATIONS[..3] {
-            connection.execute_batch(migration.sql).unwrap();
-        }
-        connection
-            .execute(
-                "INSERT INTO blobs (content_id, byte_length, stored_at_unix_ms)
-             VALUES (?1, 9, 10)",
-                params![content_id.to_string()],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO upload_sessions (
-                upload_id, upload_length, upload_offset, state,
-                created_at_unix_ms, expires_at_unix_ms
-             ) VALUES (?1, 12, 4, 'active', 10, 20)",
-                params![upload_id.to_string()],
-            )
-            .unwrap();
-        drop(connection);
-        make_legacy_fixture_private(temporary.path(), &path);
-
-        let store = SqliteStore::open(&path).unwrap();
-        assert_eq!(
-            store.readiness().unwrap().schema_version,
-            super::super::SCHEMA_VERSION
-        );
-        assert_eq!(store.content(content_id).unwrap().unwrap().byte_length, 9);
-        let upload = store.upload(upload_id).unwrap().unwrap();
-        assert_eq!(upload.upload_length, 12);
-        assert_eq!(upload.upload_offset, 4);
-    }
-
-    fn make_legacy_fixture_private(directory: &std::path::Path, database: &std::path::Path) {
-        #[cfg(unix)]
-        {
-            use std::{fs, os::unix::fs::PermissionsExt};
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
-            fs::set_permissions(database, fs::Permissions::from_mode(0o600)).unwrap();
-        }
     }
 
     #[test]

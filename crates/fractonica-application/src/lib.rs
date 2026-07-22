@@ -168,9 +168,7 @@ pub trait ContentRepository: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RepositoryReadiness {
-    pub schema_version: u32,
-}
+pub struct RepositoryReadiness;
 
 /// One admitted operation plus node-local receipt metadata.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -378,6 +376,12 @@ pub trait OperationRepository: Send + Sync {
 
     fn spaces(&self) -> Result<Vec<SpaceDescriptor>, RepositoryError>;
 
+    fn delete_space(&self, _space_id: SpaceId) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Unavailable(
+            "workspace deletion is not implemented by this repository".into(),
+        ))
+    }
+
     fn bootstrap_trusted_space(
         &self,
         request: &TrustedSpaceBootstrapRequest,
@@ -500,6 +504,10 @@ impl ApplicationService {
 
     pub fn spaces(&self) -> Result<Vec<SpaceDescriptor>, ApplicationError> {
         self.repository.spaces().map_err(Into::into)
+    }
+
+    pub fn delete_space(&self, space_id: SpaceId) -> Result<(), ApplicationError> {
+        self.repository.delete_space(space_id).map_err(Into::into)
     }
 
     /// Explicit local trust-anchor creation. This must not be exposed as a
@@ -690,6 +698,8 @@ pub fn validate_trusted_space_bootstrap(
         != [
             CapabilityAction::AppendOperation,
             CapabilityAction::ReadSpace,
+            CapabilityAction::WriteContent,
+            CapabilityAction::LinkWorkspace,
         ]
         || grant.schemas.as_slice()
             != [
@@ -699,8 +709,8 @@ pub fn validate_trusted_space_bootstrap(
                 EntitySchema::Tag,
             ]
         || grant.visibilities.as_slice() != [Visibility::Public, Visibility::Private]
-        || !grant.content_roles.is_empty()
-        || grant.max_resource_byte_length.is_some()
+        || grant.content_roles.as_slice() != ["record.media"]
+        || grant.max_resource_byte_length != Some(1_073_741_824)
         || grant.not_before_unix_ms.is_some()
         || grant.expires_at_unix_ms.is_some()
         || grant.delegation_depth != 0

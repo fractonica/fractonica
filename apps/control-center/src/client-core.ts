@@ -96,6 +96,9 @@ export interface ClientCore {
   deleteRecord(entityId: string): Promise<CommitResult>;
   claimPairing(invitation: string): Promise<PairingClaim>;
   acceptPairing(invitationId: string, recordPolicy: PrePairRecordPolicy): Promise<PairingClaim>;
+  createWorkspace?(displayName: string): Promise<void>;
+  activateWorkspace?(spaceId: string): Promise<void>;
+  deleteWorkspace?(spaceId: string): Promise<void>;
   resetInstallation?(): Promise<void>;
 }
 
@@ -406,6 +409,21 @@ export function createClientCore(invoke: Invoke): ClientCore {
       return decodePairingClaim(
         await invoke("client_accept_pairing_invitation", { invitationId, recordPolicy }),
       );
+    },
+    createWorkspace: async (displayName) => {
+      const name = displayName.trim();
+      if (name.length < 1 || [...name].length > 128 || /\p{Cc}/u.test(name)) {
+        throw new Error("Workspace name must contain between 1 and 128 visible characters.");
+      }
+      await invoke("client_create_workspace", { displayName: name });
+    },
+    activateWorkspace: async (spaceId) => {
+      if (!SPACE_ID.test(spaceId)) throw new Error("The workspace ID is invalid.");
+      await invoke("client_activate_workspace", { spaceId });
+    },
+    deleteWorkspace: async (spaceId) => {
+      if (!SPACE_ID.test(spaceId)) throw new Error("The workspace ID is invalid.");
+      await invoke("client_delete_workspace", { spaceId });
     },
     resetInstallation: async () => {
       await invoke("client_reset_local_installation", {

@@ -59,7 +59,7 @@ impl StubRepository {
 
 impl OperationRepository for StubRepository {
     fn readiness(&self) -> Result<RepositoryReadiness, RepositoryError> {
-        Ok(RepositoryReadiness { schema_version: 4 })
+        Ok(RepositoryReadiness)
     }
 
     fn installation(&self) -> Result<InstallationMetadata, RepositoryError> {
@@ -249,6 +249,8 @@ fn bootstrap() -> TrustedSpaceBootstrapRequest {
                 actions: vec![
                     CapabilityAction::AppendOperation,
                     CapabilityAction::ReadSpace,
+                    CapabilityAction::WriteContent,
+                    CapabilityAction::LinkWorkspace,
                 ],
                 schemas: vec![
                     EntitySchema::Event,
@@ -257,8 +259,8 @@ fn bootstrap() -> TrustedSpaceBootstrapRequest {
                     EntitySchema::Tag,
                 ],
                 visibilities: vec![Visibility::Public, Visibility::Private],
-                content_roles: Vec::new(),
-                max_resource_byte_length: None,
+                content_roles: vec!["record.media".into()],
+                max_resource_byte_length: Some(1_073_741_824),
                 not_before_unix_ms: None,
                 expires_at_unix_ms: None,
                 delegation_depth: 0,

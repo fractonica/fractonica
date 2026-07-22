@@ -10,7 +10,7 @@ export type PairingState =
   | "expired";
 
 export type StorageReadyStatus =
-  | { kind: "sqlite"; status: "ready"; schemaVersion: number }
+  | { kind: "sqlite"; status: "ready" }
   | { kind: "none"; status: "notConfigured" };
 
 export interface ReadyResponse {
@@ -47,7 +47,7 @@ export interface NodeSnapshot {
 }
 
 export interface PairingCapabilityTemplate {
-  actions: Array<"appendOperation" | "readSpace" | "writeContent">;
+  actions: Array<"appendOperation" | "readSpace" | "writeContent" | "linkWorkspace">;
   schemas: Array<"record" | "event" | "tag" | "profile">;
   visibilities: Array<"public" | "private">;
   contentRoles: string[];
@@ -186,17 +186,16 @@ function decodeReadyResponse(value: unknown): ReadyResponse {
 
   if (value.profile === "node") {
     if (
-      !hasExactKeys(value.storage, ["kind", "status", "schemaVersion"]) ||
+      !hasExactKeys(value.storage, ["kind", "status"]) ||
       value.storage.kind !== "sqlite" ||
-      value.storage.status !== "ready" ||
-      !isSafeNonnegativeInteger(value.storage.schemaVersion)
+      value.storage.status !== "ready"
     ) {
       throw new Error("The readiness response did not match the expected schema.");
     }
     return {
       status: "ready",
       profile: "node",
-      storage: { kind: "sqlite", status: "ready", schemaVersion: value.storage.schemaVersion },
+      storage: { kind: "sqlite", status: "ready" },
     };
   }
 
@@ -591,15 +590,13 @@ function createResolvingNodeClient(
 }
 
 export function decodeDesktopNodeConnection(value: unknown): NodeConnection {
-  if (!isObject(value)) {
+  if (
+    !isObject(value) ||
+    !hasExactKeys(value, ["baseUrl", "bearerToken", "pairingEndpointHints"])
+  ) {
     throw new Error("The desktop node handoff did not match the expected schema.");
   }
-  // Tauri currently respects serde's camelCase names, but accepting the native
-  // snake_case names keeps the handoff compatible with older packaged shells.
-  const baseUrl = value.baseUrl ?? value.base_url;
-  const bearerToken = value.bearerToken ?? value.bearer_token;
-  const pairingEndpointHints =
-    value.pairingEndpointHints ?? value.pairing_endpoint_hints ?? [];
+  const { baseUrl, bearerToken, pairingEndpointHints } = value;
   if (
     typeof baseUrl !== "string" ||
     typeof bearerToken !== "string" ||

@@ -31,6 +31,48 @@ tags:
 security:
   - bootstrapBearer: []
 paths:
+  /api/workspaces:
+    post:
+      tags: [Operations]
+      summary: Create an independent local workspace
+      operationId: createWorkspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWorkspaceRequest"
+      responses:
+        "201":
+          description: The workspace and its signed trust anchors were created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceCreated"
+        "400":
+          $ref: "#/components/responses/MalformedSignedOperation"
+        "401":
+          $ref: "#/components/responses/TransportUnauthorized"
+        "503":
+          $ref: "#/components/responses/ProfileUnavailable"
+  /api/workspaces/{spaceId}:
+    delete:
+      tags: [Operations]
+      summary: Delete one local workspace and its data
+      operationId: deleteWorkspace
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+      responses:
+        "204":
+          description: The workspace was deleted.
+        "401":
+          $ref: "#/components/responses/TransportUnauthorized"
+        "404":
+          $ref: "#/components/responses/SpaceOrDependencyNotFound"
+        "422":
+          $ref: "#/components/responses/InvalidPathIdentifier"
+        "503":
+          $ref: "#/components/responses/ProfileUnavailable"
   /api/spaces/{spaceId}/operations:
     post:
       tags: [Operations]
@@ -661,6 +703,42 @@ components:
           schema:
             $ref: "#/components/schemas/Problem"
   schemas:
+    CreateWorkspaceRequest:
+      type: object
+      additionalProperties: false
+      required: [displayName]
+      properties:
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 128
+    WorkspaceDescriptor:
+      type: object
+      additionalProperties: false
+      required:
+        - spaceId
+        - displayName
+        - genesisOperationId
+        - initialGrantOperationId
+        - controllerActorId
+        - localWriterActorId
+        - createdAtUnixMs
+      properties:
+        spaceId: { $ref: "#/components/schemas/SpaceId" }
+        displayName: { type: string, minLength: 1, maxLength: 128 }
+        genesisOperationId: { $ref: "#/components/schemas/OperationId" }
+        initialGrantOperationId: { $ref: "#/components/schemas/OperationId" }
+        controllerActorId: { $ref: "#/components/schemas/ActorId" }
+        localWriterActorId: { $ref: "#/components/schemas/ActorId" }
+        createdAtUnixMs: { type: integer, format: int64, minimum: 0 }
+    WorkspaceCreated:
+      type: object
+      additionalProperties: false
+      required: [space, genesis, initialGrant]
+      properties:
+        space: { $ref: "#/components/schemas/WorkspaceDescriptor" }
+        genesis: { $ref: "#/components/schemas/SignedOperation" }
+        initialGrant: { $ref: "#/components/schemas/SignedOperation" }
     SpaceId:
       type: string
       pattern: '^space:(?!0{64}$)[0-9a-f]{64}$'
@@ -1138,6 +1216,7 @@ components:
         - revokeCapability
         - readSpace
         - writeContent
+        - linkWorkspace
     CapabilityRevocation:
       type: object
       additionalProperties: false

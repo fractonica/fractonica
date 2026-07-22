@@ -9,5 +9,3 @@ CREATE TABLE peer_request_nonces (
 
 CREATE INDEX peer_request_nonces_expiry_idx
     ON peer_request_nonces (expires_at_unix_ms);
-
-PRAGMA user_version = 6;

@@ -34,5 +34,3 @@ CREATE INDEX client_projection_text_idx
 
 CREATE INDEX client_projection_actor_idx
     ON client_operation_projections (space_id, schema_id, actor_id, entity_id);
-
-PRAGMA user_version = 7;

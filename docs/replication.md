@@ -63,12 +63,20 @@ unchanged.
 ## Connection lifecycle
 
 - Startup and network-path changes wake the durable outbox immediately.
-- Online paired nodes run a bounded anti-entropy exchange after authentication.
+- Online workspace members run a bounded anti-entropy exchange after
+  membership authentication.
 - A clean root is cached only as an optimization; peers recheck periodically.
 - Mobile suspension is safe. The next foreground/network opportunity resumes
   from durable queues and inventory roots.
-- Revocation stops admission immediately. Re-pairing creates a new capability
-  and reopens work that was rejected under the previous credential.
+- A signed, workspace-scoped peer directory lets every discoverable member
+  learn alternate routes; pairwise invitation secrets are never propagated.
+- Mesh cycles are expected. Immutable operation/content IDs and inventories,
+  rather than an acyclic topology, suppress duplicate relay.
+- Edge unlinking stops one direct route without revoking workspace membership.
+  Membership revocation is a separate administrative operation.
+- Revocation stops admission immediately. Relinking after revocation requires
+  a new active membership capability and reopens work rejected under the old
+  grant.
 
 ## Implementation sequence
 

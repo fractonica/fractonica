@@ -40,7 +40,7 @@ Fractonica uses four identities with deliberately different lifecycles:
 
 | Identity | Meaning | Security role |
 | --- | --- | --- |
-| `InstallationId` | One local database lifecycle | Diagnostics and local migrations only. It MUST NOT authorize, sign, or be treated as a peer identity. |
+| `InstallationId` | One local database lifecycle | Diagnostics only. It MUST NOT authorize, sign, or be treated as a peer identity. |
 | `NodeId` | One node transport endpoint, derived from its Ed25519 public key | Pins a node during pairing and future authenticated transport. It MUST NOT be reused as an actor key. |
 | `SpaceId` | A random 256-bit authorization and replication namespace | Scopes operations and grants. It conveys no authority by itself. |
 | `ActorId` | An author, derived directly from its Ed25519 public key | Verifies operation authorship and is the subject or issuer of capabilities. |

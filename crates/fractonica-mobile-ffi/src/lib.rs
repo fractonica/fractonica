@@ -13,6 +13,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use fractonica_application::SpaceDescriptor;
 use fractonica_client_runtime::{
     ClientRuntime, ClientRuntimeError, PairingClaim, PrePairRecordPolicy, StandaloneClientConfig,
     StandaloneIdentityAction, StandaloneIdentityState, StandaloneIdentityStore,
@@ -74,6 +75,17 @@ pub struct MobileClientStatus {
     pub synchronized_bytes: u64,
     pub total_bytes: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct MobileWorkspace {
+    pub space_id: String,
+    pub display_name: String,
+    pub genesis_operation_id: String,
+    pub initial_grant_operation_id: String,
+    pub controller_actor_id: String,
+    pub local_writer_actor_id: String,
+    pub created_at_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
@@ -211,12 +223,9 @@ pub struct MobileClientBootstrap {
 #[uniffi::export]
 impl MobileClientBootstrap {
     #[uniffi::constructor]
-    pub fn new(storage_dir: String, display_name: String) -> Result<Arc<Self>, MobileClientError> {
+    pub fn new(storage_dir: String) -> Result<Arc<Self>, MobileClientError> {
         let path = PathBuf::from(storage_dir);
-        if !path.is_absolute()
-            || display_name.trim().is_empty()
-            || display_name.len() > MAX_DISPLAY_NAME_BYTES
-        {
+        if !path.is_absolute() {
             return Err(MobileClientError::InvalidConfiguration);
         }
         let executor = Runtime::new().map_err(|_| MobileClientError::InitializationFailed)?;
@@ -224,7 +233,6 @@ impl MobileClientBootstrap {
             executor: Arc::new(executor),
             config: StandaloneClientConfig {
                 client_data_dir: path,
-                display_name,
             },
             opened: Mutex::new(false),
         }))
@@ -314,7 +322,7 @@ impl MobileClientCore {
             phase: "ready".to_owned(),
             node_id: Some(status.node_id.to_string()),
             actor_id: Some(status.actor_id.to_string()),
-            space_id: Some(status.space_id.to_string()),
+            space_id: status.space_id.map(|space_id| space_id.to_string()),
             sync_running: status.sync.running,
             cycle: status.sync.cycle,
             pending_operations: counts
@@ -335,6 +343,44 @@ impl MobileClientCore {
                 .last_error
                 .map(|_| "Synchronization failed.".to_owned()),
         }
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<MobileWorkspace>, MobileClientError> {
+        self.client
+            .workspaces()
+            .map(|workspaces| workspaces.into_iter().map(mobile_workspace).collect())
+            .map_err(|_| MobileClientError::OperationFailed)
+    }
+
+    pub fn create_workspace(
+        &self,
+        display_name: String,
+    ) -> Result<MobileWorkspace, MobileClientError> {
+        if display_name.trim().is_empty() || display_name.len() > MAX_DISPLAY_NAME_BYTES {
+            return Err(MobileClientError::InvalidConfiguration);
+        }
+        self.executor
+            .block_on(self.client.create_workspace(display_name))
+            .map(mobile_workspace)
+            .map_err(|_| MobileClientError::OperationFailed)
+    }
+
+    pub fn activate_workspace(&self, space_id: String) -> Result<(), MobileClientError> {
+        let space_id = space_id
+            .parse()
+            .map_err(|_| MobileClientError::InvalidConfiguration)?;
+        self.executor
+            .block_on(self.client.activate_workspace(space_id))
+            .map_err(|_| MobileClientError::OperationFailed)
+    }
+
+    pub fn delete_workspace(&self, space_id: String) -> Result<(), MobileClientError> {
+        let space_id = space_id
+            .parse()
+            .map_err(|_| MobileClientError::InvalidConfiguration)?;
+        self.executor
+            .block_on(self.client.delete_workspace(space_id))
+            .map_err(|_| MobileClientError::OperationFailed)
     }
 
     pub fn list_records(&self, limit: u32) -> Result<Vec<MobileRecordPreview>, MobileClientError> {
@@ -667,6 +713,18 @@ const fn visibility_name(visibility: Visibility) -> &'static str {
     }
 }
 
+fn mobile_workspace(workspace: SpaceDescriptor) -> MobileWorkspace {
+    MobileWorkspace {
+        space_id: workspace.space_id.to_string(),
+        display_name: workspace.display_name,
+        genesis_operation_id: workspace.genesis_operation_id.to_string(),
+        initial_grant_operation_id: workspace.initial_grant_operation_id.to_string(),
+        controller_actor_id: workspace.controller_actor_id.to_string(),
+        local_writer_actor_id: workspace.local_writer_actor_id.to_string(),
+        created_at_unix_ms: workspace.created_at_unix_ms,
+    }
+}
+
 fn reset_client_data_directory(path: &Path) -> Result<(), MobileClientError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -682,15 +740,10 @@ fn reset_client_data_directory(path: &Path) -> Result<(), MobileClientError> {
 fn map_initialization_error(error: ClientRuntimeError) -> MobileClientError {
     match error {
         ClientRuntimeError::StandaloneRecovery(_)
-        | ClientRuntimeError::MissingInstallationAnchor(_)
-        | ClientRuntimeError::InvalidInstallationAnchor(_) => MobileClientError::RecoveryRequired,
+        | ClientRuntimeError::MissingInstallationAnchor(_) => MobileClientError::RecoveryRequired,
         ClientRuntimeError::Store(
-            ClientStoreError::UnsupportedSchema { .. }
-            | ClientStoreError::MigrationVersionMismatch { .. }
-            | ClientStoreError::Corrupt(_)
+            ClientStoreError::Corrupt(_)
             | ClientStoreError::InvalidBootstrap(_)
-            | ClientStoreError::UntrackedInstallationOperations
-            | ClientStoreError::InstallationNotInitializing
             | ClientStoreError::InstallationConflict,
         ) => MobileClientError::RecoveryRequired,
         _ => MobileClientError::InitializationFailed,
@@ -738,20 +791,25 @@ mod tests {
     }
 
     #[test]
-    fn established_database_reopens_while_native_lifecycle_marker_lags() {
+    fn explicit_mobile_workspace_reopens_with_its_records() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("client");
-        let bootstrap = MobileClientBootstrap::new(
-            path.to_string_lossy().into_owned(),
-            "Personal space".to_owned(),
-        )
-        .expect("bootstrap");
+        let bootstrap =
+            MobileClientBootstrap::new(path.to_string_lossy().into_owned()).expect("bootstrap");
         assert_eq!(
             bootstrap.prepare(false).expect("prepare"),
             MobileIdentityAction::CreateOrResume
         );
         let material = generate_identity_material().expect("identity");
         let client = bootstrap.open(material.clone()).expect("open");
+        assert!(client.list_workspaces().expect("workspaces").is_empty());
+        let workspace = client
+            .create_workspace("Personal space".to_owned())
+            .expect("workspace");
+        assert_eq!(
+            client.status().space_id.as_deref(),
+            Some(workspace.space_id.as_str())
+        );
         let result = client
             .create_public_record(
                 r#"{"visibility":"public","document":{"startAtUnixMs":1,"text":"hello","metadata":{},"resources":[],"references":[]}}"#
@@ -779,15 +837,8 @@ mod tests {
         drop(client);
         drop(bootstrap);
 
-        // Platform storage is deliberately treated as present even if its
-        // outer lifecycle byte still says `initializing`. This models a crash
-        // after Rust committed the installation but before native storage was
-        // marked established.
-        let reopened = MobileClientBootstrap::new(
-            path.to_string_lossy().into_owned(),
-            "Personal space".to_owned(),
-        )
-        .expect("bootstrap");
+        let reopened =
+            MobileClientBootstrap::new(path.to_string_lossy().into_owned()).expect("bootstrap");
         assert_eq!(
             reopened.prepare(true).expect("prepare"),
             MobileIdentityAction::OpenExisting
@@ -839,11 +890,8 @@ mod tests {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("client");
         let material = generate_identity_material().expect("identity");
-        let bootstrap = MobileClientBootstrap::new(
-            path.to_string_lossy().into_owned(),
-            "Personal space".to_owned(),
-        )
-        .expect("bootstrap");
+        let bootstrap =
+            MobileClientBootstrap::new(path.to_string_lossy().into_owned()).expect("bootstrap");
         bootstrap.prepare(false).expect("prepare");
 
         assert!(matches!(
@@ -861,19 +909,18 @@ mod tests {
         drop(client);
         drop(bootstrap);
 
-        let recovery = MobileClientBootstrap::new(
-            path.to_string_lossy().into_owned(),
-            "Personal space".to_owned(),
-        )
-        .expect("recovery bootstrap");
+        let recovery = MobileClientBootstrap::new(path.to_string_lossy().into_owned())
+            .expect("recovery bootstrap");
         recovery
             .reset_local_installation(RESET_LOCAL_INSTALLATION_CONFIRMATION.to_owned())
             .expect("reset");
         assert!(!path.exists());
-        assert!(matches!(
-            recovery.prepare(true),
-            Err(MobileClientError::RecoveryRequired)
-        ));
+        assert_eq!(
+            recovery
+                .prepare(true)
+                .expect("existing identity may bind fresh storage"),
+            MobileIdentityAction::OpenExisting
+        );
         assert_eq!(
             recovery.prepare(false).expect("fresh preparation"),
             MobileIdentityAction::CreateOrResume
@@ -891,11 +938,8 @@ mod tests {
         fs::write(target.join("keep"), b"untouched").expect("marker");
         let linked_path = directory.path().join("client");
         symlink(&target, &linked_path).expect("symlink");
-        let recovery = MobileClientBootstrap::new(
-            linked_path.to_string_lossy().into_owned(),
-            "Personal space".to_owned(),
-        )
-        .expect("recovery bootstrap");
+        let recovery = MobileClientBootstrap::new(linked_path.to_string_lossy().into_owned())
+            .expect("recovery bootstrap");
 
         assert!(matches!(
             recovery.reset_local_installation(RESET_LOCAL_INSTALLATION_CONFIRMATION.to_owned()),

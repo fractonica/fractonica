@@ -48,5 +48,3 @@ CREATE TABLE operation_resources (
 
 CREATE INDEX operation_resources_content_idx
     ON operation_resources (content_id, operation_id);
-
-PRAGMA user_version = 3;

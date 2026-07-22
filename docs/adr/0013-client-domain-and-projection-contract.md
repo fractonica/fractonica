@@ -137,7 +137,7 @@ provenance, never reused as Fractonica operation identities or authority.
   account semantics.
 - References remain descriptive graph data and cannot bypass capabilities.
 - Public analytics are indexable; private analytics require local decryption.
-- Adding the schemas requires a SQLite schema migration because the current
-  `operations.schema_id` constraint is closed.
+- The checked-in SQLite schema includes the complete closed
+  `operations.schema_id` constraint.
 - Global handle uniqueness, public discovery, following, realtime publication,
   and encrypted LAN replication remain later protocols.

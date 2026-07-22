@@ -65,5 +65,3 @@ CREATE INDEX pairing_sessions_expiry_idx
 
 CREATE INDEX pairing_sessions_peer_idx
     ON pairing_sessions (space_id, joiner_node_id, subject_actor_id);
-
-PRAGMA user_version = 5;

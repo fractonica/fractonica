@@ -40,7 +40,7 @@ use fractonica_pairing::{
     InvitationId, JoinerClaim, PairingAcceptance, PairingInvitation, PairingReceipt,
 };
 use fractonica_peer::{PeerReadChangesFields, PeerReadChangesProof, PeerSessionId};
-use fractonica_space_bootstrap::build_trusted_space_bootstrap;
+use fractonica_space_bootstrap::build_trusted_space_bootstrap_for_space;
 use fractonica_sync::{
     NodeHttpTransport, PeerProofCustody, SyncConfig, SyncError, SyncStatus, SyncTransport,
     SyncWorker, TransportError,
@@ -88,6 +88,12 @@ struct PendingPairing {
     acceptance: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct SupervisorControl {
+    endpoint: Url,
+    bearer_token: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct SupervisedNodeConfig {
     pub client_data_dir: PathBuf,
@@ -100,7 +106,6 @@ pub struct SupervisedNodeConfig {
 #[derive(Clone, Debug)]
 pub struct StandaloneClientConfig {
     pub client_data_dir: PathBuf,
-    pub display_name: String,
 }
 
 /// State of the protected identity independently from the client database.
@@ -176,7 +181,7 @@ impl StandaloneIdentityStore for FileKeyStore {
 pub struct ClientRuntimeStatus {
     pub node_id: NodeId,
     pub actor_id: ActorId,
-    pub space_id: SpaceId,
+    pub space_id: Option<SpaceId>,
     pub sync: SyncStatus,
 }
 
@@ -225,11 +230,11 @@ type NativeAuthor = OperationAuthor<EstablishedIdentityCustody, SystemAuthoringR
 pub struct ClientRuntime {
     store: ClientSqliteStore,
     content: ClientContentStore,
-    author: Mutex<Arc<NativeAuthor>>,
+    author: Mutex<Option<Arc<NativeAuthor>>>,
     custody: EstablishedIdentityCustody,
     node_id: NodeId,
     actor_id: ActorId,
-    local_space_id: SpaceId,
+    supervisor: Option<SupervisorControl>,
     pending_pairings: Mutex<BTreeMap<String, PendingPairing>>,
     sync: RuntimeSync,
 }
@@ -256,11 +261,9 @@ impl ClientRuntime {
 
     /// Establishes or reopens a self-owned client without contacting a node.
     ///
-    /// The database enters its durable initializing phase before protected key
-    /// creation. Both signed trust anchors and their public installation
-    /// binding are then committed in one SQLite transaction. Record creation
-    /// becomes available only after every stored identifier has been checked
-    /// against the protected identity.
+    /// Installation identity is bound independently of workspace roots. A
+    /// fresh client opens with no active workspace; the user must explicitly
+    /// create or link one before authoring records.
     pub async fn bootstrap_standalone<S>(
         config: StandaloneClientConfig,
         identities: Arc<S>,
@@ -291,32 +294,12 @@ impl ClientRuntime {
             .map_err(http_error)?;
         let node: BootstrapNodeResponse =
             get_json(&client, &endpoint, "api/node", &config.bearer_token).await?;
-        let (node_id, space) = validate_node_contract(&node, &identity)?;
-        let genesis: StoredOperation = get_json(
-            &client,
-            &endpoint,
-            &format!(
-                "api/spaces/{}/operations/{}",
-                space.space_id, space.genesis_operation_id
-            ),
-            &config.bearer_token,
-        )
-        .await?;
-        let initial_grant: StoredOperation = get_json(
-            &client,
-            &endpoint,
-            &format!(
-                "api/spaces/{}/operations/{}",
-                space.space_id, space.initial_grant_operation_id
-            ),
-            &config.bearer_token,
-        )
-        .await?;
-        validate_bootstrap_anchors(&identity, &space, &genesis, &initial_grant)?;
-
+        let (node_id, spaces) = validate_node_contract(&node, &identity)?;
+        let supervisor = SupervisorControl {
+            endpoint: endpoint.clone(),
+            bearer_token: config.bearer_token.clone(),
+        };
         let store = ClientSqliteStore::open(config.client_data_dir.join(CLIENT_DATABASE_FILE))?;
-        store.commit_remote(&genesis.operation, genesis.received_at_unix_ms)?;
-        store.commit_remote(&initial_grant.operation, initial_grant.received_at_unix_ms)?;
         let now = unix_time_millis()?;
         store.upsert_peer(&PeerConfig {
             peer_id: node_id,
@@ -327,40 +310,81 @@ impl ClientRuntime {
             peer_transport_credential: None,
             added_at_unix_ms: now,
         })?;
-        store.configure_peer_space(&PeerSpaceConfig {
-            peer_id: node_id,
-            space_id: space.space_id,
-            read_mode: PeerReadMode::SupervisorBearer,
-            start_after: 0,
-            next_pull_at_unix_ms: now,
-        })?;
+        for space in &spaces {
+            let genesis: StoredOperation = get_json(
+                &client,
+                &endpoint,
+                &format!(
+                    "api/spaces/{}/operations/{}",
+                    space.space_id, space.genesis_operation_id
+                ),
+                &config.bearer_token,
+            )
+            .await?;
+            let initial_grant: StoredOperation = get_json(
+                &client,
+                &endpoint,
+                &format!(
+                    "api/spaces/{}/operations/{}",
+                    space.space_id, space.initial_grant_operation_id
+                ),
+                &config.bearer_token,
+            )
+            .await?;
+            validate_bootstrap_anchors(&identity, space, &genesis, &initial_grant)?;
+            let stored = store.store_workspace(&TrustedSpaceBootstrapRequest {
+                display_name: space.display_name.clone(),
+                genesis: genesis.operation,
+                initial_grant: initial_grant.operation,
+                received_at_unix_ms: space.created_at_unix_ms,
+            })?;
+            if &stored != space {
+                return Err(contract(
+                    "stored workspace does not match the node descriptor",
+                ));
+            }
+            store.configure_peer_space(&PeerSpaceConfig {
+                peer_id: node_id,
+                space_id: space.space_id,
+                read_mode: PeerReadMode::SupervisorBearer,
+                start_after: 0,
+                next_pull_at_unix_ms: now,
+            })?;
+        }
         let active = match store.active_workspace()? {
-            Some(active) => active,
-            None => {
-                let active = ActiveWorkspace {
-                    space_id: space.space_id,
-                    authorization_operation_id: space.initial_grant_operation_id,
-                    peer_id: Some(node_id),
-                    activated_at_unix_ms: now,
-                };
-                store.set_active_workspace(active)?;
-                active
+            Some(active)
+                if spaces.iter().any(|space| space.space_id == active.space_id)
+                    && store
+                        .operation(active.authorization_operation_id)?
+                        .is_some() =>
+            {
+                Some(active)
+            }
+            _ => {
+                store.clear_active_workspace()?;
+                match spaces.first() {
+                    Some(space) => {
+                        let active = ActiveWorkspace {
+                            space_id: space.space_id,
+                            authorization_operation_id: space.initial_grant_operation_id,
+                            peer_id: Some(node_id),
+                            activated_at_unix_ms: now,
+                        };
+                        store.set_active_workspace(active)?;
+                        Some(active)
+                    }
+                    None => None,
+                }
             }
         };
         // A restarted desktop must immediately retry durable work for the
         // workspace it was using before shutdown. This is especially
         // important after a peer credential was replaced while deliveries
         // were offline or rejected.
-        if let Some(peer_id) = active.peer_id {
-            store.requeue_unacknowledged_peer_space(peer_id, active.space_id, now)?;
-        }
-        if store
-            .operation(active.authorization_operation_id)?
-            .is_none()
-        {
-            return Err(ClientRuntimeError::MissingInstallationAnchor(
-                active.authorization_operation_id,
-            ));
+        if let Some(active) = active {
+            if let Some(peer_id) = active.peer_id {
+                store.requeue_unacknowledged_peer_space(peer_id, active.space_id, now)?;
+            }
         }
 
         let content =
@@ -368,11 +392,18 @@ impl ClientRuntime {
         let custody = EstablishedIdentityCustody {
             identity: Arc::clone(&identity),
         };
-        let author = Arc::new(OperationAuthor::new(
-            AuthoringContext::new(active.space_id, vec![active.authorization_operation_id])?,
-            custody.clone(),
-            SystemAuthoringRuntime,
-        ));
+        let author = active
+            .map(|active| {
+                Ok::<_, ClientRuntimeError>(Arc::new(OperationAuthor::new(
+                    AuthoringContext::new(
+                        active.space_id,
+                        vec![active.authorization_operation_id],
+                    )?,
+                    custody.clone(),
+                    SystemAuthoringRuntime,
+                )))
+            })
+            .transpose()?;
         let mut tokens = BTreeMap::new();
         tokens.insert(node_id, config.bearer_token);
         let transport = NodeHttpTransport::new(custody.clone(), tokens)?;
@@ -388,7 +419,7 @@ impl ClientRuntime {
             custody,
             node_id,
             actor_id: identity.local_writer_actor_id(),
-            local_space_id: space.space_id,
+            supervisor: Some(supervisor),
             pending_pairings: Mutex::new(BTreeMap::new()),
             sync: RuntimeSync::Worker {
                 status: sync_status,
@@ -403,8 +434,8 @@ impl ClientRuntime {
         let space_id = self
             .author
             .lock()
-            .map(|author| author.context().space_id)
-            .unwrap_or(self.local_space_id);
+            .ok()
+            .and_then(|author| author.as_ref().map(|author| author.context().space_id));
         ClientRuntimeStatus {
             node_id: self.node_id,
             actor_id: self.actor_id,
@@ -414,6 +445,219 @@ impl ClientRuntime {
                 RuntimeSync::Worker { status, .. } => status.borrow().clone(),
             },
         }
+    }
+
+    pub fn workspaces(&self) -> Result<Vec<SpaceDescriptor>, ClientRuntimeError> {
+        Ok(self.store.workspaces()?)
+    }
+
+    pub async fn create_workspace(
+        &self,
+        display_name: String,
+    ) -> Result<SpaceDescriptor, ClientRuntimeError> {
+        let Some(supervisor) = self.supervisor.clone() else {
+            let now = unix_time_millis()?;
+            for _ in 0..16 {
+                let mut bytes = [0_u8; 32];
+                getrandom::fill(&mut bytes)
+                    .map_err(|_| ClientRuntimeError::RandomSourceUnavailable)?;
+                if bytes == [0; 32] {
+                    continue;
+                }
+                let space_id = SpaceId::from_bytes(bytes);
+                if self.store.workspace(space_id)?.is_some() {
+                    continue;
+                }
+                let bootstrap = build_trusted_space_bootstrap_for_space(
+                    &self.custody.identity,
+                    space_id,
+                    display_name.clone(),
+                    now,
+                )
+                .map_err(|error| contract(error.to_string()))?;
+                let workspace = self.store.store_workspace(&bootstrap)?;
+                self.store.set_active_workspace(ActiveWorkspace {
+                    space_id,
+                    authorization_operation_id: workspace.initial_grant_operation_id,
+                    peer_id: None,
+                    activated_at_unix_ms: now,
+                })?;
+                let author = Arc::new(OperationAuthor::new(
+                    AuthoringContext::new(space_id, vec![workspace.initial_grant_operation_id])?,
+                    self.custody.clone(),
+                    SystemAuthoringRuntime,
+                ));
+                *self
+                    .author
+                    .lock()
+                    .map_err(|_| ClientRuntimeError::LifecycleLock)? = Some(author);
+                return Ok(workspace);
+            }
+            return Err(ClientRuntimeError::RandomSourceUnavailable);
+        };
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(http_error)?;
+        let url = supervisor
+            .endpoint
+            .join("api/workspaces")
+            .map_err(|error| contract(format!("invalid workspace route: {error}")))?;
+        let response = client
+            .post(url)
+            .bearer_auth(&supervisor.bearer_token)
+            .json(&serde_json::json!({ "displayName": display_name }))
+            .send()
+            .await
+            .map_err(http_error)?;
+        if !response.status().is_success() {
+            return Err(ClientRuntimeError::Http(format!(
+                "workspace creation returned HTTP {}",
+                response.status()
+            )));
+        }
+        let created: WorkspaceCreatedWire = response.json().await.map_err(http_error)?;
+        let bootstrap = TrustedSpaceBootstrapRequest {
+            display_name: created.space.display_name.clone(),
+            received_at_unix_ms: created.genesis.occurred_at_unix_ms,
+            genesis: created.genesis.clone(),
+            initial_grant: created.initial_grant.clone(),
+        };
+        validate_trusted_space_bootstrap(&bootstrap)
+            .map_err(|error| contract(error.to_string()))?;
+        if created.space.space_id != created.genesis.space_id
+            || created.space.genesis_operation_id != created.genesis.operation_id
+            || created.space.initial_grant_operation_id != created.initial_grant.operation_id
+            || created.space.controller_actor_id
+                != self.custody.identity.space_controller_actor_id()
+            || created.space.local_writer_actor_id != self.actor_id
+        {
+            return Err(contract(
+                "created workspace anchors do not match its descriptor",
+            ));
+        }
+        let stored = self.store.store_workspace(&bootstrap)?;
+        if stored != created.space {
+            return Err(contract("stored workspace does not match its descriptor"));
+        }
+        let now = unix_time_millis()?;
+        self.store.configure_peer_space(&PeerSpaceConfig {
+            peer_id: self.node_id,
+            space_id: created.space.space_id,
+            read_mode: PeerReadMode::SupervisorBearer,
+            start_after: 0,
+            next_pull_at_unix_ms: now,
+        })?;
+        self.store.set_active_workspace(ActiveWorkspace {
+            space_id: created.space.space_id,
+            authorization_operation_id: created.space.initial_grant_operation_id,
+            peer_id: Some(self.node_id),
+            activated_at_unix_ms: now,
+        })?;
+        let author = Arc::new(OperationAuthor::new(
+            AuthoringContext::new(
+                created.space.space_id,
+                vec![created.space.initial_grant_operation_id],
+            )?,
+            self.custody.clone(),
+            SystemAuthoringRuntime,
+        ));
+        *self
+            .author
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)? = Some(author);
+        Ok(created.space)
+    }
+
+    pub async fn delete_workspace(&self, space_id: SpaceId) -> Result<(), ClientRuntimeError> {
+        if let Some(supervisor) = self.supervisor.clone() {
+            let client = Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(http_error)?;
+            let url = supervisor
+                .endpoint
+                .join(&format!("api/workspaces/{space_id}"))
+                .map_err(|error| contract(format!("invalid workspace route: {error}")))?;
+            let response = client
+                .delete(url)
+                .bearer_auth(&supervisor.bearer_token)
+                .send()
+                .await
+                .map_err(http_error)?;
+            if !response.status().is_success() {
+                return Err(ClientRuntimeError::Http(format!(
+                    "workspace deletion returned HTTP {}",
+                    response.status()
+                )));
+            }
+        }
+        self.store.delete_workspace(space_id)?;
+        let mut author = self
+            .author
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)?;
+        if author
+            .as_ref()
+            .is_some_and(|author| author.context().space_id == space_id)
+        {
+            *author = None;
+        }
+        Ok(())
+    }
+
+    pub async fn activate_workspace(&self, space_id: SpaceId) -> Result<(), ClientRuntimeError> {
+        let workspace = if let Some(supervisor) = self.supervisor.clone() {
+            let client = Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(http_error)?;
+            let node: BootstrapNodeResponse = get_json(
+                &client,
+                &supervisor.endpoint,
+                "api/node",
+                &supervisor.bearer_token,
+            )
+            .await?;
+            let (_, spaces) = validate_node_contract(&node, &self.custody.identity)?;
+            spaces
+                .into_iter()
+                .find(|workspace| workspace.space_id == space_id)
+                .ok_or_else(|| contract("selected workspace is not hosted by the local node"))?
+        } else {
+            self.store
+                .workspace(space_id)?
+                .ok_or_else(|| contract("selected workspace is not stored locally"))?
+        };
+        if self
+            .store
+            .operation(workspace.initial_grant_operation_id)?
+            .is_none()
+        {
+            return Err(ClientRuntimeError::MissingInstallationAnchor(
+                workspace.initial_grant_operation_id,
+            ));
+        }
+        let now = unix_time_millis()?;
+        self.store.set_active_workspace(ActiveWorkspace {
+            space_id,
+            authorization_operation_id: workspace.initial_grant_operation_id,
+            peer_id: self.supervisor.as_ref().map(|_| self.node_id),
+            activated_at_unix_ms: now,
+        })?;
+        let author = Arc::new(OperationAuthor::new(
+            AuthoringContext::new(space_id, vec![workspace.initial_grant_operation_id])?,
+            self.custody.clone(),
+            SystemAuthoringRuntime,
+        ));
+        *self
+            .author
+            .lock()
+            .map_err(|_| ClientRuntimeError::LifecycleLock)? = Some(author);
+        Ok(())
     }
 
     #[must_use]
@@ -584,15 +828,12 @@ impl ClientRuntime {
         blocking(move || Ok(store.record(space_id, entity_id, operation_id)?)).await
     }
 
-    /// Number of current records in the installation's original standalone
-    /// space. This stays stable after pairing and is used to make the first
-    /// workspace transition an explicit user decision.
+    /// Number of records in the workspace currently shown to the user. A
+    /// later link must never report zero merely because this installation had
+    /// already joined a different workspace.
     pub async fn pre_pair_record_count(&self) -> Result<u64, ClientRuntimeError> {
-        if self.active_space_id()? != self.local_space_id {
-            return Ok(0);
-        }
         let store = self.store.clone();
-        let space_id = self.local_space_id;
+        let space_id = self.active_space_id()?;
         blocking(move || Ok(store.record_import_count(space_id)?)).await
     }
 
@@ -753,16 +994,16 @@ impl ClientRuntime {
                 "the paired node did not return the admitted capability grant",
             ));
         }
+        let source_space_id = self.active_space_id()?;
         let author = Arc::new(OperationAuthor::new(
             AuthoringContext::new(space_id, vec![grant_operation_id])?,
             self.custody.clone(),
             SystemAuthoringRuntime,
         ));
-        if record_policy == PrePairRecordPolicy::Merge && self.local_space_id != space_id {
+        if record_policy == PrePairRecordPolicy::Merge && source_space_id != space_id {
             let mut after_local_sequence = 0;
             loop {
                 let source_store = store.clone();
-                let source_space_id = self.local_space_id;
                 let batch = blocking(move || {
                     Ok(source_store.record_import_batch(
                         source_space_id,
@@ -829,7 +1070,7 @@ impl ClientRuntime {
         *self
             .author
             .lock()
-            .map_err(|_| ClientRuntimeError::LifecycleLock)? = author;
+            .map_err(|_| ClientRuntimeError::LifecycleLock)? = Some(author);
         Ok(())
     }
 
@@ -898,8 +1139,10 @@ impl ClientRuntime {
     fn active_author(&self) -> Result<Arc<NativeAuthor>, ClientRuntimeError> {
         self.author
             .lock()
-            .map(|author| Arc::clone(&author))
-            .map_err(|_| ClientRuntimeError::LifecycleLock)
+            .map_err(|_| ClientRuntimeError::LifecycleLock)?
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(ClientRuntimeError::NoActiveWorkspace)
     }
 
     fn active_space_id(&self) -> Result<SpaceId, ClientRuntimeError> {
@@ -950,21 +1193,19 @@ fn bootstrap_standalone_blocking<S: StandaloneIdentityStore>(
     .map_err(|error| ClientRuntimeError::Identity(error.to_string()))?;
     let database_path = config.client_data_dir.join(CLIENT_DATABASE_FILE);
     let store = ClientSqliteStore::open(&database_path)?;
+    let expected_binding = ClientInstallationBinding {
+        node_id: identity.node_id(),
+        controller_actor_id: identity.space_controller_actor_id(),
+        local_writer_actor_id: identity.local_writer_actor_id(),
+    };
     let binding = match store.installation()? {
-        ClientInstallation::Unbound => {
-            return Err(ClientRuntimeError::StandaloneRecovery(
-                "standalone database preparation did not persist its initializing marker",
-            ));
-        }
-        ClientInstallation::Initializing => {
-            establish_standalone(&store, &identity, &config.display_name)?
-        }
+        ClientInstallation::Unbound => store.bind_local_identity(expected_binding)?,
         ClientInstallation::Established(binding) => {
-            validate_standalone_binding(&store, &identity, &binding)?;
+            validate_standalone_binding(&identity, &binding)?;
             *binding
         }
     };
-    validate_standalone_binding(&store, &identity, &binding)?;
+    validate_standalone_binding(&identity, &binding)?;
 
     let content = ClientContentStore::open(config.client_data_dir.join(CLIENT_CONTENT_DIRECTORY))?;
     let identity = Arc::new(identity);
@@ -972,39 +1213,32 @@ fn bootstrap_standalone_blocking<S: StandaloneIdentityStore>(
         identity: Arc::clone(&identity),
     };
     let now = unix_time_millis()?;
-    let active = match store.active_workspace()? {
-        Some(active) => active,
-        None => {
-            let active = ActiveWorkspace {
-                space_id: binding.space_id,
-                authorization_operation_id: binding.initial_grant_operation_id,
-                peer_id: None,
-                activated_at_unix_ms: now,
-            };
-            store.set_active_workspace(active)?;
-            active
-        }
-    };
+    let active = store.active_workspace()?;
     // Startup is an anti-entropy opportunity even before the inventory wire
     // protocol is available. Reopen work that may have been terminally
     // rejected by a stale/revoked transport credential so an already-paired
     // installation repairs itself without requiring another pairing ceremony.
-    if let Some(peer_id) = active.peer_id {
-        store.requeue_unacknowledged_peer_space(peer_id, active.space_id, now)?;
+    if let Some(active) = active {
+        if store.workspace(active.space_id)?.is_none()
+            || store
+                .operation(active.authorization_operation_id)?
+                .is_none()
+        {
+            store.clear_active_workspace()?;
+        } else if let Some(peer_id) = active.peer_id {
+            store.requeue_unacknowledged_peer_space(peer_id, active.space_id, now)?;
+        }
     }
-    if store
-        .operation(active.authorization_operation_id)?
-        .is_none()
-    {
-        return Err(ClientRuntimeError::MissingInstallationAnchor(
-            active.authorization_operation_id,
-        ));
-    }
-    let author = Arc::new(OperationAuthor::new(
-        AuthoringContext::new(active.space_id, vec![active.authorization_operation_id])?,
-        custody.clone(),
-        SystemAuthoringRuntime,
-    ));
+    let active = store.active_workspace()?;
+    let author = active
+        .map(|active| {
+            Ok::<_, ClientRuntimeError>(Arc::new(OperationAuthor::new(
+                AuthoringContext::new(active.space_id, vec![active.authorization_operation_id])?,
+                custody.clone(),
+                SystemAuthoringRuntime,
+            )))
+        })
+        .transpose()?;
     let sync = SyncStatus {
         counts: Some(store.sync_counts(now)?),
         ..SyncStatus::default()
@@ -1017,7 +1251,7 @@ fn bootstrap_standalone_blocking<S: StandaloneIdentityStore>(
             custody: custody.clone(),
             node_id: binding.node_id,
             actor_id: binding.local_writer_actor_id,
-            local_space_id: binding.space_id,
+            supervisor: None,
             pending_pairings: Mutex::new(BTreeMap::new()),
             sync: RuntimeSync::Static(Box::new(sync)),
         },
@@ -1030,55 +1264,22 @@ fn prepare_standalone_blocking(
     identity_present: bool,
 ) -> Result<StandaloneIdentityAction, ClientRuntimeError> {
     prepare_private_directory(&config.client_data_dir)?;
-    let database_path = config.client_data_dir.join(CLIENT_DATABASE_FILE);
-    let database_preexisting = inspect_client_database(&database_path)?;
-    if !database_preexisting && identity_present {
-        return Err(ClientRuntimeError::StandaloneRecovery(
-            "protected identity exists without its client database",
-        ));
-    }
-    let store = ClientSqliteStore::open(database_path)?;
-    match store.installation()? {
-        ClientInstallation::Unbound if identity_present => {
-            Err(ClientRuntimeError::StandaloneRecovery(
-                "an unbound client database cannot adopt an existing identity",
-            ))
-        }
-        ClientInstallation::Unbound => {
-            store.begin_local_installation()?;
-            Ok(StandaloneIdentityAction::CreateOrResume)
-        }
-        ClientInstallation::Initializing if identity_present => {
-            Ok(StandaloneIdentityAction::OpenExisting)
-        }
-        ClientInstallation::Initializing => Ok(StandaloneIdentityAction::CreateOrResume),
-        ClientInstallation::Established(_) if identity_present => {
-            Ok(StandaloneIdentityAction::OpenExisting)
-        }
-        ClientInstallation::Established(_) => Err(ClientRuntimeError::StandaloneRecovery(
-            "established client database has no established protected identity",
+    let store = ClientSqliteStore::open(config.client_data_dir.join(CLIENT_DATABASE_FILE))?;
+    match (store.installation()?, identity_present) {
+        (ClientInstallation::Unbound, false) => Ok(StandaloneIdentityAction::CreateOrResume),
+        (ClientInstallation::Unbound, true) => Ok(StandaloneIdentityAction::OpenExisting),
+        (ClientInstallation::Established(_), true) => Ok(StandaloneIdentityAction::OpenExisting),
+        (ClientInstallation::Established(_), false) => Err(ClientRuntimeError::StandaloneRecovery(
+            "client installation identity exists without protected keys",
         )),
     }
 }
 
-fn establish_standalone(
-    store: &ClientSqliteStore,
-    identity: &IdentityBundle,
-    display_name: &str,
-) -> Result<ClientInstallationBinding, ClientRuntimeError> {
-    let bootstrap = build_trusted_space_bootstrap(identity, display_name, unix_time_millis()?)?;
-    Ok(store
-        .establish_local_space(identity.node_id(), &bootstrap)?
-        .binding)
-}
-
 fn validate_standalone_binding(
-    store: &ClientSqliteStore,
     identity: &IdentityBundle,
     binding: &ClientInstallationBinding,
 ) -> Result<(), ClientRuntimeError> {
     if binding.node_id != identity.node_id()
-        || binding.space_id != identity.space_id()
         || binding.controller_actor_id != identity.space_controller_actor_id()
         || binding.local_writer_actor_id != identity.local_writer_actor_id()
     {
@@ -1086,64 +1287,7 @@ fn validate_standalone_binding(
             "protected identity does not match the established client binding",
         ));
     }
-    let genesis = store.operation(binding.genesis_operation_id)?.ok_or(
-        ClientRuntimeError::MissingInstallationAnchor(binding.genesis_operation_id),
-    )?;
-    let initial_grant = store.operation(binding.initial_grant_operation_id)?.ok_or(
-        ClientRuntimeError::MissingInstallationAnchor(binding.initial_grant_operation_id),
-    )?;
-    let bootstrap = TrustedSpaceBootstrapRequest {
-        display_name: binding.display_name.clone(),
-        genesis,
-        initial_grant,
-        received_at_unix_ms: binding.created_at_unix_ms,
-    };
-    validate_trusted_space_bootstrap(&bootstrap)
-        .map_err(|error| ClientRuntimeError::InvalidInstallationAnchor(error.to_string()))?;
-    let expected = installation_binding_from_request(identity.node_id(), &bootstrap)?;
-    if &expected != binding {
-        return Err(ClientRuntimeError::StandaloneRecovery(
-            "stored trust anchors do not match the established client binding",
-        ));
-    }
     Ok(())
-}
-
-fn installation_binding_from_request(
-    node_id: NodeId,
-    request: &TrustedSpaceBootstrapRequest,
-) -> Result<ClientInstallationBinding, ClientRuntimeError> {
-    let OperationBody::SpaceGenesis { controller } = &request.genesis.body else {
-        return Err(ClientRuntimeError::InvalidInstallationAnchor(
-            "genesis body has the wrong kind".into(),
-        ));
-    };
-    let OperationBody::CapabilityGrant { grant } = &request.initial_grant.body else {
-        return Err(ClientRuntimeError::InvalidInstallationAnchor(
-            "initial grant body has the wrong kind".into(),
-        ));
-    };
-    Ok(ClientInstallationBinding {
-        node_id,
-        space_id: request.genesis.space_id,
-        controller_actor_id: *controller,
-        local_writer_actor_id: grant.subject,
-        genesis_operation_id: request.genesis.operation_id,
-        initial_grant_operation_id: request.initial_grant.operation_id,
-        display_name: request.display_name.clone(),
-        created_at_unix_ms: request.received_at_unix_ms,
-    })
-}
-
-fn inspect_client_database(path: &Path) -> Result<bool, ClientRuntimeError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
-        Ok(_) => Err(ClientRuntimeError::StandaloneRecovery(
-            "client database path is not a regular file",
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(ClientRuntimeError::Io(error)),
-    }
 }
 
 fn observed_entity(
@@ -1181,10 +1325,18 @@ struct BootstrapNodeResponse {
     profile: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceCreatedWire {
+    space: SpaceDescriptor,
+    genesis: OperationEnvelope,
+    initial_grant: OperationEnvelope,
+}
+
 fn validate_node_contract(
     node: &BootstrapNodeResponse,
     identity: &IdentityBundle,
-) -> Result<(NodeId, SpaceDescriptor), ClientRuntimeError> {
+) -> Result<(NodeId, Vec<SpaceDescriptor>), ClientRuntimeError> {
     if node.profile != "node" {
         return Err(contract(
             "supervised client runtime requires a node profile",
@@ -1198,27 +1350,17 @@ fn validate_node_contract(
             "node identity does not match protected installation keys",
         ));
     }
-    let matches = node
-        .spaces
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter(|space| space.space_id == identity.space_id())
-        .cloned()
-        .collect::<Vec<_>>();
-    let [space] = matches.as_slice() else {
-        return Err(contract(
-            "node must expose exactly one descriptor for its protected default space",
-        ));
-    };
-    if space.local_writer_actor_id != identity.local_writer_actor_id()
-        || space.controller_actor_id != identity.space_controller_actor_id()
-    {
-        return Err(contract(
-            "space descriptor does not match protected writer/controller keys",
-        ));
+    let spaces = node.spaces.clone().unwrap_or_default();
+    for space in &spaces {
+        if space.local_writer_actor_id != identity.local_writer_actor_id()
+            || space.controller_actor_id != identity.space_controller_actor_id()
+        {
+            return Err(contract(
+                "locally hosted workspace does not match protected writer/controller keys",
+            ));
+        }
     }
-    Ok((node_id, space.clone()))
+    Ok((node_id, spaces))
 }
 
 fn validate_bootstrap_anchors(
@@ -1748,8 +1890,6 @@ pub enum ClientRuntimeError {
     Bootstrap(#[from] fractonica_space_bootstrap::BootstrapBuildError),
     #[error("standalone installation anchor {0} is missing")]
     MissingInstallationAnchor(OperationId),
-    #[error("standalone installation anchor is invalid: {0}")]
-    InvalidInstallationAnchor(String),
     #[error("supervised node request failed: {0}")]
     Http(String),
     #[error("supervised node contract is invalid: {0}")]
@@ -1779,6 +1919,8 @@ pub enum ClientRuntimeError {
     Join(String),
     #[error("client lifecycle lock was poisoned")]
     LifecycleLock,
+    #[error("no workspace is selected")]
+    NoActiveWorkspace,
     #[error("paired workspace bootstrap failed: {0}")]
     PairingBootstrap(&'static str),
     #[error("local record {0} already exists in the paired workspace")]

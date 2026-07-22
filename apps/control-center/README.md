@@ -29,14 +29,15 @@ controller-signed `capability.revoke` operation; revoked rows remain visible
 as an audit trail.
 
 It validates the reported profile from both endpoints before rendering. The
-`node` profile reports ready SQLite storage and its schema version; the
-stateless `saros` profile reports that no local storage is configured.
+`node` profile reports ready SQLite storage; the stateless `saros` profile
+reports that no local storage is configured.
 
 The node base URL comes from `VITE_FRACTONICA_NODE_URL` and defaults to
 `http://127.0.0.1:8789`.
 
-Inside Tauri, Records is the default workspace. It lists public or opaque
-private records from client SQLite, creates and edits public records, preserves
+Inside Tauri, Workspaces is the explicit root. A new installation starts empty
+and lets the user create, open, or delete isolated vaults. Records lists public
+or opaque private records from the selected workspace in client SQLite, creates and edits public records, preserves
 existing resources and entity references during edits, imports or removes
 record attachments, performs two-step local deletion, and displays compact
 operation/resource synchronization status. File selection, hashing, and

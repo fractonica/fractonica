@@ -525,6 +525,34 @@ async fn accept_operation() -> AxumStatus {
     AxumStatus::CREATED
 }
 
+async fn reject_genesis_replay() -> AxumStatus {
+    AxumStatus::CONFLICT
+}
+
+#[tokio::test]
+async fn http_transport_acknowledges_a_conflicting_genesis_replay() {
+    let app = Router::new().route(
+        "/api/spaces/{space}/operations",
+        post(reject_genesis_replay),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let signing_key = key(52);
+    let genesis = genesis(&signing_key);
+    let transport = NodeHttpTransport::new(
+        SoftwarePeerProofCustody::new(key(53), signing_key),
+        BTreeMap::new(),
+    )
+    .unwrap();
+
+    transport
+        .push(&peer(format!("http://{address}"), 54), &genesis)
+        .await
+        .unwrap();
+    server.abort();
+}
+
 async fn create_content_upload_handler() -> Response {
     let mut response = AxumStatus::CREATED.into_response();
     response.headers_mut().insert(

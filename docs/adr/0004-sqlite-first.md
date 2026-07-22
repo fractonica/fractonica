@@ -6,14 +6,14 @@
 ## Context
 
 The first Fractonica nodes run locally on desktop or as a single headless Linux
-process. They need transactional durability, simple deployment, migration, and
+process. They need transactional durability, simple deployment, resettable storage, and
 backup without an external database service.
 
 ## Decision
 
 SQLite is the default durable store. The node is its sole writer and applies
-checked-in, ordered schema migrations inside controlled transactions. Database
-configuration, migration state, backup, restore, and integrity verification are
+one checked-in fresh-store schema inside a controlled transaction. Database
+configuration, backup, restore, and integrity verification are
 operational features, not application-specific shortcuts.
 
 The implementation uses SQLite-safe backup or snapshot mechanisms. P2P
@@ -24,11 +24,11 @@ Storage boundaries may be introduced where they improve testing or isolate
 domain code, but Fractonica will not build a speculative lowest-common-
 denominator abstraction for PostgreSQL. A managed service can add another
 storage implementation after a separate ADR defines its concurrency,
-consistency, migration, and operational requirements.
+consistency and operational requirements.
 
 ## Consequences
 
 - A local or headless node remains a single-service deployment.
-- Transactions, migrations, and backups can be tested deterministically.
+- Transactions, fresh-store creation, and backups can be tested deterministically.
 - Horizontal multi-writer database scaling is not an initial capability.
 - Long-running work must not hold write transactions unnecessarily.

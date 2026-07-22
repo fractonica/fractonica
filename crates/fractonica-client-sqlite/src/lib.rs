@@ -10,7 +10,9 @@ use std::{
     time::Duration,
 };
 
-use fractonica_application::{TrustedSpaceBootstrapRequest, validate_trusted_space_bootstrap};
+use fractonica_application::{
+    SpaceDescriptor, TrustedSpaceBootstrapRequest, validate_trusted_space_bootstrap,
+};
 use fractonica_content::{ContentDescriptor, ContentId, ResourceRef};
 use fractonica_data_model::{
     ActorId, EntityId, EntitySchema, MAX_CAUSAL_PARENTS, NodeId, OperationBody, OperationEnvelope,
@@ -23,7 +25,6 @@ use rusqlite::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CLIENT_SCHEMA_VERSION: u32 = 5;
 pub const MAX_OUTBOX_BATCH: usize = 100;
 pub const MAX_ERROR_BYTES: usize = 2_048;
 pub const MAX_ENDPOINT_BYTES: usize = 2_048;
@@ -31,12 +32,12 @@ pub const MAX_RESOURCE_TRANSFER_BATCH: usize = 100;
 /// Maximum Unicode scalars stored for a record feed preview.
 pub const MAX_RECORD_PREVIEW_TEXT_CHARS: usize = 192;
 
-const MIGRATIONS: &[&str] = &[
-    include_str!("../migrations/0001_client_store.sql"),
-    include_str!("../migrations/0002_local_installation.sql"),
-    include_str!("../migrations/0003_record_previews.sql"),
-    include_str!("../migrations/0004_peer_delivery_policy.sql"),
-    include_str!("../migrations/0005_peer_transport_credentials.sql"),
+const FRESH_SCHEMA: &[&str] = &[
+    include_str!("../schema/client_store.sql"),
+    include_str!("../schema/local_installation.sql"),
+    include_str!("../schema/record_previews.sql"),
+    include_str!("../schema/peer_delivery_policy.sql"),
+    include_str!("../schema/peer_transport_credentials.sql"),
 ];
 
 #[derive(Clone)]
@@ -60,35 +61,21 @@ pub struct CommitResult {
     pub queued_peers: u64,
 }
 
-/// Durable public binding between a standalone client's protected identity
-/// and the exact authorization anchors in its local operation log.
+/// Durable public binding between a standalone client and its protected
+/// installation identity. Workspaces are stored independently.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientInstallationBinding {
     pub node_id: NodeId,
-    pub space_id: SpaceId,
     pub controller_actor_id: ActorId,
     pub local_writer_actor_id: ActorId,
-    pub genesis_operation_id: OperationId,
-    pub initial_grant_operation_id: OperationId,
-    pub display_name: String,
-    pub created_at_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientInstallation {
-    /// No standalone lifecycle has claimed this otherwise-empty client store.
+    /// The store has not yet been bound to protected identity.
     Unbound,
-    /// The database marker is durable; protected identity creation may safely
-    /// be started or resumed.
-    Initializing,
-    /// Identity and exact signed space anchors were committed as one unit.
+    /// Installation identity is established independently of all workspaces.
     Established(Box<ClientInstallationBinding>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EstablishLocalSpaceResult {
-    pub binding: ClientInstallationBinding,
-    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -315,10 +302,6 @@ pub enum ClientStoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("signed operation is invalid: {0}")]
     InvalidOperation(String),
-    #[error("client database uses schema {found}, but this binary supports {supported}")]
-    UnsupportedSchema { found: u32, supported: u32 },
-    #[error("client database migration {expected} completed with schema {found}")]
-    MigrationVersionMismatch { expected: u32, found: u32 },
     #[error("client database lock was poisoned")]
     LockPoisoned,
     #[error("stored client data is corrupt: {0}")]
@@ -369,11 +352,7 @@ pub enum ClientStoreError {
     InvalidPullCursor,
     #[error("trusted local-space bootstrap is invalid: {0}")]
     InvalidBootstrap(String),
-    #[error("standalone initialization requires an otherwise-empty client operation log")]
-    UntrackedInstallationOperations,
-    #[error("standalone installation is not in its initializing phase")]
-    InstallationNotInitializing,
-    #[error("standalone installation binding or anchor replay differs from established state")]
+    #[error("installation identity or workspace anchors conflict with stored state")]
     InstallationConflict,
 }
 
@@ -439,6 +418,76 @@ impl ClientSqliteStore {
         Ok(())
     }
 
+    pub fn clear_active_workspace(&self) -> Result<(), ClientStoreError> {
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM client_active_workspace WHERE singleton = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_workspace(&self, space_id: SpaceId) -> Result<(), ClientStoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let space = space_id.to_string();
+        transaction.execute(
+            "DELETE FROM client_active_workspace WHERE space_id=?1",
+            params![space],
+        )?;
+        transaction.execute(
+            "DELETE FROM client_peer_spaces WHERE space_id=?1",
+            params![space],
+        )?;
+        transaction.execute(
+            "DELETE FROM client_deliveries
+             WHERE operation_id IN (
+                 SELECT operation_id FROM client_operations WHERE space_id=?1
+             )",
+            params![space],
+        )?;
+        transaction.execute(
+            "DELETE FROM client_workspaces WHERE space_id=?1",
+            params![space],
+        )?;
+        transaction.execute(
+            "DELETE FROM client_operation_resources
+             WHERE operation_id IN (
+                 SELECT operation_id FROM client_operations WHERE space_id=?1
+             )",
+            params![space],
+        )?;
+        for table in [
+            "client_projections",
+            "client_entity_heads",
+            "client_entity_visibility",
+        ] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE space_id=?1"),
+                params![space],
+            )?;
+        }
+        for table in [
+            "client_operation_authorizations",
+            "client_operation_parents",
+        ] {
+            transaction.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE operation_id IN (
+                         SELECT operation_id FROM client_operations WHERE space_id=?1
+                     )"
+                ),
+                params![space],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM client_operations WHERE space_id=?1",
+            params![space],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ClientStoreError> {
         let requested_path = path.as_ref().to_path_buf();
         let open_path = nofollow_database_path(&requested_path)?;
@@ -450,7 +499,7 @@ impl ClientSqliteStore {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         configure(&connection, true)?;
-        migrate(&mut connection)?;
+        install_fresh_schema(&mut connection)?;
         secure_sqlite_files(&open_path)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -461,7 +510,7 @@ impl ClientSqliteStore {
     pub fn open_in_memory() -> Result<Self, ClientStoreError> {
         let mut connection = Connection::open_in_memory()?;
         configure(&connection, false)?;
-        migrate(&mut connection)?;
+        install_fresh_schema(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             path: Arc::new(PathBuf::from(":memory:")),
@@ -479,116 +528,108 @@ impl ClientSqliteStore {
         load_installation(&connection)
     }
 
-    /// Durably announces standalone initialization before protected identity
-    /// creation is allowed to begin.
-    ///
-    /// Replaying this method while already initializing is harmless. An
-    /// unbound database containing operations is never silently adopted.
-    pub fn begin_local_installation(&self) -> Result<ClientInstallation, ClientStoreError> {
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let installation = load_installation(&transaction)?;
-        match installation {
-            ClientInstallation::Unbound => {
-                if operation_count(&transaction)? != 0 {
-                    return Err(ClientStoreError::UntrackedInstallationOperations);
-                }
-                transaction.execute(
-                    "INSERT INTO client_local_installation (singleton, phase)
-                     VALUES (1, 'initializing')",
-                    [],
-                )?;
-                transaction.commit()?;
-                Ok(ClientInstallation::Initializing)
-            }
-            ClientInstallation::Initializing => {
-                transaction.commit()?;
-                Ok(ClientInstallation::Initializing)
-            }
-            established @ ClientInstallation::Established(_) => {
-                transaction.commit()?;
-                Ok(established)
-            }
-        }
-    }
-
-    /// Atomically commits a standalone client's two trust anchors and the
-    /// public identity binding that makes future startup fail closed.
-    ///
-    /// A crash cannot expose only one newly admitted anchor because both
-    /// anchors and the binding share this transaction. The initializing phase
-    /// is valid only while the operation log remains empty.
-    pub fn establish_local_space(
+    /// Binds this client database to protected installation identity.
+    pub fn bind_local_identity(
         &self,
-        node_id: NodeId,
-        request: &TrustedSpaceBootstrapRequest,
-    ) -> Result<EstablishLocalSpaceResult, ClientStoreError> {
-        validate_trusted_space_bootstrap(request)
-            .map_err(|error| ClientStoreError::InvalidBootstrap(error.to_string()))?;
-        let binding = installation_binding(node_id, request)?;
+        binding: ClientInstallationBinding,
+    ) -> Result<ClientInstallationBinding, ClientStoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match load_installation(&transaction)? {
             ClientInstallation::Unbound => {
-                return Err(ClientStoreError::InstallationNotInitializing);
-            }
-            ClientInstallation::Established(existing) => {
-                if existing.as_ref() != &binding
-                    || !operation_matches(&transaction, &request.genesis)?
-                    || !operation_matches(&transaction, &request.initial_grant)?
-                {
-                    return Err(ClientStoreError::InstallationConflict);
-                }
+                transaction.execute(
+                    "INSERT INTO client_local_installation (
+                        singleton, node_id, controller_actor_id, local_writer_actor_id
+                     ) VALUES (1, ?1, ?2, ?3)",
+                    params![
+                        binding.node_id.to_string(),
+                        binding.controller_actor_id.to_string(),
+                        binding.local_writer_actor_id.to_string(),
+                    ],
+                )?;
                 transaction.commit()?;
-                return Ok(EstablishLocalSpaceResult {
-                    binding: *existing,
-                    replayed: true,
-                });
+                Ok(binding)
             }
-            ClientInstallation::Initializing => {}
+            ClientInstallation::Established(existing) if existing.as_ref() == &binding => {
+                transaction.commit()?;
+                Ok(*existing)
+            }
+            ClientInstallation::Established(_) => Err(ClientStoreError::InstallationConflict),
         }
+    }
 
-        if operation_count(&transaction)? != 0 {
-            return Err(ClientStoreError::UntrackedInstallationOperations);
+    /// Atomically admits one independent workspace root.
+    pub fn store_workspace(
+        &self,
+        request: &TrustedSpaceBootstrapRequest,
+    ) -> Result<SpaceDescriptor, ClientStoreError> {
+        validate_trusted_space_bootstrap(request)
+            .map_err(|error| ClientStoreError::InvalidBootstrap(error.to_string()))?;
+        let descriptor = workspace_descriptor(request)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = load_workspace(&transaction, descriptor.space_id)? {
+            if existing != descriptor
+                || !operation_matches(&transaction, &request.genesis)?
+                || !operation_matches(&transaction, &request.initial_grant)?
+            {
+                return Err(ClientStoreError::InstallationConflict);
+            }
+            transaction.commit()?;
+            return Ok(existing);
         }
-        let genesis = commit_transaction(
+        commit_transaction(
             &transaction,
             &request.genesis,
             request.received_at_unix_ms,
             CommitSource::Remote,
         )?;
-        let grant = commit_transaction(
+        commit_transaction(
             &transaction,
             &request.initial_grant,
             request.received_at_unix_ms,
             CommitSource::Remote,
         )?;
-        let changed = transaction.execute(
-            "UPDATE client_local_installation SET
-                phase = 'established', node_id = ?1, space_id = ?2,
-                controller_actor_id = ?3, local_writer_actor_id = ?4,
-                genesis_operation_id = ?5, initial_grant_operation_id = ?6,
-                display_name = ?7, created_at_unix_ms = ?8
-             WHERE singleton = 1 AND phase = 'initializing'",
+        transaction.execute(
+            "INSERT INTO client_workspaces (
+                space_id, display_name, genesis_operation_id,
+                initial_grant_operation_id, controller_actor_id,
+                local_writer_actor_id, created_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                binding.node_id.to_string(),
-                binding.space_id.to_string(),
-                binding.controller_actor_id.to_string(),
-                binding.local_writer_actor_id.to_string(),
-                binding.genesis_operation_id.to_string(),
-                binding.initial_grant_operation_id.to_string(),
-                binding.display_name,
-                binding.created_at_unix_ms,
+                descriptor.space_id.to_string(),
+                descriptor.display_name,
+                descriptor.genesis_operation_id.to_string(),
+                descriptor.initial_grant_operation_id.to_string(),
+                descriptor.controller_actor_id.to_string(),
+                descriptor.local_writer_actor_id.to_string(),
+                descriptor.created_at_unix_ms,
             ],
         )?;
-        if changed != 1 {
-            return Err(ClientStoreError::InstallationNotInitializing);
-        }
         transaction.commit()?;
-        Ok(EstablishLocalSpaceResult {
-            binding,
-            replayed: genesis.replayed || grant.replayed,
-        })
+        Ok(descriptor)
+    }
+
+    pub fn workspace(
+        &self,
+        space_id: SpaceId,
+    ) -> Result<Option<SpaceDescriptor>, ClientStoreError> {
+        let connection = self.lock()?;
+        load_workspace(&connection, space_id)
+    }
+
+    pub fn workspaces(&self) -> Result<Vec<SpaceDescriptor>, ClientStoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT space_id, display_name, genesis_operation_id,
+                    initial_grant_operation_id, controller_actor_id,
+                    local_writer_actor_id, created_at_unix_ms
+             FROM client_workspaces ORDER BY created_at_unix_ms, space_id",
+        )?;
+        statement
+            .query_map([], decode_workspace_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ClientStoreError::from)
     }
 
     /// Reads one exact locally stored signed operation by its digest identity.
@@ -674,8 +715,10 @@ impl ClientSqliteStore {
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', ?2 FROM client_operations
                    WHERE schema_id IN ('record', 'event', 'tag', 'profile')
-                     AND ((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
-                       OR EXISTS (
+                     AND (((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM client_peer_spaces configured WHERE configured.peer_id=?1
+                       )) OR EXISTS (
                          SELECT 1 FROM client_peer_spaces space
                           WHERE space.peer_id=?1
                             AND space.space_id=client_operations.space_id
@@ -733,8 +776,10 @@ impl ClientSqliteStore {
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT ?1, operation_id, 'pending', stored_at_unix_ms
                    FROM client_operations
-                  WHERE ((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
-                      OR EXISTS (
+                  WHERE (((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM client_peer_spaces configured WHERE configured.peer_id=?1
+                      )) OR EXISTS (
                         SELECT 1 FROM client_peer_spaces space
                          WHERE space.peer_id=?1
                            AND space.space_id=client_operations.space_id
@@ -2225,10 +2270,9 @@ fn commit_transaction(
     })
 }
 
-fn installation_binding(
-    node_id: NodeId,
+fn workspace_descriptor(
     request: &TrustedSpaceBootstrapRequest,
-) -> Result<ClientInstallationBinding, ClientStoreError> {
+) -> Result<SpaceDescriptor, ClientStoreError> {
     let OperationBody::SpaceGenesis { controller } = request.genesis.body else {
         return Err(ClientStoreError::InvalidBootstrap(
             "genesis body has the wrong kind".into(),
@@ -2239,8 +2283,7 @@ fn installation_binding(
             "initial grant body has the wrong kind".into(),
         ));
     };
-    Ok(ClientInstallationBinding {
-        node_id,
+    Ok(SpaceDescriptor {
         space_id: request.genesis.space_id,
         controller_actor_id: controller,
         local_writer_actor_id: grant.subject,
@@ -2252,97 +2295,84 @@ fn installation_binding(
 }
 
 fn load_installation(connection: &Connection) -> Result<ClientInstallation, ClientStoreError> {
-    type InstallationRow = (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-    );
-    let row: Option<InstallationRow> = connection
+    let row: Option<(String, String, String)> = connection
         .query_row(
-            "SELECT phase, node_id, space_id, controller_actor_id,
-                    local_writer_actor_id, genesis_operation_id,
-                    initial_grant_operation_id, display_name, created_at_unix_ms
+            "SELECT node_id, controller_actor_id, local_writer_actor_id
              FROM client_local_installation WHERE singleton = 1",
             [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
     let Some(row) = row else {
         return Ok(ClientInstallation::Unbound);
     };
-    if row.0 == "initializing" {
-        if row.1.is_some()
-            || row.2.is_some()
-            || row.3.is_some()
-            || row.4.is_some()
-            || row.5.is_some()
-            || row.6.is_some()
-            || row.7.is_some()
-            || row.8.is_some()
-        {
-            return Err(corrupt(
-                "initializing installation contains established fields",
-            ));
-        }
-        return Ok(ClientInstallation::Initializing);
-    }
-    if row.0 != "established" {
-        return Err(corrupt("unknown client installation phase"));
-    }
-    let required = |value: Option<String>, name: &'static str| {
-        value.ok_or_else(|| corrupt(format!("established installation omitted {name}")))
-    };
     let binding = ClientInstallationBinding {
-        node_id: required(row.1, "node ID")?
+        node_id: row
+            .0
             .parse()
             .map_err(|error| corrupt(format!("invalid installation node ID: {error}")))?,
-        space_id: required(row.2, "space ID")?
-            .parse()
-            .map_err(|error| corrupt(format!("invalid installation space ID: {error}")))?,
-        controller_actor_id: required(row.3, "controller actor ID")?
+        controller_actor_id: row
+            .1
             .parse()
             .map_err(|error| corrupt(format!("invalid installation controller ID: {error}")))?,
-        local_writer_actor_id: required(row.4, "local writer actor ID")?
+        local_writer_actor_id: row
+            .2
             .parse()
             .map_err(|error| corrupt(format!("invalid installation writer ID: {error}")))?,
-        genesis_operation_id: OperationId::parse(&required(row.5, "genesis operation ID")?)
-            .map_err(|error| corrupt(format!("invalid installation genesis ID: {error}")))?,
-        initial_grant_operation_id: OperationId::parse(&required(
-            row.6,
-            "initial grant operation ID",
-        )?)
-        .map_err(|error| corrupt(format!("invalid installation grant ID: {error}")))?,
-        display_name: required(row.7, "display name")?,
-        created_at_unix_ms: row
-            .8
-            .ok_or_else(|| corrupt("established installation omitted creation time"))?,
     };
     Ok(ClientInstallation::Established(Box::new(binding)))
 }
 
-fn operation_count(connection: &Connection) -> Result<u64, ClientStoreError> {
-    let count = connection.query_row("SELECT count(*) FROM client_operations", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
-    nonnegative_u64(count)
+fn load_workspace(
+    connection: &Connection,
+    space_id: SpaceId,
+) -> Result<Option<SpaceDescriptor>, ClientStoreError> {
+    connection
+        .query_row(
+            "SELECT space_id, display_name, genesis_operation_id,
+                    initial_grant_operation_id, controller_actor_id,
+                    local_writer_actor_id, created_at_unix_ms
+             FROM client_workspaces WHERE space_id=?1",
+            params![space_id.to_string()],
+            decode_workspace_row,
+        )
+        .optional()
+        .map_err(ClientStoreError::from)
+}
+
+fn decode_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpaceDescriptor> {
+    let parse_operation = |value: String, index: usize| {
+        OperationId::parse(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    };
+    Ok(SpaceDescriptor {
+        space_id: parse_sql_id(row.get(0)?, 0)?,
+        display_name: row.get(1)?,
+        genesis_operation_id: parse_operation(row.get(2)?, 2)?,
+        initial_grant_operation_id: parse_operation(row.get(3)?, 3)?,
+        controller_actor_id: parse_sql_id(row.get(4)?, 4)?,
+        local_writer_actor_id: parse_sql_id(row.get(5)?, 5)?,
+        created_at_unix_ms: row.get(6)?,
+    })
+}
+
+fn parse_sql_id<T>(value: String, index: usize) -> rusqlite::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    value.parse().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 fn operation_matches(
@@ -2411,31 +2441,19 @@ fn configure(connection: &Connection, persistent: bool) -> Result<(), ClientStor
     Ok(())
 }
 
-fn migrate(connection: &mut Connection) -> Result<(), ClientStoreError> {
-    let mut version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > CLIENT_SCHEMA_VERSION {
-        return Err(ClientStoreError::UnsupportedSchema {
-            found: version,
-            supported: CLIENT_SCHEMA_VERSION,
-        });
-    }
-    while version < CLIENT_SCHEMA_VERSION {
-        let expected = version + 1;
-        let migration =
-            MIGRATIONS
-                .get(version as usize)
-                .ok_or(ClientStoreError::MigrationVersionMismatch {
-                    expected,
-                    found: version,
-                })?;
+fn install_fresh_schema(connection: &mut Connection) -> Result<(), ClientStoreError> {
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_schema
+          WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(migration)?;
-        let found: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if found != expected {
-            return Err(ClientStoreError::MigrationVersionMismatch { expected, found });
+        for part in FRESH_SCHEMA {
+            transaction.execute_batch(part)?;
         }
         transaction.commit()?;
-        version = expected;
     }
     Ok(())
 }
@@ -2583,7 +2601,9 @@ fn queue_resource_uploads(
                   ?2
            FROM client_peers p JOIN client_resources r ON r.content_id = ?1
           WHERE p.enabled = 1 AND p.push_enabled = 1
-            AND (p.peer_transport_credential IS NULL OR EXISTS (
+            AND ((p.peer_transport_credential IS NULL AND NOT EXISTS (
+                SELECT 1 FROM client_peer_spaces configured WHERE configured.peer_id=p.peer_id
+            )) OR EXISTS (
                 SELECT 1 FROM client_operation_resources link
                 JOIN client_operations operation USING(operation_id)
                 JOIN client_peer_spaces space
@@ -2612,14 +2632,16 @@ fn queue_known_resources_for_peer(
                   CASE locally_available WHEN 1 THEN 'pending' ELSE 'waiting_local' END,
                   max(discovered_at_unix_ms, ?2)
            FROM client_resources resource
-          WHERE (SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
-             OR EXISTS (
+          WHERE (((SELECT peer_transport_credential FROM client_peers WHERE peer_id=?1) IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM client_peer_spaces configured WHERE configured.peer_id=?1
+              )) OR EXISTS (
               SELECT 1 FROM client_operation_resources link
               JOIN client_operations operation USING(operation_id)
               JOIN client_peer_spaces space
                 ON space.peer_id=?1 AND space.space_id=operation.space_id
               WHERE link.content_id=resource.content_id
-          )",
+          ))",
         params![peer_id.to_string(), fallback_at_unix_ms],
     )?;
     Ok(())
@@ -2782,7 +2804,11 @@ fn apply_delivery_source(
                     peer_id, operation_id, state, next_attempt_at_unix_ms
                  ) SELECT peer_id, ?1, 'pending', ?2 FROM client_peers
                    WHERE enabled = 1 AND push_enabled = 1
-                     AND (client_peers.peer_transport_credential IS NULL OR EXISTS (
+                     AND ((client_peers.peer_transport_credential IS NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM client_peer_spaces configured
+                          WHERE configured.peer_id=client_peers.peer_id
+                       )) OR EXISTS (
                          SELECT 1 FROM client_peer_spaces space
                          JOIN client_operations operation
                            ON operation.operation_id=?1

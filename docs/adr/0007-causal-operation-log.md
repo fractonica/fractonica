@@ -67,12 +67,11 @@ authorization and pairing boundaries are selected by ADR 0010. Payload
 encryption and non-loopback networking remain prohibited until their own
 decisions and conformance coverage exist.
 
-## Bounds and compatibility
+## Bounds
 
-Protocol version, schema identifier, causal-parent count, text, emoji and JSON
-metadata all have explicit bounds. Unsupported protocol or schema versions are
-rejected; they are never guessed or reinterpreted. Breaking semantic changes
-require a new version and conformance fixtures.
+Protocol discriminator, schema identifier, causal-parent count, text, emoji,
+and JSON metadata all have explicit bounds. Unknown values are rejected; they
+are never guessed or reinterpreted.
 
 Operations use millisecond Unix timestamps at the protocol boundary. Saros
 phase and glyph values are derived from

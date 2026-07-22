@@ -6,5 +6,3 @@ ALTER TABLE pairing_sessions
 
 CREATE INDEX pairing_sessions_completed_activity_idx
     ON pairing_sessions (state, last_seen_at_unix_ms, completed_at_unix_ms);
-
-PRAGMA user_version = 9;

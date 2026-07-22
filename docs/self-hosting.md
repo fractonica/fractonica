@@ -28,9 +28,8 @@ cargo run -p fractonica-node -- \
   --display-name "Development node"
 ```
 
-Use a dedicated directory for each node installation. Fractonica database
-schema migrations are internal storage maintenance, not application protocol
-versions or compatibility with another product.
+Use a dedicated directory for each node installation. Development builds may
+reset that directory whenever the checked-in storage shape changes.
 
 The standalone default is `http://127.0.0.1:8789`. Confirm the process and
 database are ready from a second terminal:
@@ -46,7 +45,7 @@ The currently implemented endpoints are:
 | Endpoint | Current purpose |
 | --- | --- |
 | `GET /health/live` | Confirms that the HTTP process is alive. |
-| `GET /health/ready` | Confirms that the local SQLite store is available and reports its schema version. |
+| `GET /health/ready` | Confirms that the local SQLite store is available. |
 | `GET /api/node` | Returns local node metadata, public `NodeId`, spaces, and advertised capabilities. |
 | `POST /api/spaces/{spaceId}/operations` | Verifies, authorizes, and atomically admits one complete client-signed operation. |
 | `GET /api/spaces/{spaceId}/operations/{operationId}` | Returns one admitted signed operation and node-local receipt metadata. |
@@ -138,25 +137,19 @@ One node process owns one data directory. A process lock prevents two nodes
 from using the same directory at once; do not work around that lock or point a
 second process at the same directory.
 
-An established full installation has three inseparable trust-critical units:
+An established full installation has these local state units:
 
-- `fractonica.db` contains the signed graph, trusted-space anchor, capability
-  projections, durable admission-clock high-water mark, and content metadata;
-- `identity/` contains the distinct node-transport, space-controller, and
-  local-writer private seeds plus the default `SpaceId`;
-- `installation.json` contains the non-secret public binding between the node,
-  default space, exact signed genesis, initial writer grant, controller, and
-  writer.
+- `fractonica.db` contains zero or more independent signed workspace graphs,
+  capability projections, delivery state, and content metadata;
+- `identity/` contains the distinct node-transport, controller, and local-writer
+  private seeds; and
+- `installation.json` contains the non-secret binding between those public
+  identities. It does not select or contain a workspace.
 
-During the only valid first run, `installation.identity.pending.json` is
-published before the keystore writes any key. A crash before, during, or just
-after identity creation therefore resumes the same marked bootstrap and the
-keystore's own atomic recovery protocol. Once the protected keys and exact
-signed bootstrap exist, `installation.pending.json` is published before SQLite
-receives the anchor. A crash can replay those exact operations. It never
-generates a second genesis for the same space or replacement keys for a pending
-anchor. Publication also recovers the private staging file on either side of
-the atomic no-replace link; unrelated inodes still fail closed.
+A fresh node opens at the workspace chooser with no workspace. Creating a
+workspace writes a new signed root to SQLite. Linking adopts the selected
+remote workspace as another independent root; neither action changes the
+installation identity.
 
 `content/` contains locally available immutable resource bytes. It is not part
 of operation validity: a missing content tree is recreated empty and those
@@ -164,12 +157,10 @@ resources report unavailable until restored or fetched again. Treat it as
 irreplaceable personal data when it is the only copy, even though it is not a
 trust anchor.
 
-On restart, the node validates the manifest against both protected identity and
-database trust anchor. If an established database or identity directory is
-missing, if either belongs to another installation, or if persistent state
-exists without its binding, startup fails closed. The node does not silently
-generate replacement controller keys, create a new trust anchor, or adopt an
-untracked database. Explicit recovery or migration is required.
+On restart, the node validates the installation manifest against the protected
+identity. Workspace anchors are verified independently when they are loaded.
+During development, resetting the local installation removes both identity and
+all workspace roots.
 
 On Unix, newly created state uses these permissions, and established state with
 different ownership, modes, or hard-link counts is rejected rather than
@@ -177,8 +168,7 @@ silently repaired:
 
 - the data directory: `0700`;
 - `fractonica.db`: `0600`;
-- `node.lock`, both installation pending markers, and `installation.json`:
-  `0600`;
+- `node.lock`, the identity marker, and `installation.json`: `0600`;
 - `identity/`: `0700`, with every identity role and manifest file `0600`;
 - `content/`, its staging directory, and digest-prefix directories: `0700`;
 - staged and committed content files: `0600`.
@@ -224,8 +214,8 @@ this conservative procedure:
    state and must be kept together.
 5. Test a backup by restoring it into a *different* data directory, starting a
    standalone node with that directory, and checking `/health/ready` and
-   `/api/node`. The returned public `NodeId`, `SpaceId`, genesis digest,
-   controller, and local writer must match the backed-up installation.
+   `/api/node`. The returned `NodeId` and complete workspace list must match the
+   backed-up installation.
 
 Never replace an active data directory in place. Stop the node first, retain
 the previous directory until the restored copy has passed its readiness check,

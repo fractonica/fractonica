@@ -64,5 +64,3 @@ CREATE TABLE idempotency_receipts (
     -- Mirrors fractonica_application::{MIN,MAX}_IDEMPOTENCY_KEY_LENGTH.
     CHECK (length(idempotency_key) BETWEEN 8 AND 200)
 ) STRICT;
-
-PRAGMA user_version = 2;

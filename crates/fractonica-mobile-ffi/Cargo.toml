@@ -12,6 +12,7 @@ publish = false
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+fractonica-application.workspace = true
 fractonica-client-runtime.workspace = true
 fractonica-client-sqlite.workspace = true
 fractonica-content.workspace = true

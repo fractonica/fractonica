@@ -6,13 +6,13 @@
 ## Context
 
 Fractonica spans a Rust core and node, desktop and headless applications,
-device helpers, public contracts, migrations, and conformance fixtures. A
+device helpers, public contracts, storage schemas, and conformance fixtures. A
 protocol change often requires coordinated updates across several of these
 parts.
 
 ## Decision
 
-Keep product source, contracts, tests, migrations, and architecture documents
+Keep product source, contracts, tests, storage schemas, and architecture documents
 in one repository. Cross-component changes are reviewed and tested atomically.
 Directories remain independently buildable, and dependency direction follows
 the layers in the architecture document.

@@ -1143,7 +1143,6 @@ components:
       required:
         - kind
         - status
-        - schemaVersion
       properties:
         kind:
           type: string
@@ -1151,9 +1150,6 @@ components:
         status:
           type: string
           const: ready
-        schemaVersion:
-          type: integer
-          minimum: 0
     NoStorageReadyStatus:
       type: object
       additionalProperties: false

@@ -5,12 +5,12 @@ use std::collections::BTreeSet;
 use fractonica_api::{
     PairedDeviceView, PairingControl, PairingControlError, PairingCreateCommand,
     PairingHandshakeResult, PairingInvitationCreated, PairingSessionView, PairingState,
-    PeerTransportAction, PeerTransportPrincipal,
+    PeerTransportAction, PeerTransportPrincipal, WorkspaceCreated,
 };
 use fractonica_application::{OperationRepository, SubmitOperationRequest};
 use fractonica_data_model::{
     CapabilityAction, CapabilityRevocation, CapabilityRevocationReason, EntityId, EntitySchema,
-    NodeId, OperationBody, OperationEnvelope, OperationId, OperationNonce,
+    NodeId, OperationBody, OperationEnvelope, OperationId, OperationNonce, SpaceId,
 };
 use fractonica_keystore::IdentityBundle;
 use fractonica_keystore::{FilePairingSecretVault, PairingSecretVaultError};
@@ -18,6 +18,7 @@ use fractonica_pairing::{
     InvitationId, InvitationParameters, IssuedInvitation, JoinerClaim, PairingAcceptance,
     PairingInvitation, PairingReceipt, confirmation_octal,
 };
+use fractonica_space_bootstrap::build_trusted_space_bootstrap_for_space;
 use fractonica_store_sqlite::{PairingLifecycle, PairingSession, PairingStoreError, SqliteStore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -155,7 +156,6 @@ impl std::fmt::Debug for DurablePairingStore {
 pub struct NodePairingControl {
     durable: DurablePairingStore,
     identity: std::sync::Arc<IdentityBundle>,
-    genesis_operation_id: OperationId,
 }
 
 impl NodePairingControl {
@@ -163,13 +163,8 @@ impl NodePairingControl {
     pub const fn new(
         durable: DurablePairingStore,
         identity: std::sync::Arc<IdentityBundle>,
-        genesis_operation_id: OperationId,
     ) -> Self {
-        Self {
-            durable,
-            identity,
-            genesis_operation_id,
-        }
+        Self { durable, identity }
     }
 
     fn view(session: PairingSession) -> PairingSessionView {
@@ -380,7 +375,7 @@ impl NodePairingControl {
             entity_id,
             EntitySchema::CapabilityRevoke,
             vec![],
-            vec![self.genesis_operation_id],
+            vec![session.descriptor.genesis_operation_id],
             now,
             OperationNonce::from_bytes(nonce),
             OperationBody::CapabilityRevoke {
@@ -397,12 +392,73 @@ impl NodePairingControl {
 }
 
 impl PairingControl for NodePairingControl {
+    fn create_workspace(
+        &self,
+        display_name: String,
+        now: i64,
+    ) -> Result<WorkspaceCreated, PairingControlError> {
+        for _ in 0..16 {
+            let mut bytes = [0_u8; 32];
+            getrandom::fill(&mut bytes).map_err(|_| PairingControlError::Storage)?;
+            if bytes == [0; 32] {
+                continue;
+            }
+            let space_id = SpaceId::from_bytes(bytes);
+            if self
+                .durable
+                .database()
+                .space(space_id)
+                .map_err(|_| PairingControlError::Storage)?
+                .is_some()
+            {
+                continue;
+            }
+            let bootstrap = build_trusted_space_bootstrap_for_space(
+                &self.identity,
+                space_id,
+                display_name.clone(),
+                now,
+            )
+            .map_err(|error| PairingControlError::Invalid(error.to_string()))?;
+            let result = self
+                .durable
+                .database()
+                .bootstrap_trusted_space(&bootstrap)
+                .map_err(|error| PairingControlError::Invalid(error.to_string()))?;
+            return Ok(WorkspaceCreated {
+                space: result.space,
+                genesis: bootstrap.genesis,
+                initial_grant: bootstrap.initial_grant,
+            });
+        }
+        Err(PairingControlError::Storage)
+    }
+
+    fn delete_workspace(&self, space_id: SpaceId) -> Result<(), PairingControlError> {
+        self.durable
+            .database()
+            .delete_space(space_id)
+            .map_err(|error| match error {
+                fractonica_application::RepositoryError::SpaceNotFound(_) => {
+                    PairingControlError::NotFound
+                }
+                _ => PairingControlError::Storage,
+            })
+    }
+
     fn create_invitation(
         &self,
         request: PairingCreateCommand,
         now: i64,
     ) -> Result<PairingInvitationCreated, PairingControlError> {
-        if request.space_id != self.identity.space_id()
+        let space = self
+            .durable
+            .database()
+            .space(request.space_id)
+            .map_err(|_| PairingControlError::Storage)?
+            .ok_or_else(|| PairingControlError::Invalid("workspace was not found".into()))?;
+        if space.controller_actor_id != self.identity.space_controller_actor_id()
+            || space.local_writer_actor_id != self.identity.local_writer_actor_id()
             || request.expires_in_ms < fractonica_pairing::MIN_INVITATION_LIFETIME_MS
             || request.expires_in_ms > fractonica_pairing::MAX_INVITATION_LIFETIME_MS
             || request
@@ -421,7 +477,7 @@ impl PairingControl for NodePairingControl {
             self.identity.node_transport_key(),
             InvitationParameters {
                 space_id: request.space_id,
-                genesis_operation_id: self.genesis_operation_id,
+                genesis_operation_id: space.genesis_operation_id,
                 now_unix_ms: now,
                 expires_at_unix_ms: expires,
                 endpoint_hints: request.endpoint_hints,
@@ -887,7 +943,6 @@ mod tests {
         let store = SqliteStore::open(root.path().join("node.sqlite3")).unwrap();
         let identity = identity();
         let bootstrap = build_trusted_space_bootstrap(&identity, "Test", NOW).unwrap();
-        let genesis = bootstrap.genesis.operation_id;
         store.bootstrap_trusted_space(&bootstrap).unwrap();
         let control = NodePairingControl::new(
             DurablePairingStore::new(
@@ -895,7 +950,6 @@ mod tests {
                 FilePairingSecretVault::new(root.path().join("pairing-secrets")),
             ),
             std::sync::Arc::clone(&identity),
-            genesis,
         );
         let created = control
             .create_invitation(

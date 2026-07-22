@@ -678,6 +678,10 @@ pub enum CapabilityAction {
     RevokeCapability,
     ReadSpace,
     WriteContent,
+    /// May issue only a same-or-narrower renewable workspace-member grant.
+    /// Unlike general capability issuance, this does not confer revocation or
+    /// arbitrary administrative authority.
+    LinkWorkspace,
 }
 
 /// Bounded capability statement carried by `capability.grant`.

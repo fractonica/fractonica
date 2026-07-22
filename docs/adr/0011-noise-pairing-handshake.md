@@ -7,7 +7,7 @@
 
 The Rust pairing crate now implements the canonical invitation, dual-signed
 claim, fixed Noise exchange, transcript receipt, and confirmation projection.
-SQLite migration 0005 stores only non-secret lifecycle indexes. Short-lived
+The SQLite pairing schema stores only non-secret lifecycle indexes. Short-lived
 secret material is written atomically to a separate private vault and startup
 reconciliation expires sessions, removes orphan secrets, and fails closed when
 an active row has lost its secret. Loopback HTTP routes now expose bearer-gated

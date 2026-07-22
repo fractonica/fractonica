@@ -14,7 +14,6 @@ export const READY_SNAPSHOT: NodeSnapshot = {
     storage: {
       kind: "sqlite",
       status: "ready",
-      schemaVersion: 14,
     },
   },
   node: {

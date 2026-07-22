@@ -3,5 +3,3 @@ CREATE TABLE node_installation (
     installation_id TEXT NOT NULL UNIQUE,
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
 ) STRICT;
-
-PRAGMA user_version = 1;
