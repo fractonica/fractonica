@@ -1388,8 +1388,8 @@ async fn claim_pairing(
         )
         .map_err(|_| ClientRuntimeError::PairingFailed)?;
     let client = Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|_| ClientRuntimeError::PairingFailed)?;
     let request = serde_json::json!({
@@ -1402,7 +1402,8 @@ async fn claim_pairing(
     // for this exact frame, so retrying here is safe even if the first response
     // was lost after the invitation had already been claimed.
     let mut response = None;
-    for attempt in 0..5_u32 {
+    let mut endpoint_failures = BTreeMap::new();
+    for attempt in 0..3_u32 {
         let mut requests = tokio::task::JoinSet::new();
         for endpoint in &endpoints {
             let endpoint = endpoint.clone();
@@ -1424,12 +1425,18 @@ async fn claim_pairing(
                         response = Some((endpoint, value));
                         break;
                     }
-                    Ok(value) => eprintln!(
-                        "Fractonica pairing endpoint {endpoint} rejected the handshake with HTTP {}",
-                        value.status()
-                    ),
+                    Ok(value) => {
+                        let detail = format!("HTTP {}", value.status());
+                        eprintln!(
+                            "Fractonica pairing endpoint {endpoint} rejected the handshake with {detail}"
+                        );
+                        endpoint_failures.insert(endpoint.to_string(), detail);
+                    }
                     Err(error) => {
-                        eprintln!("Fractonica pairing endpoint {endpoint} was unreachable: {error}")
+                        eprintln!(
+                            "Fractonica pairing endpoint {endpoint} was unreachable: {error}"
+                        );
+                        endpoint_failures.insert(endpoint.to_string(), error.to_string());
                     }
                 }
             }
@@ -1437,14 +1444,25 @@ async fn claim_pairing(
         if response.is_some() {
             break;
         }
-        if attempt < 4 {
+        if attempt < 2 {
             tokio::time::sleep(std::time::Duration::from_millis(
                 500_u64.saturating_mul(u64::from(attempt + 1)),
             ))
             .await;
         }
     }
-    let (endpoint, response) = response.ok_or(ClientRuntimeError::PairingFailed)?;
+    let (endpoint, response) = response.ok_or_else(|| {
+        let detail = endpoint_failures
+            .into_iter()
+            .map(|(endpoint, failure)| format!("{endpoint}: {failure}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        ClientRuntimeError::PairingTransportUnavailable(if detail.is_empty() {
+            "no endpoint request completed".to_owned()
+        } else {
+            detail
+        })
+    })?;
     let response: PairingHandshakeResponse = response
         .json()
         .await
@@ -1769,6 +1787,8 @@ pub enum ClientRuntimeError {
     InvalidPairingInvitation,
     #[error("pairing ceremony failed")]
     PairingFailed,
+    #[error("pairing node is unreachable: {0}")]
+    PairingTransportUnavailable(String),
     #[error("pairing completion failed: {0}")]
     PairingCompletion(String),
     #[error("pairing invitation is not pending human confirmation")]

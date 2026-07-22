@@ -1448,6 +1448,7 @@ async fn pairing_handshake(
 ) -> Result<Json<PairingHandshakeResponse>, ApiError> {
     let Json(request) = payload.map_err(pairing_json_error)?;
     let id = parse_invitation_id(&request.invitation_id)?;
+    eprintln!("Fractonica pairing handshake received for invitation {id}");
     let frame = URL_SAFE_NO_PAD
         .decode(request.frame_base64url)
         .map_err(|_| pairing_malformed())?;

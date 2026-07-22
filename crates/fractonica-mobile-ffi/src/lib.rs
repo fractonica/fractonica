@@ -165,6 +165,8 @@ pub enum MobileClientError {
     InvalidPairingInvitation,
     #[error("The pairing handshake failed.")]
     PairingFailed,
+    #[error("No invitation endpoint was reachable on the local network.")]
+    PairingTransportUnavailable,
 }
 
 #[uniffi::export]
@@ -529,6 +531,9 @@ fn map_pairing_error(error: ClientRuntimeError) -> MobileClientError {
     match error {
         ClientRuntimeError::InvalidPairingInvitation => MobileClientError::InvalidPairingInvitation,
         ClientRuntimeError::RandomSourceUnavailable => MobileClientError::RandomSourceUnavailable,
+        ClientRuntimeError::PairingTransportUnavailable(_) => {
+            MobileClientError::PairingTransportUnavailable
+        }
         _ => MobileClientError::PairingFailed,
     }
 }
@@ -709,6 +714,16 @@ mod tests {
                 rust_core_linked: true,
             }
         );
+    }
+
+    #[test]
+    fn unreachable_pairing_transport_keeps_its_specific_mobile_error() {
+        assert!(matches!(
+            map_pairing_error(ClientRuntimeError::PairingTransportUnavailable(
+                "http://192.168.1.20:49152: request timed out".to_owned(),
+            )),
+            MobileClientError::PairingTransportUnavailable
+        ));
     }
 
     #[test]

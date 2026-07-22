@@ -2477,7 +2477,13 @@ sealed class MobileClientException: kotlin.Exception() {
         override val message
             get() = ""
     }
-    
+
+    class PairingTransportUnavailable(
+        ) : MobileClientException() {
+        override val message
+            get() = ""
+    }
+
 
     
 
@@ -2507,6 +2513,7 @@ public object FfiConverterTypeMobileClientError : FfiConverterRustBuffer<MobileC
             8 -> MobileClientException.OperationFailed()
             9 -> MobileClientException.InvalidPairingInvitation()
             10 -> MobileClientException.PairingFailed()
+            11 -> MobileClientException.PairingTransportUnavailable()
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -2553,6 +2560,10 @@ public object FfiConverterTypeMobileClientError : FfiConverterRustBuffer<MobileC
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
             )
+            is MobileClientException.PairingTransportUnavailable -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
         }
     }
 
@@ -2596,6 +2607,10 @@ public object FfiConverterTypeMobileClientError : FfiConverterRustBuffer<MobileC
             }
             is MobileClientException.PairingFailed -> {
                 buf.putInt(10)
+                Unit
+            }
+            is MobileClientException.PairingTransportUnavailable -> {
+                buf.putInt(11)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -2825,5 +2840,4 @@ public object FfiConverterSequenceTypeMobileRecordPreview: FfiConverterRustBuffe
     )
     }
     
-
 

@@ -38,6 +38,13 @@ final class FractonicaClientModuleError: Exception, @unchecked Sendable {
       reason: "The pairing invitation could not be claimed or completed. Create a new invitation and try again."
     )
   }
+
+  static var pairingTransportUnavailable: FractonicaClientModuleError {
+    FractonicaClientModuleError(
+      code: "ERR_FRACTONICA_LINK_UNREACHABLE",
+      reason: "The linked node could not be reached. Allow Local Network access for Fractonica and confirm both devices are on the same network."
+    )
+  }
 }
 
 /// Serial native owner of the Rust runtime. Paths and protected identity bytes
@@ -345,6 +352,8 @@ final class FractonicaClientCoordinator {
       throw FractonicaClientModuleError.invalidRequest
     } catch MobileClientError.PairingFailed {
       throw FractonicaClientModuleError.pairingFailed
+    } catch MobileClientError.PairingTransportUnavailable {
+      throw FractonicaClientModuleError.pairingTransportUnavailable
     } catch {
       throw FractonicaClientModuleError.unavailable
     }

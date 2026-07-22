@@ -505,6 +505,10 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
             </p>
             <dl className="pairing-facts">
               <div><dt>Expires</dt><dd>{new Date(session.expiresAtUnixMs).toLocaleString()}</dd></div>
+              <div>
+                <dt>Addresses</dt>
+                <dd>{client.pairingEndpointHints.join(", ")}</dd>
+              </div>
             </dl>
             <div className="pairing-actions">
               <Button disabled={busy} onClick={() => void refresh()} variant="quiet">Check claim</Button>

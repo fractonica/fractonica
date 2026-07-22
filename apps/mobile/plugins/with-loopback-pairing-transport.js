@@ -18,13 +18,15 @@ const NETWORK_SECURITY_CONFIG = `<?xml version="1.0" encoding="utf-8"?>
 `;
 
 /**
- * Pairing v1 is intentionally plain HTTP on loopback because the invitation's
- * Noise handshake supplies authentication and confidentiality. Native Rust
- * rejects every non-loopback hint; these platform exceptions only let that
- * already-bounded transport reach the local development node.
+ * Linking v1 uses plain HTTP only for private/local IP origins because the
+ * invitation's Noise handshake supplies authentication and confidentiality.
+ * Native Rust rejects public-network hints; these platform exceptions let the
+ * bounded transport reach a node on the same local network.
  */
 module.exports = function withLoopbackPairingTransport(config) {
   config = withInfoPlist(config, (iosConfig) => {
+    iosConfig.modResults.NSLocalNetworkUsageDescription =
+      "Fractonica links your devices and synchronizes records over your local network.";
     iosConfig.modResults.NSAppTransportSecurity = {
       ...(iosConfig.modResults.NSAppTransportSecurity ?? {}),
       NSAllowsLocalNetworking: true,

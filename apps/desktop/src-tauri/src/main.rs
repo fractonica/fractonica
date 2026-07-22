@@ -841,11 +841,25 @@ fn pairing_endpoint_hints(control_base_url: &str) -> Vec<String> {
 fn interface_preference(name: &str, ip: Ipv4Addr) -> u8 {
     let name = name.to_ascii_lowercase();
     let virtual_interface = [
-        "awdl", "bridge", "docker", "llw", "tap", "tun", "utun", "veth", "vmnet",
+        "awdl",
+        "bridge",
+        "docker",
+        "llw",
+        "tap",
+        "tailscale",
+        "tun",
+        "utun",
+        "veth",
+        "virtualbox",
+        "vmnet",
+        "vmware",
+        "zerotier",
     ]
     .iter()
     .any(|prefix| name.starts_with(prefix));
     let physical_interface = name == "en0"
+        || name == "wi-fi"
+        || name == "wifi"
         || name.starts_with("eth")
         || name.starts_with("wlan")
         || name.starts_with("wl");
@@ -1052,6 +1066,10 @@ mod tests {
         assert!(
             interface_preference("wlan0", Ipv4Addr::new(10, 0, 0, 20))
                 < interface_preference("docker0", Ipv4Addr::new(192, 168, 65, 1))
+        );
+        assert!(
+            interface_preference("Wi-Fi", Ipv4Addr::new(10, 0, 0, 20))
+                < interface_preference("Tailscale", Ipv4Addr::new(192, 168, 65, 1))
         );
     }
 }

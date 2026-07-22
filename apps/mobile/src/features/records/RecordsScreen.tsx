@@ -508,7 +508,7 @@ function PairingModal({
               )}
             </Pressable>
             <Text style={styles.pairingFootnote}>
-              This phase deliberately accepts only a node exposed on this device’s loopback interface. LAN transport remains disabled until encrypted resumable sessions are implemented.
+              Both devices must be on the same local network. Fractonica authenticates the link with the confirmation glyphs before synchronizing records.
             </Text>
           </View>
         )}

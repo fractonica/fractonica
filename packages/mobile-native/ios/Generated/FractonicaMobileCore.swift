@@ -1535,6 +1535,7 @@ enum MobileClientError: Swift.Error, Equatable, Hashable, Foundation.LocalizedEr
     case OperationFailed
     case InvalidPairingInvitation
     case PairingFailed
+    case PairingTransportUnavailable
 
     
 
@@ -1574,6 +1575,7 @@ public struct FfiConverterTypeMobileClientError: FfiConverterRustBuffer {
         case 8: return .OperationFailed
         case 9: return .InvalidPairingInvitation
         case 10: return .PairingFailed
+        case 11: return .PairingTransportUnavailable
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1620,11 +1622,15 @@ public struct FfiConverterTypeMobileClientError: FfiConverterRustBuffer {
         
         case .InvalidPairingInvitation:
             writeInt(&buf, Int32(9))
-        
-        
+
+
         case .PairingFailed:
             writeInt(&buf, Int32(10))
-        
+
+
+        case .PairingTransportUnavailable:
+            writeInt(&buf, Int32(11))
+
         }
     }
 }

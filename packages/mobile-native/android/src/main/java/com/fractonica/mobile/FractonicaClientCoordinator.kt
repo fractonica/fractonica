@@ -289,6 +289,8 @@ internal class FractonicaClientCoordinator(context: Context) {
     throw invalidRequest(error)
   } catch (error: MobileClientException.PairingFailed) {
     throw pairingFailed(error)
+  } catch (error: MobileClientException.PairingTransportUnavailable) {
+    throw linkUnreachable(error)
   } catch (error: FractonicaClientBridgeException) {
     throw error
   } catch (error: Throwable) {
@@ -316,6 +318,12 @@ internal class FractonicaClientCoordinator(context: Context) {
   private fun pairingFailed(cause: Throwable? = null) = FractonicaClientBridgeException(
     "ERR_FRACTONICA_PAIRING_FAILED",
     "The pairing invitation could not be claimed or completed. Create a new invitation and try again.",
+    cause,
+  )
+
+  private fun linkUnreachable(cause: Throwable? = null) = FractonicaClientBridgeException(
+    "ERR_FRACTONICA_LINK_UNREACHABLE",
+    "The linked node could not be reached. Confirm both devices are on the same local network.",
     cause,
   )
 
