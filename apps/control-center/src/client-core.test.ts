@@ -149,4 +149,21 @@ describe("native client core adapter", () => {
       confirmation: "RESET LOCAL INSTALLATION",
     });
   });
+
+  it("decodes the native workspace list independently of node status", async () => {
+    const workspace = {
+      spaceId: `space:${"1".repeat(64)}`,
+      displayName: "Personal",
+      genesisOperationId: `sha-256:${"2".repeat(64)}`,
+      initialGrantOperationId: `sha-256:${"3".repeat(64)}`,
+      controllerActorId: `actor:ed25519:${"4".repeat(64)}`,
+      localWriterActorId: `actor:ed25519:${"5".repeat(64)}`,
+      createdAtUnixMs: 1_800_000_000_000,
+    };
+    const invoke = vi.fn().mockResolvedValue([workspace]);
+    const client = createClientCore(invoke);
+
+    await expect(client.listWorkspaces?.()).resolves.toEqual([workspace]);
+    expect(invoke).toHaveBeenCalledWith("client_list_workspaces");
+  });
 });

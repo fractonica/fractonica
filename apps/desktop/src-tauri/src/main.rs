@@ -81,6 +81,18 @@ struct ClientStatusResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ClientWorkspaceResponse {
+    space_id: String,
+    display_name: String,
+    genesis_operation_id: String,
+    initial_grant_operation_id: String,
+    controller_actor_id: String,
+    local_writer_actor_id: String,
+    created_at_unix_ms: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CommitResponse {
     local_sequence: u64,
     operation_id: String,
@@ -562,6 +574,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             node_connection,
             client_status,
+            client_list_workspaces,
             client_create_workspace,
             client_delete_workspace,
             client_activate_workspace,
@@ -1091,6 +1104,40 @@ async fn client_create_workspace(
         .await
         .map_err(command_error)?;
     Ok(())
+}
+
+#[tauri::command]
+async fn client_list_workspaces(
+    sidecar: State<'_, NodeSidecar>,
+) -> Result<Vec<ClientWorkspaceResponse>, String> {
+    for _ in 0..CONNECTION_WAIT_ATTEMPTS {
+        if let Some(runtime) = sidecar.client.lock().ok().and_then(|value| value.clone()) {
+            return runtime.workspaces().map_err(command_error).map(|spaces| {
+                spaces
+                    .into_iter()
+                    .map(|space| ClientWorkspaceResponse {
+                        space_id: space.space_id.to_string(),
+                        display_name: space.display_name,
+                        genesis_operation_id: space.genesis_operation_id.to_string(),
+                        initial_grant_operation_id: space.initial_grant_operation_id.to_string(),
+                        controller_actor_id: space.controller_actor_id.to_string(),
+                        local_writer_actor_id: space.local_writer_actor_id.to_string(),
+                        created_at_unix_ms: space.created_at_unix_ms,
+                    })
+                    .collect()
+            });
+        }
+        if let Some(error) = sidecar
+            .client_error
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+        {
+            return Err(error);
+        }
+        tokio::time::sleep(CONNECTION_WAIT_INTERVAL).await;
+    }
+    Err("The local client runtime did not become ready.".into())
 }
 
 #[tauri::command]

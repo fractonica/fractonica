@@ -139,6 +139,18 @@ describe("control center", () => {
     expect(readStatus).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps workspace creation visible when node status is temporarily offline", async () => {
+    const client = makeClient(vi.fn().mockRejectedValue(new Error("Status request failed.")));
+    const clientCore = makeClientCore();
+
+    render(<App client={client} clientCore={clientCore} />);
+
+    expect(await screen.findByRole("heading", { name: "Workspaces" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create workspace" })).toBeInTheDocument();
+    expect(await screen.findByText("Node status unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Status request failed.")).toBeInTheDocument();
+  });
+
   it("creates an invitation and requires both confirmation glyphs before authorization", async () => {
     const invitationId = "7".repeat(32);
     const spaceId = READY_SNAPSHOT.node.spaces![0].spaceId;

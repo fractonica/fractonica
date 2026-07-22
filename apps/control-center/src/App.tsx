@@ -13,7 +13,12 @@ import type {
 } from "./api";
 import { formatCheckedAt, formatLocalDateTime, formatUptime } from "./format";
 import { createRuntimeClientCore } from "./client-core";
-import type { ClientCore, PairingClaim, PrePairRecordPolicy } from "./client-core";
+import type {
+  ClientCore,
+  ClientWorkspace,
+  PairingClaim,
+  PrePairRecordPolicy,
+} from "./client-core";
 import { RecordsWorkspace } from "./RecordsWorkspace";
 import { useNodeStatus } from "./use-node-status";
 import "./app.css";
@@ -22,6 +27,8 @@ export interface AppProps {
   client?: NodeClient;
   clientCore?: ClientCore | null;
 }
+
+const EMPTY_WORKSPACES: ClientWorkspace[] = [];
 
 function FractonicaMark() {
   return <OctalGlyph decorative className="brand-mark" depth={6} value="777777" />;
@@ -715,7 +722,7 @@ function PairingPanel({ client, clientCore, snapshot }: PairingPanelProps) {
 
 interface WorkspaceManagerProps {
   clientCore: ClientCore;
-  snapshot: NodeSnapshot;
+  initialSpaces: ClientWorkspace[];
   onRefresh: () => Promise<void>;
   activeSpaceId?: string;
   onActiveChange: (spaceId?: string) => void;
@@ -723,7 +730,7 @@ interface WorkspaceManagerProps {
 
 function WorkspaceManager({
   clientCore,
-  snapshot,
+  initialSpaces,
   onRefresh,
   activeSpaceId,
   onActiveChange,
@@ -731,7 +738,25 @@ function WorkspaceManager({
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const spaces = snapshot.node.spaces ?? [];
+  const [spaces, setSpaces] = useState<ClientWorkspace[]>(initialSpaces);
+
+  const refreshSpaces = async () => {
+    if (clientCore.listWorkspaces) {
+      setSpaces(await clientCore.listWorkspaces());
+    } else {
+      setSpaces(initialSpaces);
+    }
+  };
+
+  useEffect(() => {
+    void refreshSpaces().catch((reason) => {
+      setError(nativeErrorMessage(reason, "Workspaces could not be loaded."));
+    });
+  }, [clientCore]);
+
+  useEffect(() => {
+    if (!clientCore.listWorkspaces) setSpaces(initialSpaces);
+  }, [clientCore, initialSpaces]);
 
   const create = async () => {
     if (!clientCore.createWorkspace) return;
@@ -742,6 +767,7 @@ function WorkspaceManager({
       setDisplayName("");
       const status = await clientCore.status();
       onActiveChange(status.spaceId);
+      await refreshSpaces();
       await onRefresh();
     } catch (reason) {
       setError(nativeErrorMessage(reason, "Workspace could not be created."));
@@ -772,6 +798,7 @@ function WorkspaceManager({
       await clientCore.deleteWorkspace(spaceId);
       const status = await clientCore.status();
       onActiveChange(status.spaceId);
+      await refreshSpaces();
       await onRefresh();
     } catch (reason) {
       setError(nativeErrorMessage(reason, "Workspace could not be deleted."));
@@ -902,14 +929,30 @@ export default function App({ client: suppliedClient, clientCore: suppliedClient
       </aside>
 
       <main id={view}>
-        {view === "workspaces" && phase === "ready" && snapshot && clientCore ? (
-          <WorkspaceManager
-            activeSpaceId={activeWorkspaceId}
-            clientCore={clientCore}
-            onActiveChange={setActiveWorkspaceId}
-            onRefresh={refresh}
-            snapshot={snapshot}
-          />
+        {view === "workspaces" && clientCore ? (
+          <>
+            <WorkspaceManager
+              activeSpaceId={activeWorkspaceId}
+              clientCore={clientCore}
+              initialSpaces={snapshot?.node.spaces ?? EMPTY_WORKSPACES}
+              onActiveChange={setActiveWorkspaceId}
+              onRefresh={refresh}
+            />
+            {phase === "loading" ? (
+              <Panel aria-busy="true"><p>Connecting to the local node…</p></Panel>
+            ) : null}
+            {phase === "offline" ? (
+              <Panel className="hero--offline">
+                <div role="alert">
+                  <h2>Node status unavailable</h2>
+                  <p>{error ?? "The local node status could not be read."}</p>
+                  <Button disabled={refreshing} onClick={() => void refresh()}>
+                    {refreshing ? "Checking…" : "Try again"}
+                  </Button>
+                </div>
+              </Panel>
+            ) : null}
+          </>
         ) : null}
         {view === "records" && clientCore && activeWorkspaceId ? <RecordsWorkspace client={clientCore} /> : null}
         {view === "records" && clientCore && !activeWorkspaceId ? (

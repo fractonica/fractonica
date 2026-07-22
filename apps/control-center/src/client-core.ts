@@ -68,6 +68,16 @@ export interface ClientStatus {
   lastError?: string;
 }
 
+export interface ClientWorkspace {
+  spaceId: string;
+  displayName: string;
+  genesisOperationId: string;
+  initialGrantOperationId: string;
+  controllerActorId: string;
+  localWriterActorId: string;
+  createdAtUnixMs: number;
+}
+
 export interface CommitResult {
   localSequence: number;
   operationId: string;
@@ -89,6 +99,7 @@ export type PrePairRecordPolicy = "merge" | "discard";
 
 export interface ClientCore {
   status(): Promise<ClientStatus>;
+  listWorkspaces?(): Promise<ClientWorkspace[]>;
   listRecords(limit?: number): Promise<ClientRecord[]>;
   importAttachments(limit: number): Promise<ResourceReference[]>;
   createRecord(payload: PublicRecordPayload): Promise<CommitResult>;
@@ -277,6 +288,42 @@ function decodeCommit(value: unknown): CommitResult {
   return value as unknown as CommitResult;
 }
 
+function decodeWorkspace(value: unknown): ClientWorkspace {
+  if (
+    !isObject(value) ||
+    !hasOnlyKeys(
+      value,
+      [
+        "spaceId",
+        "displayName",
+        "genesisOperationId",
+        "initialGrantOperationId",
+        "controllerActorId",
+        "localWriterActorId",
+        "createdAtUnixMs",
+      ],
+      [],
+    ) ||
+    typeof value.spaceId !== "string" ||
+    !SPACE_ID.test(value.spaceId) ||
+    typeof value.displayName !== "string" ||
+    value.displayName.length === 0 ||
+    [...value.displayName].length > 128 ||
+    typeof value.genesisOperationId !== "string" ||
+    !OPERATION_ID.test(value.genesisOperationId) ||
+    typeof value.initialGrantOperationId !== "string" ||
+    !OPERATION_ID.test(value.initialGrantOperationId) ||
+    typeof value.controllerActorId !== "string" ||
+    !ACTOR_ID.test(value.controllerActorId) ||
+    typeof value.localWriterActorId !== "string" ||
+    !ACTOR_ID.test(value.localWriterActorId) ||
+    !isUnixMillis(value.createdAtUnixMs)
+  ) {
+    throw new Error("A local workspace did not match the expected schema.");
+  }
+  return value as unknown as ClientWorkspace;
+}
+
 function decodePairingClaim(value: unknown): PairingClaim {
   if (
     !isObject(value) ||
@@ -364,6 +411,13 @@ export function isDesktopRuntime(): boolean {
 export function createClientCore(invoke: Invoke): ClientCore {
   return {
     status: async () => decodeStatus(await invoke("client_status")),
+    listWorkspaces: async () => {
+      const value = await invoke("client_list_workspaces");
+      if (!Array.isArray(value) || value.length > 1_024) {
+        throw new Error("The local workspace list did not match the expected schema.");
+      }
+      return value.map(decodeWorkspace);
+    },
     listRecords: async (limit = 200) => {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
         throw new Error("Record list limit must be between 1 and 200.");
