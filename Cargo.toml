@@ -40,7 +40,7 @@ repository = "https://github.com/fractonica/fractonica"
 [workspace.dependencies]
 anyhow = "1.0.103"
 axum = "0.8.9"
-base64 = "0.22.1"
+base64 = "0.23.0"
 clap = { version = "4.6.2", features = ["derive", "env"] }
 directories = "6.0.0"
 fractonica-api = { path = "crates/fractonica-api" }
@@ -82,8 +82,8 @@ rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml_ng = "0.10.0"
-sha1 = "0.10.6"
-sha2 = "0.10.9"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
 snow = { version = "0.10.0", default-features = false, features = ["std", "default-resolver-crypto", "use-curve25519", "use-chacha20poly1305", "use-blake2"] }
 subtle = "2.6.1"
 tempfile = "3.27.0"
